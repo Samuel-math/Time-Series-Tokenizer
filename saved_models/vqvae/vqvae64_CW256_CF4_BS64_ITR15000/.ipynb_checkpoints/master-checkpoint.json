@@ -1,0 +1,29 @@
+{
+    "start_time": "2025-12-03T12-56-44",
+    "config file": "model_config/ettm1_vqvae.json",
+    "save directory": "saved_models/vqvae/vqvae64_CW256_CF4_BS64_ITR15000",
+    "gpus": 0,
+    "summaries": {
+        "general_seed": 47,
+        "data initialization location": "cpu",
+        "device": "cuda:0",
+        "vqvae_config": {
+            "general_seed": 47,
+            "model_name": "vqvae",
+            "model_save_name": "vqvae",
+            "pretrained": false,
+            "learning_rate": 0.001,
+            "num_training_updates": 15000,
+            "block_hidden_size": 128,
+            "num_residual_layers": 2,
+            "res_hidden_size": 64,
+            "embedding_dim": 64,
+            "num_embeddings": 256,
+            "commitment_cost": 0.25,
+            "compression_factor": 4,
+            "dataset": "ETTm1"
+        },
+        "total_time": 191.866,
+        "log_path": "saved_models/vqvae/vqvae64_CW256_CF4_BS64_ITR15000"
+    }
+}
