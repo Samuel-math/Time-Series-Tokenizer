@@ -255,6 +255,10 @@ def finetune_func(lr=args.lr):
     total_steps = len(dls.train) * args.n_epochs_finetune
     scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.2)
     
+    # 清空 torch 缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Training loop
     train_losses = []
     valid_losses = []
