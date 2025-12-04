@@ -328,50 +328,147 @@ class VQVAETransformerFinetune(nn.Module):
             pred: [B, target_len, C] 预测结果
         """
         B, T, C = x.shape
+        device = x.device
         
-        # 获取codebook logits
+        # Step 1: 通过 VQVAE encoder 生成 [B, codebook_size, T/compression_factor, C] 的概率分布
         with torch.no_grad():
-            logits = self.pretrained_model(x)  # [B, codebook_size, T/compression_factor, C]
+            # 使用预训练模型的 encoder 部分获取 codebook 概率分布
+            codebook_probs = self.pretrained_model(x)  # [B, codebook_size, T/compression_factor, C]
         
-        # 选择最可能的codebook索引
-        codebook_indices = torch.argmax(logits, dim=1)  # [B, T/compression_factor, C]
+        # Step 2: 对每个通道独立，使用 decoder-only 生成模式生成未来 tokens
+        T_compressed = codebook_probs.shape[2]
+        target_T_compressed = target_len // self.compression_factor
         
-        # 从VQ层获取codebook embeddings
+        # 创建 causal mask 用于生成（decoder only 模式）
+        total_len = T_compressed + target_T_compressed
+        causal_mask = torch.triu(torch.ones(total_len, total_len, device=device), diagonal=1)
+        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))
+        
+        # 对每个通道分别生成
+        generated_probs = []
+        
+        for ch in range(C):
+            # 当前通道的 codebook 概率分布: [B, codebook_size, T/compression_factor]
+            probs_ch = codebook_probs[:, :, :, ch]  # [B, codebook_size, T/compression_factor]
+            
+            # 将概率分布转换为 logits（取对数）
+            logits_ch = torch.log(probs_ch + 1e-10)  # [B, codebook_size, T/compression_factor]
+            logits_ch = logits_ch.permute(0, 2, 1)  # [B, T/compression_factor, codebook_size]
+            
+            # 投影到 d_model 维度
+            # 使用预训练模型的 projection 层
+            # 首先需要将 codebook indices 转换为 embeddings
+            # 选择最可能的 codebook index
+            codebook_indices = torch.argmax(probs_ch, dim=1)  # [B, T/compression_factor]
+            
+            # 从 VQ 层获取 codebook embeddings
+            codebook_embeddings = self.pretrained_model.vq._embedding.weight  # [num_embeddings, embedding_dim]
+            
+            # 获取对应的 embeddings
+            indices_flat = codebook_indices.view(-1)  # [B*T/compression_factor]
+            z_ch = codebook_embeddings[indices_flat]  # [B*T/compression_factor, embedding_dim]
+            z_ch = z_ch.view(B, T_compressed, self.embedding_dim)  # [B, T/compression_factor, embedding_dim]
+            
+            # 投影到 d_model
+            z_ch = self.pretrained_model.projection(z_ch)  # [B, T/compression_factor, d_model]
+            
+            # 位置编码
+            W_pos = positional_encoding(
+                self.pretrained_model.pe, 
+                self.pretrained_model.learn_pe, 
+                total_len, 
+                self.pretrained_model.d_model
+            )
+            z_ch = z_ch + W_pos[:T_compressed].to(device)
+            z_ch = self.pretrained_model.dropout_layer(z_ch)
+            
+            # 自回归生成未来的 tokens
+            generated_tokens = []
+            current_z = z_ch  # [B, T/compression_factor, d_model]
+            
+            for step in range(target_T_compressed):
+                # 对当前整个序列（包括已生成的）通过 Transformer layers
+                current_seq_len = current_z.shape[1]
+                z_processed = current_z
+                
+                # 创建当前序列的 causal mask
+                seq_mask = causal_mask[:current_seq_len, :current_seq_len]
+                
+                # 通过所有 Transformer layers（decoder only，使用 causal mask）
+                for layer in self.pretrained_model.transformer_layers:
+                    z_processed = layer(z_processed, mask=seq_mask)
+                
+                # 获取最后一个位置的表示（用于预测下一个 token）
+                last_z = z_processed[:, -1:, :]  # [B, 1, d_model]
+                
+                # 更新 current_z 为处理后的序列（用于下一次迭代，避免重复处理）
+                current_z = z_processed
+                
+                # 预测下一个 codebook token 的概率分布
+                next_logits = self.pretrained_model.codebook_head(last_z)  # [B, 1, codebook_size]
+                next_probs = F.softmax(next_logits, dim=-1)  # [B, 1, codebook_size]
+                
+                # 选择最可能的 codebook index
+                next_index = torch.argmax(next_probs, dim=-1)  # [B, 1]
+                
+                # 获取对应的 embedding
+                next_index_flat = next_index.view(-1)  # [B]
+                next_embedding = codebook_embeddings[next_index_flat]  # [B, embedding_dim]
+                next_embedding = next_embedding.unsqueeze(1)  # [B, 1, embedding_dim]
+                
+                # 投影到 d_model
+                next_z = self.pretrained_model.projection(next_embedding)  # [B, 1, d_model]
+                
+                # 添加位置编码
+                pos_idx = T_compressed + step
+                next_z = next_z + W_pos[pos_idx:pos_idx+1].to(device)
+                next_z = self.pretrained_model.dropout_layer(next_z)
+                
+                # 添加到序列中（用于下一次迭代）
+                current_z = torch.cat([current_z, next_z], dim=1)  # [B, current_seq_len+1, d_model]
+                generated_tokens.append(next_probs)
+            
+            # 合并所有生成的概率分布
+            if generated_tokens:
+                generated_probs_ch = torch.cat(generated_tokens, dim=1)  # [B, target_T/compression_factor, codebook_size]
+                generated_probs_ch = generated_probs_ch.permute(0, 2, 1)  # [B, codebook_size, target_T/compression_factor]
+            else:
+                # 如果没有生成任何 token，创建一个空的
+                generated_probs_ch = torch.zeros(B, self.num_embeddings, target_T_compressed, device=device)
+            
+            generated_probs.append(generated_probs_ch)
+        
+        # Stack: [B, codebook_size, target_T/compression_factor, C]
+        generated_probs = torch.stack(generated_probs, dim=3)  # [B, codebook_size, target_T/compression_factor, C]
+        
+        # Step 3: 从生成的概率分布中选择最可能的 codebook indices
+        codebook_indices = torch.argmax(generated_probs, dim=1)  # [B, target_T/compression_factor, C]
+        
+        # Step 4: 通过 VQVAE decoder 解码得到最终预测
         codebook_embeddings = self.pretrained_model.vq._embedding.weight  # [num_embeddings, embedding_dim]
-        
-        # 对每个通道分别解码
-        T_compressed = codebook_indices.shape[1]
         decoded = []
         
         for ch in range(C):
-            indices_ch = codebook_indices[:, :, ch]  # [B, T/compressed]
+            indices_ch = codebook_indices[:, :, ch]  # [B, target_T/compression_factor]
             
-            # 获取对应的embeddings
-            indices_flat = indices_ch.view(-1)  # [B*T/compressed]
-            quantized_ch = codebook_embeddings[indices_flat]  # [B*T/compressed, embedding_dim]
-            quantized_ch = quantized_ch.view(B, -1, self.embedding_dim)  # [B, T/compressed, embedding_dim]
+            # 获取对应的 embeddings
+            indices_flat = indices_ch.view(-1)  # [B*target_T/compression_factor]
+            quantized_ch = codebook_embeddings[indices_flat]  # [B*target_T/compression_factor, embedding_dim]
+            quantized_ch = quantized_ch.view(B, -1, self.embedding_dim)  # [B, target_T/compression_factor, embedding_dim]
             
-            # 如果添加了finetune head，通过它处理
+            # 如果添加了 finetune head，通过它处理
             if self.add_finetune_head:
                 quantized_ch = self.finetune_head(quantized_ch)
             
-            # 转换为decoder需要的格式 [B, embedding_dim, T/compressed]
+            # 转换为 decoder 需要的格式 [B, embedding_dim, target_T/compression_factor]
             quantized_ch = quantized_ch.permute(0, 2, 1)
             
-            # 通过decoder解码
-            decoded_ch = self.decoder(quantized_ch, self.compression_factor)  # [B, T]
+            # 通过 decoder 解码
+            decoded_ch = self.decoder(quantized_ch, self.compression_factor)  # [B, target_len]
             decoded.append(decoded_ch)
         
-        # Stack: [B, T, C]
-        pred = torch.stack(decoded, dim=2)  # [B, T, C]
-        
-        # 只返回target_len长度的预测
-        if pred.shape[1] > target_len:
-            pred = pred[:, :target_len, :]
-        elif pred.shape[1] < target_len:
-            # 如果预测长度不够，进行插值或重复最后一个值
-            last_val = pred[:, -1:, :].repeat(1, target_len - pred.shape[1], 1)
-            pred = torch.cat([pred, last_val], dim=1)
+        # Stack: [B, target_len, C]
+        pred = torch.stack(decoded, dim=2)  # [B, target_len, C]
         
         return pred
 
