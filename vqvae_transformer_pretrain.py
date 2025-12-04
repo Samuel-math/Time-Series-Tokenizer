@@ -260,18 +260,8 @@ def pretrain_func(lr=args.lr):
     if revin:
         revin = revin.to(device)
     
-    # 可选：冻结 VQVAE encoder 和 VQ（如果加载了预训练权重）
-    if args.vqvae_checkpoint is not None:
-        print("冻结 VQVAE encoder 和 VQ 参数（只训练 Transformer 部分）")
-        for param in model.vqvae_encoder.parameters():
-            param.requires_grad = False
-        for param in model.vq.parameters():
-            param.requires_grad = False
-    
     # Optimizer and scheduler
-    # 只优化需要梯度的参数
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     total_steps = len(dls.train) * args.n_epochs_pretrain
     scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
     
@@ -285,6 +275,7 @@ def pretrain_func(lr=args.lr):
     best_val_loss = float('inf')
     
     print(f"开始预训练，共 {args.n_epochs_pretrain} 个 epoch")
+    print(f"总参数数量: {sum(p.numel() for p in model.parameters())}")
     print(f"可训练参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     
     for epoch in range(args.n_epochs_pretrain):
@@ -310,17 +301,17 @@ def pretrain_func(lr=args.lr):
             loss.backward()
             
             # 梯度裁剪（防止梯度爆炸）
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             
             optimizer.step()
             scheduler.step()
             
             epoch_train_losses.append(loss.item())
             
-            # 每 100 个 batch 打印一次梯度信息（用于调试）
+            # 每 1000 个 batch 打印一次梯度信息（用于调试）
             if batch_idx % 1000 == 0 and batch_idx > 0:
                 total_grad_norm = 0
-                for p in trainable_params:
+                for p in model.parameters():
                     if p.grad is not None:
                         param_norm = p.grad.data.norm(2)
                         total_grad_norm += param_norm.item() ** 2

@@ -247,13 +247,25 @@ def finetune_func(lr=args.lr):
     if revin:
         revin = revin.to(device)
     
+    # 冻结 VQVAE encoder 和 VQ 参数（在预训练模型中）
+    print("冻结 VQVAE encoder 和 VQ 参数")
+    if hasattr(model, 'pretrained_model'):
+        if hasattr(model.pretrained_model, 'vqvae_encoder'):
+            for param in model.pretrained_model.vqvae_encoder.parameters():
+                param.requires_grad = False
+        if hasattr(model.pretrained_model, 'vq'):
+            for param in model.pretrained_model.vq.parameters():
+                param.requires_grad = False
+    
     # Loss
     loss_func = nn.MSELoss(reduction='mean')
     
     # Optimizer and scheduler
-    optimizer = Adam(model.parameters(), lr=lr)
+    # 只优化需要梯度的参数
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
     total_steps = len(dls.train) * args.n_epochs_finetune
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.2)
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
     
     # 清空 torch 缓存
     if torch.cuda.is_available():
@@ -265,13 +277,14 @@ def finetune_func(lr=args.lr):
     best_val_loss = float('inf')
     
     print(f"开始微调，共 {args.n_epochs_finetune} 个 epoch")
+    print(f"可训练参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     
     for epoch in range(args.n_epochs_finetune):
         # Training
         model.train()
         epoch_train_losses = []
         
-        for batch_x, batch_y in dls.train:
+        for batch_idx, (batch_x, batch_y) in enumerate(dls.train):
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             
@@ -287,11 +300,32 @@ def finetune_func(lr=args.lr):
                 pred = revin(pred, 'denorm')
             
             loss = loss_func(pred, batch_y)
+            
+            # 检查 loss 是否为 NaN 或 Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"警告: Epoch {epoch+1}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
+                continue
+            
             loss.backward()
+            
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            
             optimizer.step()
             scheduler.step()
             
             epoch_train_losses.append(loss.item())
+            
+            # 每 1000 个 batch 打印一次梯度信息（用于调试）
+            if batch_idx % 1000 == 0 and batch_idx > 0:
+                total_grad_norm = 0
+                for p in trainable_params:
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"  Batch {batch_idx}, Loss: {loss.item():.6f}, Grad Norm: {total_grad_norm:.6f}, LR: {current_lr:.2e}")
         
         avg_train_loss = np.mean(epoch_train_losses)
         train_losses.append(avg_train_loss)
