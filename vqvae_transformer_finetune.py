@@ -96,6 +96,37 @@ def load_json_config(path):
         return json.load(f)
 
 
+def load_transformer_config(args, pretrained_checkpoint=None, device='cpu'):
+    """
+    统一加载 transformer_config 的辅助函数
+    优先从 checkpoint 加载，其次从配置文件加载
+    
+    Args:
+        args: 命令行参数
+        pretrained_checkpoint: 已加载的 checkpoint（可选，避免重复加载）
+        device: 设备
+    """
+    # 如果未提供 checkpoint，则加载
+    if pretrained_checkpoint is None:
+        print(f"加载预训练Transformer模型: {args.pretrained_model}")
+        pretrained_checkpoint = torch.load(args.pretrained_model, map_location=device)
+    
+    if isinstance(pretrained_checkpoint, dict) and "transformer_config" in pretrained_checkpoint:
+        transformer_config = pretrained_checkpoint["transformer_config"]
+        print("从 checkpoint 加载 transformer_config")
+    elif hasattr(args, "transformer_config_path") and args.transformer_config_path and os.path.exists(args.transformer_config_path):
+        transformer_config = load_json_config(args.transformer_config_path)
+        print(f"从文件加载 transformer_config: {args.transformer_config_path}")
+    else:
+        raise ValueError(
+            "找不到 Transformer 配置！请确保 checkpoint 包含 transformer_config，"
+            "或通过 --transformer_config_path 指定配置文件。"
+        )
+    
+    print("Transformer 配置:", transformer_config)
+    return transformer_config
+
+
 def get_model(c_in, args, vqvae_config, device='cpu'):
     """
     加载预训练模型 + VQVAE decoder + 构建 Finetune 模型
@@ -107,19 +138,7 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
     # --------------------------
     # 1) 获取 transformer_config
     # --------------------------
-    if isinstance(pretrained_checkpoint, dict) and "transformer_config" in pretrained_checkpoint:
-        transformer_config = pretrained_checkpoint["transformer_config"]
-        print("从 checkpoint 加载 transformer_config")
-    elif hasattr(args, "transformer_config_path") and os.path.exists(args.transformer_config_path):
-        transformer_config = load_json_config(args.transformer_config_path)
-        print(f"从文件加载 transformer_config: {args.transformer_config_path}")
-    else:
-        raise ValueError(
-            "找不到 Transformer 配置！请确保 checkpoint 包含 transformer_config，"
-            "或通过 --transformer_config_path 指定配置文件。"
-        )
-
-    print("Transformer 配置:", transformer_config)
+    transformer_config = load_transformer_config(args, pretrained_checkpoint, device)
 
     # --------------------------
     # 2) 构建预训练模型骨架
@@ -218,18 +237,8 @@ def finetune_func(lr=args.lr):
     # 加载配置
     vqvae_config = load_vqvae_config(args.vqvae_config_path)
     
-    # Transformer配置
-    transformer_config = {
-        'd_model': 128,
-        'n_layers': 3,
-        'n_heads': 8,
-        'd_ff': 256,
-        'dropout': 0.1,
-        'attn_dropout': 0.1
-    }
-    
-    # get model
-    model = get_model(dls.vars, args, vqvae_config, transformer_config)
+    # get model (transformer_config 会在 get_model 内部自动加载)
+    model = get_model(dls.vars, args, vqvae_config)
     
     # get loss
     loss_func = torch.nn.MSELoss(reduction='mean')
@@ -258,16 +267,9 @@ def test_func(weight_path):
     
     # 加载配置
     vqvae_config = load_vqvae_config(args.vqvae_config_path)
-    transformer_config = {
-        'd_model': 128,
-        'n_layers': 3,
-        'n_heads': 8,
-        'd_ff': 256,
-        'dropout': 0.1,
-        'attn_dropout': 0.1
-    }
     
-    model = get_model(dls.vars, args, vqvae_config, transformer_config)
+    # get model (transformer_config 会在 get_model 内部自动加载)
+    model = get_model(dls.vars, args, vqvae_config)
     
     # get callbacks
     cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
