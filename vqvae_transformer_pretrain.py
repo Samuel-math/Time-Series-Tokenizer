@@ -318,7 +318,7 @@ def pretrain_func(lr=args.lr):
             epoch_train_losses.append(loss.item())
             
             # 每 100 个 batch 打印一次梯度信息（用于调试）
-            if batch_idx % 10 == 0 and batch_idx > 0:
+            if batch_idx % 1000 == 0 and batch_idx > 0:
                 total_grad_norm = 0
                 for p in trainable_params:
                     if p.grad is not None:
