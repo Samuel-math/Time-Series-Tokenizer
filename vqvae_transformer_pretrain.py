@@ -136,10 +136,6 @@ def compute_next_token_loss(model, x, compression_factor, device='cuda'):
     logits = model(x)  # [B, codebook_size, T/compression_factor, C]
     
     # 计算损失（next token prediction）
-    # 使用 CrossEntropyLoss，需要从 probs 转换回 logits
-    # 使用温度缩放来提高数值稳定性
-    temperature = 1.0
-    logits = torch.log(probs + 1e-10) / temperature  # [B, codebook_size, T/compression_factor, C]
     
     ce_criterion = nn.CrossEntropyLoss(ignore_index=-1)
     loss = 0
