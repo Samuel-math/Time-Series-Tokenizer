@@ -146,7 +146,7 @@ def compute_next_token_loss(model, x, compression_factor, device='cuda'):
         pred_probs = probs_ch[:, :-1, :].reshape(-1, probs_ch.shape[-1])  # [B*(T/compressed-1), codebook_size]
         target_tokens = target_ch[:, 1:].reshape(-1)  # [B*(T/compressed-1)]
         
-        # 使用 NLLLoss，需要取对数
+        # 使用 NLLLoss，需要取对数（对预测的概率取对数）
         log_probs = torch.log(pred_probs + 1e-10)  # 添加小值避免 log(0)
         loss += nll_criterion(log_probs, target_tokens)
     
@@ -260,10 +260,20 @@ def pretrain_func(lr=args.lr):
     if revin:
         revin = revin.to(device)
     
+    # 可选：冻结 VQVAE encoder 和 VQ（如果加载了预训练权重）
+    if args.vqvae_checkpoint is not None:
+        print("冻结 VQVAE encoder 和 VQ 参数（只训练 Transformer 部分）")
+        for param in model.vqvae_encoder.parameters():
+            param.requires_grad = False
+        for param in model.vq.parameters():
+            param.requires_grad = False
+    
     # Optimizer and scheduler
-    optimizer = Adam(model.parameters(), lr=lr)
+    # 只优化需要梯度的参数
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
     total_steps = len(dls.train) * args.n_epochs_pretrain
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.2)
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
     
     # 清空 torch 缓存
     if torch.cuda.is_available():
@@ -275,13 +285,14 @@ def pretrain_func(lr=args.lr):
     best_val_loss = float('inf')
     
     print(f"开始预训练，共 {args.n_epochs_pretrain} 个 epoch")
+    print(f"可训练参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     
     for epoch in range(args.n_epochs_pretrain):
         # Training
         model.train()
         epoch_train_losses = []
         
-        for batch_x, _ in dls.train:
+        for batch_idx, (batch_x, _) in enumerate(dls.train):
             batch_x = batch_x.to(device)
             
             # RevIN normalization
@@ -290,11 +301,32 @@ def pretrain_func(lr=args.lr):
             
             optimizer.zero_grad()
             loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device)
+            
+            # 检查 loss 是否为 NaN 或 Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"警告: Epoch {epoch+1}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
+                continue
+            
             loss.backward()
+            
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            
             optimizer.step()
             scheduler.step()
             
             epoch_train_losses.append(loss.item())
+            
+            # 每 100 个 batch 打印一次梯度信息（用于调试）
+            if batch_idx % 10 == 0 and batch_idx > 0:
+                total_grad_norm = 0
+                for p in trainable_params:
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"  Batch {batch_idx}, Loss: {loss.item():.6f}, Grad Norm: {total_grad_norm:.6f}, LR: {current_lr:.2e}")
         
         avg_train_loss = np.mean(epoch_train_losses)
         train_losses.append(avg_train_loss)

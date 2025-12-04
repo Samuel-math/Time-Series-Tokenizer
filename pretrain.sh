@@ -8,7 +8,7 @@ python vqvae_transformer_pretrain.py \
     --vqvae_checkpoint saved_models/vqvae/ettm1/vqvae64_CW256_CF4_BS64_ITR15000/checkpoints/best_model.pth \
     --transformer_parameter_path "model_config/${dset}/"\
     --d_model 128 \
-    --n_layers 2 \
+    --n_layers 3 \
     --n_heads 8 \
-    --d_ff 128 \
+    --d_ff 256 \
     --dropout 0.3
