@@ -133,22 +133,25 @@ def compute_next_token_loss(model, x, compression_factor, device='cuda'):
     
     # 前向传播（使用 causal mask）
     model._current_mask = causal_mask
-    probs = model(x)  # [B, codebook_size, T/compression_factor, C]
+    logits = model(x)  # [B, codebook_size, T/compression_factor, C]
     
     # 计算损失（next token prediction）
-    nll_criterion = nn.NLLLoss(ignore_index=-1)
+    # 使用 CrossEntropyLoss，需要从 probs 转换回 logits
+    # 使用温度缩放来提高数值稳定性
+    temperature = 1.0
+    logits = torch.log(probs + 1e-10) / temperature  # [B, codebook_size, T/compression_factor, C]
+    
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=-1)
     loss = 0
     for ch in range(C):
-        probs_ch = probs[:, :, :, ch].permute(0, 2, 1)  # [B, T/compressed, codebook_size]
+        logits_ch = logits[:, :, :, ch].permute(0, 2, 1)  # [B, T/compressed, codebook_size]
         target_ch = target_indices[:, :, ch]  # [B, T/compressed]
         
         # Next token prediction: 预测位置 i+1 的 token，使用位置 i 的 context
-        pred_probs = probs_ch[:, :-1, :].reshape(-1, probs_ch.shape[-1])  # [B*(T/compressed-1), codebook_size]
+        pred_logits = logits_ch[:, :-1, :].reshape(-1, logits_ch.shape[-1])  # [B*(T/compressed-1), codebook_size]
         target_tokens = target_ch[:, 1:].reshape(-1)  # [B*(T/compressed-1)]
         
-        # 使用 NLLLoss，需要取对数（对预测的概率取对数）
-        log_probs = torch.log(pred_probs + 1e-10)  # 添加小值避免 log(0)
-        loss += nll_criterion(log_probs, target_tokens)
+        loss += ce_criterion(pred_logits, target_tokens)
     
     loss = loss / C
     return loss
@@ -166,6 +169,27 @@ def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
         vqvae_checkpoint_path=args.vqvae_checkpoint,
         device=device
     )
+    
+    # 对 Transformer 部分进行更好的初始化
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            # 使用 Xavier 初始化
+            nn.init.xavier_uniform_(m.weight, gain=1.0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0.0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    # 只对 Transformer 部分初始化（如果 VQVAE 是预训练的，不要重新初始化）
+    if args.vqvae_checkpoint is None:
+        # 如果没有加载 VQVAE 权重，初始化所有层
+        model.apply(init_weights)
+    else:
+        # 只初始化 Transformer 部分
+        model.projection.apply(init_weights)
+        model.transformer_layers.apply(init_weights)
+        model.codebook_head.apply(init_weights)
     
     print('number of model params', sum(p.numel() for p in model.parameters() if p.requires_grad))
     return model
@@ -200,18 +224,22 @@ def find_lr():
         revin = revin.to(device)
     
     # Optimizer
-    optimizer = Adam(model.parameters(), lr=args.lr)
+    optimizer = Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
     
-    # 简单的学习率查找：尝试几个不同的学习率
+    # 简单的学习率查找：尝试几个不同的学习率（从更大的学习率开始）
     best_lr = args.lr
     best_loss = float('inf')
     
-    for test_lr in [1e-5, 5e-5, 1e-4, 5e-4, 1e-3]:
+    # 尝试更大的学习率范围
+    for test_lr in [5e-5, 1e-4, 5e-4, 1e-3, 2e-3]:
         optimizer.param_groups[0]['lr'] = test_lr
         model.train()
         
-        # 使用一个 batch 测试
-        for batch_x, _ in dls.train:
+        # 使用几个 batch 测试，取平均
+        losses = []
+        for batch_idx, (batch_x, _) in enumerate(dls.train):
+            if batch_idx >= 5:  # 只测试前5个batch
+                break
             batch_x = batch_x.to(device)
             
             # RevIN normalization
@@ -221,12 +249,19 @@ def find_lr():
             optimizer.zero_grad()
             loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
             
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                best_lr = test_lr
-            break
+            losses.append(loss.item())
+        
+        avg_loss = np.mean(losses) if losses else float('inf')
+        if avg_loss < best_loss and not np.isnan(avg_loss):
+            best_loss = avg_loss
+            best_lr = test_lr
+    
+    # 如果找到的学习率太小，使用默认值或稍微大一点的值
+    if best_lr < 1e-4:
+        best_lr = max(1e-4, args.lr * 2)
     
     print(f'suggested_lr = {best_lr}')
     return best_lr
@@ -261,9 +296,11 @@ def pretrain_func(lr=args.lr):
         revin = revin.to(device)
     
     # Optimizer and scheduler
-    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    # 使用更大的学习率和调整 betas 以加速训练
+    optimizer = Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=1e-5)
     total_steps = len(dls.train) * args.n_epochs_pretrain
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
+    # 减少 warmup 时间，更快达到最大学习率
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.1, div_factor=10.0)
     
     # 清空 torch 缓存
     if torch.cuda.is_available():
@@ -301,7 +338,7 @@ def pretrain_func(lr=args.lr):
             loss.backward()
             
             # 梯度裁剪（防止梯度爆炸）
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
             optimizer.step()
             scheduler.step()

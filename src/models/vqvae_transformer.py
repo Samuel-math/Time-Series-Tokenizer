@@ -237,11 +237,7 @@ class VQVAETransformerPretrain(nn.Module):
         logits = self.codebook_head(z)  # [B, T/compression_factor, C, codebook_size]
         logits = logits.permute(0, 3, 1, 2)  # [B, codebook_size, T/compression_factor, C]
         
-        # 应用softmax得到每个码本元素的概率
-        probs = F.softmax(logits, dim=1)  # [B, codebook_size, T/compression_factor, C]
-        
-        # 返回概率和对应的编码索引（如果直接用于训练可只返回probs，根据需要可返回encoding_indices）
-        return probs
+        return logits
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -346,10 +342,10 @@ class VQVAETransformerFinetune(nn.Module):
         # Step 1: 通过 VQVAE encoder 生成 [B, codebook_size, T/compression_factor, C] 的概率分布
         with torch.no_grad():
             # 使用预训练模型的 encoder 部分获取 codebook 概率分布
-            codebook_probs = self.pretrained_model(x)  # [B, codebook_size, T/compression_factor, C]
+            codebook_logits = self.pretrained_model(x)  # [B, codebook_size, T/compression_factor, C]
         
         # Step 2: 对每个通道独立，使用 decoder-only 生成模式生成未来 tokens
-        T_compressed = codebook_probs.shape[2]
+        T_compressed = codebook_logits.shape[2]
         target_T_compressed = target_len // self.compression_factor
         
         # 创建 causal mask 用于生成（decoder only 模式）
@@ -362,10 +358,8 @@ class VQVAETransformerFinetune(nn.Module):
         
         for ch in range(C):
             # 当前通道的 codebook 概率分布: [B, codebook_size, T/compression_factor]
-            probs_ch = codebook_probs[:, :, :, ch]  # [B, codebook_size, T/compression_factor]
+            logits_ch = codebook_logits[:, :, :, ch]  # [B, codebook_size, T/compression_factor]
             
-            # 将概率分布转换为 logits（取对数）
-            logits_ch = torch.log(probs_ch + 1e-10)  # [B, codebook_size, T/compression_factor]
             logits_ch = logits_ch.permute(0, 2, 1)  # [B, T/compression_factor, codebook_size]
             
             # 投影到 d_model 维度
