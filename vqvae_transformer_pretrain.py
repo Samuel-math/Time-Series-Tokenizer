@@ -1,19 +1,19 @@
 """
 VQVAE + Transformer 预训练脚本
+使用标准 PyTorch 训练循环，不使用 Learner
 """
 
 import numpy as np
 import pandas as pd
 import os
+import json
 import torch
 from torch import nn
+from torch.optim import Adam
+from torch.optim.lr_scheduler import OneCycleLR
 
 from src.models.vqvae_transformer import VQVAETransformerPretrain
-from src.learner import Learner
-from src.callback.tracking import *
-from src.callback.transforms import *
-from src.callback.core import Callback
-from src.metrics import *
+from src.models.layers.revin import RevIN
 from src.basics import set_device
 from src.utils_vqvae import load_vqvae_config
 from datautils import get_dls
@@ -95,91 +95,63 @@ def save_transformer_config(args, filename="transformer_config.json"):
         json.dump(transformer_config, f, indent=4)
 
     print(f"Transformer 参数已保存到 {save_path}")
-save_transformer_config(f'{args.dset}_transformer_config.json')
 
-class NextTokenPredictionCB(Callback):
+def compute_next_token_loss(model, x, compression_factor, device='cuda'):
     """
-    Callback for next token prediction task
-    处理 VQVAE+Transformer 的 next token prediction 损失计算
-    """
-    def __init__(self, compression_factor):
-        super().__init__()
-        self.compression_factor = compression_factor
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-1)
-        self.target_indices = None
-        self.causal_mask = None
-        
-    def before_forward(self):
-        """在forward之前计算target indices和causal mask"""
-        x = self.learner.xb  # [B, seq_len, n_vars]
-        B, L, C = x.shape
-        model = self.learner.model  # 获取VQVAE+Transformer模型
-        device = x.device
-        
-        # 计算压缩后的长度
-        T_compressed = L // self.compression_factor
-        
-        # 创建causal mask用于next token prediction
-        self.causal_mask = torch.triu(torch.ones(T_compressed, T_compressed, device=device), diagonal=1)
-        self.causal_mask = self.causal_mask.masked_fill(self.causal_mask == 1, float('-inf'))
-        
-        # 获取真实的codebook indices（通过VQVAE encoder + VQ）
-        target_indices = []
-        with torch.no_grad():
-            for ch in range(C):
-                x_ch = x[:, :, ch].view(B, L)
-                # 使用VQVAE encoder和VQ获取真实indices
-                z = model.vqvae_encoder(x_ch, self.compression_factor)
-                z = z.permute(0, 2, 1)  # [B, T/compressed, embedding_dim]
-                _, _, _, _, encoding_indices, _ = model.vq(z.permute(0, 2, 1).contiguous())
-                # encoding_indices: [B*T/compressed, 1]
-                indices = encoding_indices.squeeze(-1).view(B, T_compressed)
-                target_indices.append(indices)
-        
-        self.target_indices = torch.stack(target_indices, dim=2)  # [B, T/compressed, C]
-        
-        # 修改模型的forward调用，传入mask
-        # 我们需要在forward中传入mask，但Learner框架不支持额外参数
-        # 所以我们将mask存储为模型属性
-        model._current_mask = self.causal_mask
-        
-    def after_forward(self):
-        """在forward之后计算损失"""
-        probs = self.learner.pred  # [B, codebook_size, T/compression_factor, C] - 现在是概率
-        target_indices = self.target_indices  # [B, T/compressed, C]
-        
-        B, codebook_size, T_compressed, C = probs.shape
-        
-        # 计算损失（next token prediction）
-        # 由于输出是概率，需要使用NLLLoss（负对数似然损失）
-        # 或者将概率转换回logits
-        nll_criterion = nn.NLLLoss(ignore_index=-1)
-        loss = 0
-        for ch in range(C):
-            probs_ch = probs[:, :, :, ch].permute(0, 2, 1)  # [B, T/compressed, codebook_size]
-            target_ch = target_indices[:, :, ch]  # [B, T/compressed]
-            
-            # Next token prediction: 预测位置i+1的token，使用位置i的context
-            pred_probs = probs_ch[:, :-1, :].reshape(-1, codebook_size)  # [B*(T/compressed-1), codebook_size]
-            target_tokens = target_ch[:, 1:].reshape(-1)  # [B*(T/compressed-1)]
-            
-            # 使用NLLLoss，需要取对数
-            log_probs = torch.log(pred_probs + 1e-10)  # 添加小值避免log(0)
-            loss += nll_criterion(log_probs, target_tokens)
-        
-        loss = loss / C
-        self.learner.pred = loss.unsqueeze(0)  # 将损失作为pred返回
-
-
-class NextTokenLoss(nn.Module):
-    """自定义损失函数，用于next token prediction"""
-    def __init__(self):
-        super().__init__()
+    计算 next token prediction 损失
     
-    def forward(self, pred, target):
-        # pred 是标量损失值（在NextTokenPredictionCB中计算）
-        # target 是dummy，不使用
-        return pred
+    Args:
+        model: VQVAETransformerPretrain 模型
+        x: [B, L, C] 输入时间序列
+        compression_factor: VQVAE 压缩因子
+        device: 设备
+    
+    Returns:
+        loss: 标量损失值
+    """
+    B, L, C = x.shape
+    T_compressed = L // compression_factor
+    
+    # 创建 causal mask
+    causal_mask = torch.triu(torch.ones(T_compressed, T_compressed, device=device), diagonal=1)
+    causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))
+    
+    # 获取真实的 codebook indices（通过 VQVAE encoder + VQ）
+    target_indices = []
+    with torch.no_grad():
+        for ch in range(C):
+            x_ch = x[:, :, ch].view(B, L)
+            # 使用 VQVAE encoder 和 VQ 获取真实 indices
+            z = model.vqvae_encoder(x_ch, compression_factor)
+            z = z.permute(0, 2, 1)  # [B, T/compressed, embedding_dim]
+            _, _, _, _, encoding_indices, _ = model.vq(z.permute(0, 2, 1).contiguous())
+            # encoding_indices: [B*T/compressed, 1]
+            indices = encoding_indices.squeeze(-1).view(B, T_compressed)
+            target_indices.append(indices)
+    
+    target_indices = torch.stack(target_indices, dim=2)  # [B, T/compressed, C]
+    
+    # 前向传播（使用 causal mask）
+    model._current_mask = causal_mask
+    probs = model(x)  # [B, codebook_size, T/compression_factor, C]
+    
+    # 计算损失（next token prediction）
+    nll_criterion = nn.NLLLoss(ignore_index=-1)
+    loss = 0
+    for ch in range(C):
+        probs_ch = probs[:, :, :, ch].permute(0, 2, 1)  # [B, T/compressed, codebook_size]
+        target_ch = target_indices[:, :, ch]  # [B, T/compressed]
+        
+        # Next token prediction: 预测位置 i+1 的 token，使用位置 i 的 context
+        pred_probs = probs_ch[:, :-1, :].reshape(-1, probs_ch.shape[-1])  # [B*(T/compressed-1), codebook_size]
+        target_tokens = target_ch[:, 1:].reshape(-1)  # [B*(T/compressed-1)]
+        
+        # 使用 NLLLoss，需要取对数
+        log_probs = torch.log(pred_probs + 1e-10)  # 添加小值避免 log(0)
+        loss += nll_criterion(log_probs, target_tokens)
+    
+    loss = loss / C
+    return loss
 
 
 def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
@@ -200,6 +172,9 @@ def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
 
 
 def find_lr():
+    """简单的学习率查找：使用一个小的训练循环"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # get dataloader
     dls = get_dls(args)
     
@@ -217,27 +192,49 @@ def find_lr():
     }
     
     model = get_model(dls.vars, args, vqvae_config, transformer_config)
+    model = model.to(device)
     
-    # get loss (dummy loss, actual loss computed in model)
-    loss_func = NextTokenLoss()
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin:
+        revin = revin.to(device)
     
-    # get callbacks
-    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
-    cbs += [NextTokenPredictionCB(compression_factor=vqvae_config['compression_factor'])]
+    # Optimizer
+    optimizer = Adam(model.parameters(), lr=args.lr)
     
-    # define learner
-    learn = Learner(dls, model, 
-                    loss_func, 
-                    lr=args.lr, 
-                    cbs=cbs,
-                    )                        
-    # fit the data to the model
-    suggested_lr = learn.lr_finder()
-    print('suggested_lr', suggested_lr)
-    return suggested_lr
+    # 简单的学习率查找：尝试几个不同的学习率
+    best_lr = args.lr
+    best_loss = float('inf')
+    
+    for test_lr in [1e-5, 5e-5, 1e-4, 5e-4, 1e-3]:
+        optimizer.param_groups[0]['lr'] = test_lr
+        model.train()
+        
+        # 使用一个 batch 测试
+        for batch_x, _ in dls.train:
+            batch_x = batch_x.to(device)
+            
+            # RevIN normalization
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+            
+            optimizer.zero_grad()
+            loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device)
+            loss.backward()
+            optimizer.step()
+            
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                best_lr = test_lr
+            break
+    
+    print(f'suggested_lr = {best_lr}')
+    return best_lr
 
 
 def pretrain_func(lr=args.lr):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # get dataloader
     dls = get_dls(args)
     
@@ -256,35 +253,92 @@ def pretrain_func(lr=args.lr):
     
     # get model
     model = get_model(dls.vars, args, vqvae_config, transformer_config)
+    model = model.to(device)
     
-    # get loss (dummy loss, actual loss computed in model)
-    loss_func = NextTokenLoss()
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin:
+        revin = revin.to(device)
     
-    # get callbacks
-    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
-    cbs += [
-        NextTokenPredictionCB(compression_factor=vqvae_config['compression_factor']),
-        SaveModelCB(monitor='valid_loss', fname=args.save_pretrained_model,                       
-                    path=args.save_path)
-    ]
+    # Optimizer and scheduler
+    optimizer = Adam(model.parameters(), lr=lr)
+    total_steps = len(dls.train) * args.n_epochs_pretrain
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.2)
     
-    # define learner
-    learn = Learner(dls, model, 
-                    loss_func, 
-                    lr=lr, 
-                    cbs=cbs,
-                    )                        
-    # fit the data to the model
-    learn.fit_one_cycle(n_epochs=args.n_epochs_pretrain, lr_max=lr)
-
-    train_loss = learn.recorder['train_loss']
-    valid_loss = learn.recorder['valid_loss']
-    df = pd.DataFrame(data={'train_loss': train_loss, 'valid_loss': valid_loss})
+    # Training loop
+    train_losses = []
+    valid_losses = []
+    best_val_loss = float('inf')
+    
+    print(f"开始预训练，共 {args.n_epochs_pretrain} 个 epoch")
+    
+    for epoch in range(args.n_epochs_pretrain):
+        # Training
+        model.train()
+        epoch_train_losses = []
+        
+        for batch_x, _ in dls.train:
+            batch_x = batch_x.to(device)
+            
+            # RevIN normalization
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+            
+            optimizer.zero_grad()
+            loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            epoch_train_losses.append(loss.item())
+        
+        avg_train_loss = np.mean(epoch_train_losses)
+        train_losses.append(avg_train_loss)
+        
+        # Validation
+        model.eval()
+        epoch_valid_losses = []
+        
+        with torch.no_grad():
+            for batch_x, _ in dls.valid:
+                batch_x = batch_x.to(device)
+                
+                # RevIN normalization
+                if revin:
+                    batch_x = revin(batch_x, 'norm')
+                
+                loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device)
+                epoch_valid_losses.append(loss.item())
+        
+        avg_valid_loss = np.mean(epoch_valid_losses)
+        valid_losses.append(avg_valid_loss)
+        
+        # Save best model
+        if avg_valid_loss < best_val_loss:
+            best_val_loss = avg_valid_loss
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'transformer_config': transformer_config,
+                'vqvae_config': vqvae_config,
+                'epoch': epoch,
+                'valid_loss': avg_valid_loss
+            }
+            torch.save(checkpoint, os.path.join(args.save_path, args.save_pretrained_model + '.pth'))
+            print(f"Epoch {epoch+1}/{args.n_epochs_pretrain} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Best Model Saved*")
+        else:
+            print(f"Epoch {epoch+1}/{args.n_epochs_pretrain} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
+    
+    # Save loss history
+    df = pd.DataFrame(data={'train_loss': train_losses, 'valid_loss': valid_losses})
     df.to_csv(args.save_path + args.save_pretrained_model + '_losses.csv', float_format='%.6f', index=False)
+    print(f"训练完成！损失历史已保存到 {args.save_path + args.save_pretrained_model + '_losses.csv'}")
 
 
 if __name__ == '__main__':
     args.dset = args.dset_pretrain
+    # 保存 transformer 配置
+    save_transformer_config(args, f'{args.dset_pretrain}_transformer_config.json')
+    # 查找学习率
     suggested_lr = find_lr()
     # Pretrain
     pretrain_func(suggested_lr)

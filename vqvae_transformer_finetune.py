@@ -1,6 +1,6 @@
 """
 VQVAE + Transformer 微调脚本
-参考 patchtst_finetune.py 的结构，使用 Learner 框架
+使用标准 PyTorch 训练循环，不使用 Learner
 在微调完成后直接输出测试集结果
 """
 
@@ -9,14 +9,12 @@ import pandas as pd
 import os
 import torch
 from torch import nn
+from torch.optim import Adam
+from torch.optim.lr_scheduler import OneCycleLR
 
 from src.models.vqvae_transformer import VQVAETransformerPretrain, VQVAETransformerFinetune
 from src.models.vqvae import vqvae, Decoder
-from src.learner import Learner
-from src.callback.core import *
-from src.callback.tracking import *
-from src.callback.transforms import *
-from src.metrics import *
+from src.models.layers.revin import RevIN
 from src.basics import set_device
 from src.utils_vqvae import load_vqvae_config
 from datautils import get_dls
@@ -69,26 +67,6 @@ args.save_finetuned_model = args.dset_finetune + '_vqvae_transformer_finetuned' 
 set_device()
 
 
-class VQVAETransformerFinetuneWrapper(nn.Module):
-    """
-    包装类，使 VQVAETransformerFinetune 能够与 Learner 框架兼容
-    """
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        
-    def forward(self, x):
-        """
-        Args:
-            x: [B, context_len, n_vars] 输入时间序列
-        
-        Returns:
-            pred: [B, target_len, n_vars] 预测结果
-        """
-        # 从dataloader获取target_len（通过模型属性传递）
-        target_len = getattr(self, '_target_len', args.target_points)
-        pred = self.model(x, target_len)
-        return pred
 
 def load_json_config(path):
     import json
@@ -182,17 +160,16 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
         add_finetune_head=False,
     )
 
-    # 包装成 learner-friendly 格式
-    model = VQVAETransformerFinetuneWrapper(finetune_model)
-    model._target_len = args.target_points
-
     print('number of trainable params:',
-          sum(p.numel() for p in model.parameters() if p.requires_grad))
+          sum(p.numel() for p in finetune_model.parameters() if p.requires_grad))
 
-    return model
+    return finetune_model
 
 
 def find_lr():
+    """简单的学习率查找：使用一个小的训练循环"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # 1) dataloader
     dls = get_dls(args)
 
@@ -201,35 +178,59 @@ def find_lr():
 
     # 3) 构建 model
     model = get_model(dls.vars, args, vqvae_config)
-
-    # 4) loss
-    loss_func = torch.nn.MSELoss(reduction='mean')
-
-    # 5) callbacks
-    cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
-
-    # 6) learner
-    learn = Learner(
-        dls,
-        model,
-        loss_func,
-        lr=args.lr,
-        cbs=cbs,
-    )
-
-    # 7) lr finder
-    suggested_lr = learn.lr_finder()
-    print("suggested_lr =", suggested_lr)
-    return suggested_lr
-
-def save_recorders(learn):
-    train_loss = learn.recorder['train_loss']
-    valid_loss = learn.recorder['valid_loss']
-    df = pd.DataFrame(data={'train_loss': train_loss, 'valid_loss': valid_loss})
-    df.to_csv(args.save_path + args.save_finetuned_model + '_losses.csv', float_format='%.6f', index=False)
+    model = model.to(device)
+    
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin:
+        revin = revin.to(device)
+    
+    # Loss
+    loss_func = nn.MSELoss(reduction='mean')
+    
+    # Optimizer
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    
+    # 简单的学习率查找：尝试几个不同的学习率
+    best_lr = args.lr
+    best_loss = float('inf')
+    
+    for test_lr in [1e-5, 5e-5, 1e-4, 5e-4, 1e-3]:
+        optimizer.param_groups[0]['lr'] = test_lr
+        model.train()
+        
+        # 使用一个 batch 测试
+        for batch_x, batch_y in dls.train:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            
+            # RevIN normalization
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+            
+            optimizer.zero_grad()
+            pred = model(batch_x, args.target_points)
+            
+            # RevIN denormalization
+            if revin:
+                pred = revin(pred, 'denorm')
+            
+            loss = loss_func(pred, batch_y)
+            loss.backward()
+            optimizer.step()
+            
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                best_lr = test_lr
+            break
+    
+    print(f"suggested_lr = {best_lr}")
+    return best_lr
 
 
 def finetune_func(lr=args.lr):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     print('end-to-end finetuning')
     # get dataloader
     dls = get_dls(args)
@@ -239,29 +240,100 @@ def finetune_func(lr=args.lr):
     
     # get model (transformer_config 会在 get_model 内部自动加载)
     model = get_model(dls.vars, args, vqvae_config)
+    model = model.to(device)
     
-    # get loss
-    loss_func = torch.nn.MSELoss(reduction='mean')
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin:
+        revin = revin.to(device)
     
-    # get callbacks
-    cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
-    cbs += [
-        SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
-    ]
+    # Loss
+    loss_func = nn.MSELoss(reduction='mean')
     
-    # define learner
-    learn = Learner(dls, model, 
-                    loss_func, 
-                    lr=lr, 
-                    cbs=cbs,
-                    metrics=[mse]
-                    )                            
-    # fit the data to the model
-    learn.fine_tune(n_epochs=args.n_epochs_finetune, base_lr=lr, freeze_epochs=0)
-    save_recorders(learn)
+    # Optimizer and scheduler
+    optimizer = Adam(model.parameters(), lr=lr)
+    total_steps = len(dls.train) * args.n_epochs_finetune
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.2)
+    
+    # Training loop
+    train_losses = []
+    valid_losses = []
+    best_val_loss = float('inf')
+    
+    print(f"开始微调，共 {args.n_epochs_finetune} 个 epoch")
+    
+    for epoch in range(args.n_epochs_finetune):
+        # Training
+        model.train()
+        epoch_train_losses = []
+        
+        for batch_x, batch_y in dls.train:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            
+            # RevIN normalization
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+            
+            optimizer.zero_grad()
+            pred = model(batch_x, args.target_points)
+            
+            # RevIN denormalization
+            if revin:
+                pred = revin(pred, 'denorm')
+            
+            loss = loss_func(pred, batch_y)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            epoch_train_losses.append(loss.item())
+        
+        avg_train_loss = np.mean(epoch_train_losses)
+        train_losses.append(avg_train_loss)
+        
+        # Validation
+        model.eval()
+        epoch_valid_losses = []
+        
+        with torch.no_grad():
+            for batch_x, batch_y in dls.valid:
+                batch_x = batch_x.to(device)
+                batch_y = batch_y.to(device)
+                
+                # RevIN normalization
+                if revin:
+                    batch_x = revin(batch_x, 'norm')
+                
+                pred = model(batch_x, args.target_points)
+                
+                # RevIN denormalization
+                if revin:
+                    pred = revin(pred, 'denorm')
+                
+                loss = loss_func(pred, batch_y)
+                epoch_valid_losses.append(loss.item())
+        
+        avg_valid_loss = np.mean(epoch_valid_losses)
+        valid_losses.append(avg_valid_loss)
+        
+        # Save best model
+        if avg_valid_loss < best_val_loss:
+            best_val_loss = avg_valid_loss
+            torch.save(model.state_dict(), os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
+            print(f"Epoch {epoch+1}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Best Model Saved*")
+        else:
+            print(f"Epoch {epoch+1}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
+    
+    # Save loss history
+    df = pd.DataFrame(data={'train_loss': train_losses, 'valid_loss': valid_losses})
+    df.to_csv(args.save_path + args.save_finetuned_model + '_losses.csv', float_format='%.6f', index=False)
+    print(f"微调完成！损失历史已保存到 {args.save_path + args.save_finetuned_model + '_losses.csv'}")
 
 
 def test_func(weight_path):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # get dataloader
     dls = get_dls(args)
     
@@ -270,21 +342,58 @@ def test_func(weight_path):
     
     # get model (transformer_config 会在 get_model 内部自动加载)
     model = get_model(dls.vars, args, vqvae_config)
+    model = model.to(device)
     
-    # get callbacks
-    cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
+    # Load weights
+    model.load_state_dict(torch.load(weight_path + '.pth', map_location=device))
+    model.eval()
     
-    learn = Learner(dls, model, cbs=cbs)
-    out = learn.test(dls.test, weight_path=weight_path + '.pth', scores=[mse, mae])
-    print('score:', out[2])
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin:
+        revin = revin.to(device)
+    
+    # Test
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for batch_x, batch_y in dls.test:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            
+            # RevIN normalization
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+            
+            pred = model(batch_x, args.target_points)
+            
+            # RevIN denormalization
+            if revin:
+                pred = revin(pred, 'denorm')
+            
+            all_preds.append(pred.cpu())
+            all_targets.append(batch_y.cpu())
+    
+    # Concatenate all predictions and targets
+    preds = torch.cat(all_preds, dim=0).numpy()
+    targets = torch.cat(all_targets, dim=0).numpy()
+    
+    # Calculate metrics
+    mse = np.mean((preds - targets) ** 2)
+    mae = np.mean(np.abs(preds - targets))
+    
+    scores = [mse, mae]
+    print(f'score: MSE={mse:.6f}, MAE={mae:.6f}')
     
     # save results
-    pd.DataFrame(np.array(out[2]).reshape(1, -1), columns=['mse', 'mae']).to_csv(
+    pd.DataFrame(np.array(scores).reshape(1, -1), columns=['mse', 'mae']).to_csv(
         args.save_path + args.save_finetuned_model + '_acc.csv', 
         float_format='%.6f', 
         index=False
     )
-    return out
+    
+    return [preds, targets, scores]
 
 
 if __name__ == '__main__':
