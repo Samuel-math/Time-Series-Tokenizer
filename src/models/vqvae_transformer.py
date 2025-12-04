@@ -174,7 +174,8 @@ class VQVAETransformerPretrain(nn.Module):
                   如果为None，会尝试从模型属性中获取（用于Learner框架兼容）
         
         Returns:
-            logits: [B, codebook_size, T/compression_factor, C] codebook概率logits
+            probs: [B, codebook_size, T/compression_factor, C] codebook概率
+            encoding_indices: [B, T/compression_factor, C] 对应每个位置的码本索引（可选返回）
         """
         # 如果mask为None，尝试从模型属性获取（用于Learner框架）
         if mask is None and hasattr(self, '_current_mask'):
@@ -184,6 +185,7 @@ class VQVAETransformerPretrain(nn.Module):
         
         # 对每个通道分别编码
         encoded_features = []
+        encoding_indices = []
         for ch in range(C):
             x_ch = x[:, :, ch]  # [B, T]
             x_ch = x_ch.view(B, T)
@@ -192,10 +194,20 @@ class VQVAETransformerPretrain(nn.Module):
             z = self.vqvae_encoder(x_ch, self.compression_factor)  # [B, embedding_dim, T/compression_factor]
             z = z.permute(0, 2, 1)  # [B, T/compression_factor, embedding_dim]
             
+            # 找到码本（VQ）最近的索引
+            with torch.no_grad():
+                # z [B, T/compression_factor, embedding_dim] -> [B, embedding_dim, T/compression_factor]
+                z_for_vq = z.permute(0, 2, 1).contiguous() # [B, embedding_dim, T/compression_factor]
+                _, _, _, _, ind, _ = self.vq(z_for_vq)
+                # ind: [B * T/compression_factor, 1]
+                ind = ind.view(B, -1)  # [B, T/compression_factor]
+                encoding_indices.append(ind)
+            
             encoded_features.append(z)
         
         # Stack: [B, T/compression_factor, C, embedding_dim]
         z = torch.stack(encoded_features, dim=2)  # [B, T/compression_factor, C, embedding_dim]
+        encoding_indices = torch.stack(encoding_indices, dim=2)  # [B, T/compression_factor, C]
         
         # 投影到d_model
         z = self.projection(z)  # [B, T/compression_factor, C, d_model]
@@ -228,6 +240,7 @@ class VQVAETransformerPretrain(nn.Module):
         # 应用softmax得到每个码本元素的概率
         probs = F.softmax(logits, dim=1)  # [B, codebook_size, T/compression_factor, C]
         
+        # 返回概率和对应的编码索引（如果直接用于训练可只返回probs，根据需要可返回encoding_indices）
         return probs
 
 
