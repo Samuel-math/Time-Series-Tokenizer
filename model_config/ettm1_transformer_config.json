@@ -1,0 +1,8 @@
+{
+        "d_model": 128,
+        "n_layers": 3,
+        "n_heads": 8,
+        "d_ff": 256,
+        "dropout": 0.3,
+        "attn_dropout": 0.1
+}

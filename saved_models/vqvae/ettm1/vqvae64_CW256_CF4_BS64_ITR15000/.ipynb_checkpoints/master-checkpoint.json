@@ -1,7 +1,7 @@
 {
-    "start_time": "2025-12-03T13-03-46",
+    "start_time": "2025-12-04T04-42-06",
     "config file": "model_config/ettm1_vqvae.json",
-    "save directory": "saved_models/vqvae/vqvae64_CW256_CF4_BS64_ITR15000",
+    "save directory": "saved_models/vqvae/ettm1/vqvae64_CW256_CF4_BS64_ITR15000",
     "gpus": 0,
     "summaries": {
         "general_seed": 47,
@@ -23,7 +23,7 @@
             "compression_factor": 4,
             "dataset": "ETTm1"
         },
-        "total_time": 1893.335,
-        "log_path": "saved_models/vqvae/vqvae64_CW256_CF4_BS64_ITR15000"
+        "total_time": 979.613,
+        "log_path": "saved_models/vqvae/ettm1/vqvae64_CW256_CF4_BS64_ITR15000"
     }
 }
