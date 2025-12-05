@@ -484,24 +484,45 @@ class VQVAETransformerFinetune(nn.Module):
         
         return aggregated
     
-    def _get_codebook_indices(self, x):
+    def _get_codebook_embeddings_soft(self, x):
         """
-        使用预训练模型获取码本索引
+        使用预训练模型获取码本 embeddings（可微分版本）
         
         Args:
             x: [B, T, C] 输入时间序列
         
         Returns:
-            codebook_indices: [B, T/compression_factor, C] 码本索引
+            embeddings: [B, T/compression_factor, C, embedding_dim] 软分配的 codebook embeddings
         """
         # 使用预训练模型获取 logits
         logits = self.pretrained_model(x, mask=None)  # [B, codebook_size, T/compression_factor, C]
         
-        # 获取码本索引（argmax）
+        # 使用 softmax 获取概率分布（可微分）
         # logits: [B, codebook_size, T/compression_factor, C]
-        codebook_indices = torch.argmax(logits, dim=1)  # [B, T/compression_factor, C]
+        probs = F.softmax(logits, dim=1)  # [B, codebook_size, T/compression_factor, C]
         
-        return codebook_indices
+        # 获取预训练模型的 codebook embeddings
+        codebook_embedding = self.pretrained_model.vq._embedding  # [num_embeddings, embedding_dim]
+        
+        # 使用概率分布加权求和 codebook embeddings（可微分）
+        # probs: [B, codebook_size, T/compression_factor, C]
+        # codebook_embedding: [num_embeddings, embedding_dim]
+        B, codebook_size, T_compressed, C = probs.shape
+        embedding_dim = codebook_embedding.weight.shape[1]
+        
+        # 对每个通道分别处理
+        embeddings = []
+        for ch in range(C):
+            probs_ch = probs[:, :, :, ch]  # [B, codebook_size, T/compression_factor]
+            probs_ch = probs_ch.permute(0, 2, 1)  # [B, T/compression_factor, codebook_size]
+            # 加权求和: [B, T/compression_factor, codebook_size] @ [codebook_size, embedding_dim]
+            embed_ch = torch.matmul(probs_ch, codebook_embedding.weight)  # [B, T/compression_factor, embedding_dim]
+            embeddings.append(embed_ch)
+        
+        # Stack: [B, T/compression_factor, C, embedding_dim]
+        embeddings = torch.stack(embeddings, dim=2)
+        
+        return embeddings
     
     def forward(self, x, target_len):
         """
@@ -514,23 +535,9 @@ class VQVAETransformerFinetune(nn.Module):
         """
         B, T, C = x.shape
         
-        # 获取码本索引
-        codebook_indices = self._get_codebook_indices(x)  # [B, T/compression_factor, C]
-        
-        # 直接使用预训练模型的 codebook (vq._embedding) 将索引转换为向量
-        # 使用预训练模型的 codebook embedding
-        codebook_embedding = self.pretrained_model.vq._embedding  # nn.Embedding(num_embeddings, embedding_dim)
-        
-        # 将码本索引转换为 embedding 向量
-        embeddings = []
-        for ch in range(C):
-            indices_ch = codebook_indices[:, :, ch]  # [B, T/compression_factor]
-            # 使用预训练的 codebook 查找 embedding
-            embed_ch = codebook_embedding(indices_ch)  # [B, T/compression_factor, embedding_dim]
-            embeddings.append(embed_ch)
-        
-        # Stack: [B, T/compression_factor, C, embedding_dim]
-        embeddings = torch.stack(embeddings, dim=2)
+        # 使用可微分的 soft assignment 获取 codebook embeddings
+        # 这样可以保持梯度流，允许微调 transformer
+        embeddings = self._get_codebook_embeddings_soft(x)  # [B, T/compression_factor, C, embedding_dim]
         
         # 对时间维度进行聚合，减少参数
         aggregated = self._aggregate_embeddings(embeddings)  # [B, C, embedding_dim]

@@ -279,7 +279,15 @@ def finetune_func(lr=args.lr):
     best_val_loss = float('inf')
     
     print(f"开始微调，共 {args.n_epochs_finetune} 个 epoch")
-    print(f"可训练参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_count = sum(p.numel() for p in model.parameters())
+    print(f"可训练参数数量: {trainable_count} / {total_count} ({100*trainable_count/total_count:.2f}%)")
+    
+    # 打印可训练参数的详细信息（用于调试）
+    print("\n可训练参数详情:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"  {name}: {param.shape}, requires_grad={param.requires_grad}")
     
     for epoch in range(args.n_epochs_finetune):
         # Training
@@ -310,8 +318,25 @@ def finetune_func(lr=args.lr):
             
             loss.backward()
             
+            # 第一个 batch 打印详细的梯度信息（用于调试）
+            if epoch == 0 and batch_idx == 0:
+                print("\n第一个 batch 的梯度信息:")
+                has_grad = False
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        if param.grad is not None:
+                            grad_norm = param.grad.data.norm(2).item()
+                            if grad_norm > 1e-8:  # 只打印有意义的梯度
+                                print(f"  {name}: grad_norm={grad_norm:.6e}")
+                                has_grad = True
+                        else:
+                            print(f"  {name}: grad is None!")
+                if not has_grad:
+                    print("  警告: 没有检测到任何梯度！")
+                print()
+            
             # 梯度裁剪（防止梯度爆炸）
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=100)
             
             optimizer.step()
             scheduler.step()
