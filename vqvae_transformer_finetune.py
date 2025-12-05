@@ -35,12 +35,15 @@ parser.add_argument('--features', type=str, default='M', help='for multivariate 
 # RevIN
 parser.add_argument('--revin', type=int, default=1, help='reversible instance normalization')
 # Pretrained model paths
-parser.add_argument('--pretrained_model', type=str, required=True,
-                   help='Path to pretrained VQVAE+Transformer model checkpoint')
+parser.add_argument('--init_mode', type=str, default='vqvae_transformer',
+                   choices=['random', 'vqvae_only', 'vqvae_transformer'],
+                   help='Initialization mode: random (fully random), vqvae_only (load VQVAE only), vqvae_transformer (load VQVAE+Transformer)')
+parser.add_argument('--pretrained_model', type=str, default=None,
+                   help='Path to pretrained VQVAE+Transformer model checkpoint (required if init_mode is vqvae_transformer)')
 parser.add_argument('--vqvae_config_path', type=str, required=True,
                    help='Path to VQVAE config file')
 parser.add_argument('--vqvae_checkpoint', type=str, default=None,
-                   help='Path to VQVAE checkpoint (deprecated, not needed for new architecture)')
+                   help='Path to VQVAE checkpoint (required if init_mode is vqvae_only or vqvae_transformer)')
 parser.add_argument('--transformer_config_path', type=str, default='', help='Path to transformer config file')
 # Optimization args
 parser.add_argument('--n_epochs_finetune', type=int, default=20, help='number of finetuning epochs')
@@ -48,9 +51,6 @@ parser.add_argument('--n_epochs_head_only', type=int, default=10, help='number o
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for full finetuning')
 parser.add_argument('--lr_head_only', type=float, default=1e-3, help='learning rate for head-only training phase (usually higher)')
 # Model architecture args
-parser.add_argument('--aggregation', type=str, default='mean', 
-                   choices=['mean', 'max', 'last', 'attention'],
-                   help='aggregation method for embeddings: mean, max, last, or attention')
 parser.add_argument('--head_type', type=str, default='mlp', choices=['mlp', 'linear'],
                    help='prediction head type: mlp or linear')
 parser.add_argument('--head_dropout', type=float, default=0.1, help='dropout rate for prediction head')
@@ -117,55 +117,145 @@ def load_transformer_config(args, pretrained_checkpoint=None, device='cpu'):
 
 def get_model(c_in, args, vqvae_config, device='cpu'):
     """
-    加载预训练模型 + 构建 Finetune 模型（新架构，不需要 decoder）
+    根据初始化模式构建 Finetune 模型（使用解耦后的 API）
+    
+    支持三种初始化模式：
+    1. random: 完全随机初始化
+    2. vqvae_only: 加载训练好的 VQVAE，其余参数随机初始化
+    3. vqvae_transformer: 加载训练好的 VQVAE 和 Transformer，其余参数随机初始化
+    
     c_in: number of input variables
     """
-    print(f"加载预训练Transformer模型: {args.pretrained_model}")
-    pretrained_checkpoint = torch.load(args.pretrained_model, map_location=device)
-
-    # --------------------------
-    # 1) 获取 transformer_config
-    # --------------------------
-    transformer_config = load_transformer_config(args, pretrained_checkpoint, device)
-
-    # --------------------------
-    # 2) 构建预训练模型骨架
-    # --------------------------
-    pretrained_model = VQVAETransformerPretrain(vqvae_config, transformer_config)
-
-    # --------------------------
-    # 3) 加载 state_dict
-    # --------------------------
-    if isinstance(pretrained_checkpoint, dict) and 'model_state_dict' in pretrained_checkpoint:
-        pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'])
-    elif isinstance(pretrained_checkpoint, dict):
-        pretrained_model.load_state_dict(pretrained_checkpoint)
+    print(f"\n初始化模式: {args.init_mode}")
+    
+    # 获取 transformer_config（如果提供了配置文件）
+    transformer_config = None
+    if args.transformer_config_path and os.path.exists(args.transformer_config_path):
+        transformer_config = load_json_config(args.transformer_config_path)
+        print(f"从文件加载 transformer_config: {args.transformer_config_path}")
     else:
-        if hasattr(pretrained_checkpoint, 'state_dict'):
-            pretrained_model.load_state_dict(pretrained_checkpoint.state_dict())
-        else:
-            print("警告: checkpoint格式异常，尝试直接使用")
-            pretrained_model = pretrained_checkpoint
+        # 如果没有配置文件，使用默认配置
+        transformer_config = {
+            'd_model': 128,
+            'n_layers': 3,
+            'n_heads': 8,
+            'd_ff': 256,
+            'dropout': 0.1,
+            'attn_dropout': 0.1
+        }
+        print("使用默认 transformer_config")
+    
+    print("Transformer 配置:", transformer_config)
+    
+    # 根据初始化模式决定是否冻结 encoder 和 vq
+    # random 模式：不冻结，允许训练所有参数
+    # vqvae_only 和 vqvae_transformer 模式：冻结 encoder 和 vq（已加载预训练权重）
+    freeze_encoder = (args.init_mode != 'random')
+    freeze_vq = (args.init_mode != 'random')
+    
+    # 根据初始化模式构建 Finetune 模型
+    if args.init_mode == 'random':
+        print("模式: 完全随机初始化（所有参数随机初始化）")
+        # 直接构建，不加载任何权重
+        finetune_model = VQVAETransformerFinetune(
+            vqvae_config,
+            transformer_config,
+            pretrained_model=None,  # 不提供预训练模型
+            freeze_encoder=freeze_encoder,
+            freeze_vq=freeze_vq,
+            freeze_transformer=False,
+            head_type=args.head_type,
+            head_dropout=args.head_dropout,
+            individual=bool(args.individual),
+            load_vqvae_weights=False,
+            vqvae_checkpoint_path=None,
+            device=device
+        )
+        
+    elif args.init_mode == 'vqvae_only':
+        print("模式: 加载 VQVAE 权重，Transformer 随机初始化")
+        if args.vqvae_checkpoint is None:
+            raise ValueError("vqvae_only 模式需要提供 --vqvae_checkpoint")
+        
+        # 直接构建，只加载 VQVAE 权重
+        finetune_model = VQVAETransformerFinetune(
+            vqvae_config,
+            transformer_config,
+            pretrained_model=None,  # 不提供预训练模型
+            freeze_encoder=freeze_encoder,
+            freeze_vq=freeze_vq,
+            freeze_transformer=False,
+            head_type=args.head_type,
+            head_dropout=args.head_dropout,
+            individual=bool(args.individual),
+            load_vqvae_weights=True,  # 加载 VQVAE 权重
+            vqvae_checkpoint_path=args.vqvae_checkpoint,
+            device=device
+        )
+        
+    elif args.init_mode == 'vqvae_transformer':
+        print("模式: 加载 VQVAE 和 Transformer 权重")
+        if args.pretrained_model is None:
+            raise ValueError("vqvae_transformer 模式需要提供 --pretrained_model")
+        
+        # 先加载预训练的 VQVAETransformerPretrain 模型
+        print(f"加载预训练模型: {args.pretrained_model}")
+        pretrained_checkpoint = torch.load(args.pretrained_model, map_location=device)
+        
+        # 构建预训练模型骨架
+        pretrained_model = VQVAETransformerPretrain(
+            vqvae_config, 
+            transformer_config,
+            load_vqvae_weights=False,  # 先不加载，后面统一加载
+            vqvae_checkpoint_path=None,
+            device=device
+        )
+        
+        # 加载 state_dict
+        try:
+            if isinstance(pretrained_checkpoint, dict) and 'model_state_dict' in pretrained_checkpoint:
+                pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'], strict=False)
+            elif isinstance(pretrained_checkpoint, dict):
+                pretrained_model.load_state_dict(pretrained_checkpoint, strict=False)
+            else:
+                if hasattr(pretrained_checkpoint, 'state_dict'):
+                    pretrained_model.load_state_dict(pretrained_checkpoint.state_dict(), strict=False)
+                else:
+                    print("警告: checkpoint格式异常，尝试直接使用")
+                    pretrained_model = pretrained_checkpoint
+        except Exception as e:
+            print(f"加载预训练模型权重时出错: {e}")
+            print("将尝试仅加载 VQVAE 权重...")
+            if args.vqvae_checkpoint is not None:
+                pretrained_model._load_vqvae_weights(args.vqvae_checkpoint, device)
+            else:
+                raise ValueError("无法加载预训练权重，且未提供 --vqvae_checkpoint")
+        
+        # 如果还提供了单独的 VQVAE checkpoint，也加载（可能会覆盖）
+        if args.vqvae_checkpoint is not None:
+            print(f"额外加载 VQVAE 权重: {args.vqvae_checkpoint}")
+            pretrained_model._load_vqvae_weights(args.vqvae_checkpoint, device)
+        
+        pretrained_model.eval()
+        print("预训练模型骨架构建完成")
+        
+        # 使用预训练模型构建 Finetune 模型
+        finetune_model = VQVAETransformerFinetune(
+            vqvae_config,
+            transformer_config,
+            pretrained_model=pretrained_model,  # 提供预训练模型
+            freeze_encoder=freeze_encoder,
+            freeze_vq=freeze_vq,
+            freeze_transformer=False,
+            head_type=args.head_type,
+            head_dropout=args.head_dropout,
+            individual=bool(args.individual),
+            load_vqvae_weights=False,  # 已通过 pretrained_model 加载
+            vqvae_checkpoint_path=None,
+            device=device
+        )
 
-    pretrained_model.eval()
-    print("预训练Transformer模型已成功加载")
-
-    # --------------------------
-    # 4) 构建 Finetune 模型（新架构，不需要 decoder）
-    # --------------------------
-    finetune_model = VQVAETransformerFinetune(
-        pretrained_model,
-        vqvae_config,
-        freeze_encoder=True,      # 冻结 VQVAE encoder
-        freeze_vq=True,           # 冻结 VQ 层
-        freeze_transformer=False,  # 允许微调 Transformer
-        head_type=args.head_type,          # 预测头类型
-        head_dropout=args.head_dropout,    # 预测头 dropout
-        individual=bool(args.individual),   # 是否使用独立预测头
-        aggregation=args.aggregation       # 聚合方法
-    )
-
-    print('number of trainable params:',
+    print('可训练参数数量:',
           sum(p.numel() for p in finetune_model.parameters() if p.requires_grad))
 
     return finetune_model
@@ -252,15 +342,14 @@ def finetune_func(lr=args.lr):
     if revin:
         revin = revin.to(device)
     
-    # 冻结 VQVAE encoder 和 VQ 参数（在预训练模型中）
-    print("冻结 VQVAE encoder 和 VQ 参数")
-    if hasattr(model, 'pretrained_model'):
-        if hasattr(model.pretrained_model, 'vqvae_encoder'):
-            for param in model.pretrained_model.vqvae_encoder.parameters():
-                param.requires_grad = False
-        if hasattr(model.pretrained_model, 'vq'):
-            for param in model.pretrained_model.vq.parameters():
-                param.requires_grad = False
+    # 冻结逻辑已在 VQVAETransformerFinetune.__init__ 中根据 freeze_encoder 和 freeze_vq 参数处理
+    # 这里只需要打印当前冻结状态（用于调试）
+    encoder_params = sum(p.numel() for p in model.vqvae_encoder.parameters())
+    encoder_trainable = sum(p.numel() for p in model.vqvae_encoder.parameters() if p.requires_grad)
+    vq_params = sum(p.numel() for p in model.vq.parameters())
+    vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
+    print(f"VQVAE Encoder: {encoder_trainable}/{encoder_params} 参数可训练")
+    print(f"VQ Codebook: {vq_trainable}/{vq_params} 参数可训练")
     
     # 第一阶段：冻结 Transformer，只训练预测头
     if args.n_epochs_head_only > 0:
