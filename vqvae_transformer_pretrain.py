@@ -168,8 +168,9 @@ def compute_next_token_loss(model, x, compression_factor, device='cuda', beta=0.
             vq_loss, quantized, _, _, _, _ = model.vq(z)
             # quantized: [B, embedding_dim, T/compressed] (经过permute后)
             
-            # Decoder解码
-            data_recon = model.decoder(quantized, compression_factor)  # [B, L]
+            # Decoder解码（decoder 已冻结，不参与训练）
+            with torch.no_grad():
+                data_recon = model.decoder(quantized, compression_factor)  # [B, L]
             
             # 重构损失（MSE）
             recon_error = F.mse_loss(data_recon, x_ch)
@@ -208,7 +209,7 @@ def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
     
     # 只对 Transformer 部分初始化（如果 VQVAE 是预训练的，不要重新初始化）
     if args.vqvae_checkpoint is None:
-        # 如果没有加载 VQVAE 权重，初始化所有层
+        # 如果没有加载 VQVAE 权重，初始化所有层（但 decoder 保持冻结）
         model.apply(init_weights)
     else:
         # 只初始化 Transformer 部分
@@ -216,7 +217,14 @@ def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
         model.transformer_layers.apply(init_weights)
         model.codebook_head.apply(init_weights)
     
-    print('number of model params', sum(p.numel() for p in model.parameters() if p.requires_grad))
+    # 确保 decoder 始终冻结（不参与训练）
+    for param in model.decoder.parameters():
+        param.requires_grad = False
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    decoder_params = sum(p.numel() for p in model.decoder.parameters())
+    print(f'总参数数量: {total_params}, 可训练参数: {trainable_params}, Decoder参数(冻结): {decoder_params}')
     return model
 
 
