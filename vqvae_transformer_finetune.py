@@ -12,6 +12,7 @@ import torch
 from torch import nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import OneCycleLR
+import torch.nn.functional as F
 
 from src.models.vqvae_transformer import VQVAETransformerPretrain, VQVAETransformerFinetune
 from src.models.layers.revin import RevIN
@@ -55,6 +56,12 @@ parser.add_argument('--head_type', type=str, default='mlp', choices=['mlp', 'lin
                    help='prediction head type: mlp or linear')
 parser.add_argument('--head_dropout', type=float, default=0.1, help='dropout rate for prediction head')
 parser.add_argument('--individual', type=int, default=0, help='use individual prediction head for each channel')
+# TOTEM-style training args
+parser.add_argument('--scheme', type=int, default=2, choices=[1, 2],
+                   help='prediction scheme: 1 predicts mu/std separately, 2 uses RevIN denorm (like PatchTST)')
+parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'smoothl1'],
+                   help='loss function type: mse or smoothl1')
+parser.add_argument('--beta', type=float, default=0.1, help='beta for smoothl1 loss')
 # model id to keep track of the number of models saved
 parser.add_argument('--finetuned_model_id', type=int, default=1, help='id of the saved finetuned model')
 parser.add_argument('--model_type', type=str, default='vqvae_transformer', help='model type for saving')
@@ -76,6 +83,38 @@ args.save_finetuned_model = args.dset_finetune + '_vqvae_transformer_finetuned' 
 # get available GPU device
 set_device()
 
+
+class MuStdModel(nn.Module):
+    """
+    MuStdModel: 预测未来序列的均值和标准差（参考 TOTEM）
+    用于 RevIN 的 denormalization
+    """
+    def __init__(self, Tin, Tout, hidden_dims=[512, 512], dropout=0.2, is_mlp=True):
+        super().__init__()
+        self.Tin = Tin
+        self.Tout = Tout
+        
+        if is_mlp:
+            layers = []
+            input_dim = Tin
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(input_dim, hidden_dim))
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(dropout))
+                input_dim = hidden_dim
+            layers.append(nn.Linear(input_dim, 2))  # 输出 mean 和 std
+            self.model = nn.Sequential(*layers)
+        else:
+            self.model = nn.Linear(Tin, 2)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B*C, Tin] 输入时间序列（flattened）
+        Returns:
+            ymeanstd: [B*C, 2] 均值和标准差
+        """
+        return self.model(x)
 
 
 def load_json_config(path):
@@ -269,16 +308,39 @@ def find_lr():
     model = get_model(dls.vars, args, vqvae_config)
     model = model.to(device)
     
-    # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    if revin:
-        revin = revin.to(device)
+    # RevIN (参考 TOTEM)
+    revin_in = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    revin_out = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin_in:
+        revin_in = revin_in.to(device)
+    if revin_out:
+        revin_out = revin_out.to(device)
     
-    # Loss
-    loss_func = nn.MSELoss(reduction='mean')
+    # MuStdModel
+    model_mustd = MuStdModel(
+        Tin=args.context_points,
+        Tout=args.target_points,
+        hidden_dims=[512, 512],
+        dropout=0.2,
+        is_mlp=True
+    )
+    model_mustd.revin_in = revin_in
+    model_mustd.revin_out = revin_out
+    model_mustd = model_mustd.to(device)
     
-    # Optimizer
-    optimizer = Adam(model.parameters(), lr=args.lr)
+    # Loss function
+    def loss_fn(type, beta=1.0):
+        if type == "mse":
+            return nn.MSELoss(reduction='mean')
+        elif type == "smoothl1":
+            return nn.SmoothL1Loss(beta=beta, reduction='mean')
+        else:
+            raise ValueError("Invalid loss type")
+    
+    loss_func = loss_fn(args.loss_type, beta=args.beta)
+    
+    # Optimizer (包含 MuStdModel)
+    optimizer = Adam(list(model.parameters()) + list(model_mustd.parameters()), lr=args.lr)
     
     # 简单的学习率查找：尝试几个不同的学习率
     best_lr = args.lr
@@ -287,6 +349,7 @@ def find_lr():
     for test_lr in [1e-4, 5e-4, 1e-3]:
         optimizer.param_groups[0]['lr'] = test_lr
         model.train()
+        model_mustd.train()
         
         # 使用一个 batch 测试
         for batch_x, batch_y in dls.train:
@@ -294,17 +357,26 @@ def find_lr():
             batch_y = batch_y.to(device)
             
             # RevIN normalization
-            if revin:
-                batch_x = revin(batch_x, 'norm')
+            if model_mustd.revin_in:
+                _ = model_mustd.revin_in(batch_x, 'norm')
+            if model_mustd.revin_out:
+                norm_y = model_mustd.revin_out(batch_y, 'norm')
+            else:
+                norm_y = batch_y
             
             optimizer.zero_grad()
-            pred = model(batch_x, args.target_points)
+            pred_norm = model(batch_x, args.target_points)
             
-            # RevIN denormalization
-            if revin:
-                pred = revin(pred, 'denorm')
-            
-            loss = loss_func(pred, batch_y)
+            # 根据 scheme 计算损失
+            if args.scheme == 2:
+                if model_mustd.revin_in:
+                    pred = model_mustd.revin_in(pred_norm, 'denorm')
+                else:
+                    pred = pred_norm
+                loss = loss_func(pred, batch_y)
+            else:
+                # Scheme 1 需要 MuStdModel，这里简化处理
+                loss = loss_func(pred_norm, norm_y)
             loss.backward()
             optimizer.step()
             
@@ -331,10 +403,25 @@ def finetune_func(lr=args.lr):
     model = get_model(dls.vars, args, vqvae_config)
     model = model.to(device)
     
-    # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    if revin:
-        revin = revin.to(device)
+    # RevIN (参考 TOTEM: 使用两个 RevIN，一个用于输入，一个用于输出)
+    revin_in = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    revin_out = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin_in:
+        revin_in = revin_in.to(device)
+    if revin_out:
+        revin_out = revin_out.to(device)
+    
+    # MuStdModel (参考 TOTEM: 用于预测均值和标准差)
+    model_mustd = MuStdModel(
+        Tin=args.context_points,
+        Tout=args.target_points,
+        hidden_dims=[512, 512],
+        dropout=0.2,
+        is_mlp=True
+    )
+    model_mustd.revin_in = revin_in
+    model_mustd.revin_out = revin_out
+    model_mustd = model_mustd.to(device)
     
     # 第一阶段：冻结 Transformer，只训练预测头
     if args.n_epochs_head_only > 0:
@@ -351,8 +438,9 @@ def finetune_func(lr=args.lr):
         for param in model.codebook_head.parameters():
             param.requires_grad = False
         
-        # 只优化预测头参数
+        # 只优化预测头参数和 MuStdModel
         head_params = [p for p in model.parameters() if p.requires_grad]
+        head_params += list(model_mustd.parameters())  # 包含 MuStdModel
         print(f"第一阶段可训练参数数量: {sum(p.numel() for p in head_params)}")
         
         # 创建第一阶段的 optimizer 和 scheduler
@@ -386,18 +474,56 @@ def finetune_func(lr=args.lr):
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
                 
-                # RevIN normalization
-                if revin:
-                    batch_x = revin(batch_x, 'norm')
+                # RevIN normalization (参考 TOTEM)
+                if model_mustd.revin_in:
+                    _ = model_mustd.revin_in(batch_x, 'norm')
+                if model_mustd.revin_out:
+                    norm_y = model_mustd.revin_out(batch_y, 'norm')
+                else:
+                    norm_y = batch_y
                 
                 head_optimizer.zero_grad()
-                pred = model(batch_x, args.target_points)
                 
-                # RevIN denormalization
-                if revin:
-                    pred = revin(pred, 'denorm')
+                # 预测（模型内部已经处理了 codebook 转换）
+                pred_norm = model(batch_x, args.target_points)  # [B, target_len, C]
                 
-                loss = loss_func(pred, batch_y)
+                # 根据 scheme 计算损失（参考 TOTEM）
+                if args.scheme == 1:
+                    # Scheme 1: 预测 mu 和 std
+                    # 准备输入用于 MuStdModel
+                    times = batch_x.permute(0, 2, 1)  # [B, C, Tin]
+                    times = times.reshape(-1, times.shape[-1])  # [B*C, Tin]
+                    ymeanstd = model_mustd(times)  # [B*C, 2]
+                    
+                    # Reshape
+                    ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)  # [B, C, 2]
+                    ymeanstd = ymeanstd.permute(0, 2, 1)  # [B, 2, C]
+                    ymean = ymeanstd[:, 0, :].unsqueeze(1)  # [B, 1, C]
+                    ystd = ymeanstd[:, 1, :].unsqueeze(1)  # [B, 1, C]
+                    
+                    # 计算多个损失项
+                    loss_mu = loss_func(
+                        model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
+                        ymean
+                    )
+                    loss_std = loss_func(
+                        model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
+                        ystd
+                    )
+                    loss_decode = loss_func(pred_norm, norm_y)
+                    loss_all = loss_func(
+                        pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
+                        + (ymean.detach() + model_mustd.revin_in.mean),
+                        batch_y
+                    )
+                    loss = loss_decode + loss_mu + loss_std + loss_all
+                else:  # scheme == 2
+                    # Scheme 2: 直接预测，然后通过 RevIN denorm（类似 PatchTST）
+                    if model_mustd.revin_in:
+                        pred = model_mustd.revin_in(pred_norm, 'denorm')
+                    else:
+                        pred = pred_norm
+                    loss = loss_func(pred, batch_y)
                 
                 # 检查 loss 是否为 NaN 或 Inf
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -427,16 +553,46 @@ def finetune_func(lr=args.lr):
                     batch_y = batch_y.to(device)
                     
                     # RevIN normalization
-                    if revin:
-                        batch_x = revin(batch_x, 'norm')
+                    if model_mustd.revin_in:
+                        _ = model_mustd.revin_in(batch_x, 'norm')
+                    if model_mustd.revin_out:
+                        norm_y = model_mustd.revin_out(batch_y, 'norm')
+                    else:
+                        norm_y = batch_y
                     
-                    pred = model(batch_x, args.target_points)
+                    pred_norm = model(batch_x, args.target_points)
                     
-                    # RevIN denormalization
-                    if revin:
-                        pred = revin(pred, 'denorm')
-                    
-                    loss = loss_func(pred, batch_y)
+                    # 根据 scheme 计算损失
+                    if args.scheme == 1:
+                        times = batch_x.permute(0, 2, 1)
+                        times = times.reshape(-1, times.shape[-1])
+                        ymeanstd = model_mustd(times)
+                        ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
+                        ymeanstd = ymeanstd.permute(0, 2, 1)
+                        ymean = ymeanstd[:, 0, :].unsqueeze(1)
+                        ystd = ymeanstd[:, 1, :].unsqueeze(1)
+                        
+                        loss_mu = loss_func(
+                            model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
+                            ymean
+                        )
+                        loss_std = loss_func(
+                            model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
+                            ystd
+                        )
+                        loss_decode = loss_func(pred_norm, norm_y)
+                        loss_all = loss_func(
+                            pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
+                            + (ymean.detach() + model_mustd.revin_in.mean),
+                            batch_y
+                        )
+                        loss = loss_decode + loss_mu + loss_std + loss_all
+                    else:
+                        if model_mustd.revin_in:
+                            pred = model_mustd.revin_in(pred_norm, 'denorm')
+                        else:
+                            pred = pred_norm
+                        loss = loss_func(pred, batch_y)
                     epoch_valid_losses.append(loss.item())
             
             avg_valid_loss = np.mean(epoch_valid_losses)
@@ -472,8 +628,9 @@ def finetune_func(lr=args.lr):
     for param in model.codebook_head.parameters():
         param.requires_grad = True
     
-    # 创建第二阶段的 optimizer 和 scheduler
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # 创建第二阶段的 optimizer 和 scheduler（包含 MuStdModel）
+    trainable_params = list(model.parameters()) + list(model_mustd.parameters())
+    trainable_params = [p for p in trainable_params if p.requires_grad]
     print(f"第二阶段可训练参数数量: {sum(p.numel() for p in trainable_params)}")
     
     optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
@@ -492,17 +649,47 @@ def finetune_func(lr=args.lr):
             batch_y = batch_y.to(device)
             
             # RevIN normalization
-            if revin:
-                batch_x = revin(batch_x, 'norm')
+            if model_mustd.revin_in:
+                _ = model_mustd.revin_in(batch_x, 'norm')
+            if model_mustd.revin_out:
+                norm_y = model_mustd.revin_out(batch_y, 'norm')
+            else:
+                norm_y = batch_y
             
             optimizer.zero_grad()
-            pred = model(batch_x, args.target_points)
+            pred_norm = model(batch_x, args.target_points)
             
-            # RevIN denormalization
-            if revin:
-                pred = revin(pred, 'denorm')
-            
-            loss = loss_func(pred, batch_y)
+            # 根据 scheme 计算损失
+            if args.scheme == 1:
+                times = batch_x.permute(0, 2, 1)
+                times = times.reshape(-1, times.shape[-1])
+                ymeanstd = model_mustd(times)
+                ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
+                ymeanstd = ymeanstd.permute(0, 2, 1)
+                ymean = ymeanstd[:, 0, :].unsqueeze(1)
+                ystd = ymeanstd[:, 1, :].unsqueeze(1)
+                
+                loss_mu = loss_func(
+                    model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
+                    ymean
+                )
+                loss_std = loss_func(
+                    model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
+                    ystd
+                )
+                loss_decode = loss_func(pred_norm, norm_y)
+                loss_all = loss_func(
+                    pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
+                    + (ymean.detach() + model_mustd.revin_in.mean),
+                    batch_y
+                )
+                loss = loss_decode + loss_mu + loss_std + loss_all
+            else:
+                if model_mustd.revin_in:
+                    pred = model_mustd.revin_in(pred_norm, 'denorm')
+                else:
+                    pred = pred_norm
+                loss = loss_func(pred, batch_y)
             
             # 检查 loss 是否为 NaN 或 Inf
             current_epoch = args.n_epochs_head_only + epoch + 1
@@ -533,26 +720,62 @@ def finetune_func(lr=args.lr):
                 batch_y = batch_y.to(device)
                 
                 # RevIN normalization
-                if revin:
-                    batch_x = revin(batch_x, 'norm')
+                if model_mustd.revin_in:
+                    _ = model_mustd.revin_in(batch_x, 'norm')
+                if model_mustd.revin_out:
+                    norm_y = model_mustd.revin_out(batch_y, 'norm')
+                else:
+                    norm_y = batch_y
                 
-                pred = model(batch_x, args.target_points)
+                pred_norm = model(batch_x, args.target_points)
                 
-                # RevIN denormalization
-                if revin:
-                    pred = revin(pred, 'denorm')
-                
-                loss = loss_func(pred, batch_y)
+                # 根据 scheme 计算损失
+                if args.scheme == 1:
+                    times = batch_x.permute(0, 2, 1)
+                    times = times.reshape(-1, times.shape[-1])
+                    ymeanstd = model_mustd(times)
+                    ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
+                    ymeanstd = ymeanstd.permute(0, 2, 1)
+                    ymean = ymeanstd[:, 0, :].unsqueeze(1)
+                    ystd = ymeanstd[:, 1, :].unsqueeze(1)
+                    
+                    loss_mu = loss_func(
+                        model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
+                        ymean
+                    )
+                    loss_std = loss_func(
+                        model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
+                        ystd
+                    )
+                    loss_decode = loss_func(pred_norm, norm_y)
+                    loss_all = loss_func(
+                        pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
+                        + (ymean.detach() + model_mustd.revin_in.mean),
+                        batch_y
+                    )
+                    loss = loss_decode + loss_mu + loss_std + loss_all
+                else:
+                    if model_mustd.revin_in:
+                        pred = model_mustd.revin_in(pred_norm, 'denorm')
+                    else:
+                        pred = pred_norm
+                    loss = loss_func(pred, batch_y)
                 epoch_valid_losses.append(loss.item())
         
         avg_valid_loss = np.mean(epoch_valid_losses)
         valid_losses.append(avg_valid_loss)
         
-        # Save best model
+        # Save best model (包含 MuStdModel)
         current_epoch = args.n_epochs_head_only + epoch + 1
         if avg_valid_loss < best_val_loss:
             best_val_loss = avg_valid_loss
-            torch.save(model.state_dict(), os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
+            # 保存两个模型的状态
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'mustd_state_dict': model_mustd.state_dict(),
+                'args': args
+            }
+            torch.save(checkpoint, os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
             print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Best Model Saved*")
         else:
             print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
@@ -576,14 +799,37 @@ def test_func(weight_path):
     model = get_model(dls.vars, args, vqvae_config)
     model = model.to(device)
     
-    # Load weights
-    model.load_state_dict(torch.load(weight_path + '.pth', map_location=device))
+    # Load weights (包含 MuStdModel)
+    checkpoint = torch.load(weight_path + '.pth', map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'mustd_state_dict' in checkpoint:
+            model_mustd.load_state_dict(checkpoint['mustd_state_dict'])
+    else:
+        # 兼容旧格式（只有主模型）
+        model.load_state_dict(checkpoint)
     model.eval()
+    model_mustd.eval()
     
-    # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    if revin:
-        revin = revin.to(device)
+    # RevIN (参考 TOTEM)
+    revin_in = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    revin_out = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
+    if revin_in:
+        revin_in = revin_in.to(device)
+    if revin_out:
+        revin_out = revin_out.to(device)
+    
+    # MuStdModel
+    model_mustd = MuStdModel(
+        Tin=args.context_points,
+        Tout=args.target_points,
+        hidden_dims=[512, 512],
+        dropout=0.2,
+        is_mlp=True
+    )
+    model_mustd.revin_in = revin_in
+    model_mustd.revin_out = revin_out
+    model_mustd = model_mustd.to(device)
     
     # Test
     all_preds = []
@@ -595,14 +841,31 @@ def test_func(weight_path):
             batch_y = batch_y.to(device)
             
             # RevIN normalization
-            if revin:
-                batch_x = revin(batch_x, 'norm')
+            if model_mustd.revin_in:
+                _ = model_mustd.revin_in(batch_x, 'norm')
+            if model_mustd.revin_out:
+                _ = model_mustd.revin_out(batch_y, 'norm')
             
-            pred = model(batch_x, args.target_points)
+            pred_norm = model(batch_x, args.target_points)
             
-            # RevIN denormalization
-            if revin:
-                pred = revin(pred, 'denorm')
+            # 根据 scheme 进行 denormalization
+            if args.scheme == 1:
+                times = batch_x.permute(0, 2, 1)
+                times = times.reshape(-1, times.shape[-1])
+                ymeanstd = model_mustd(times)
+                ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
+                ymeanstd = ymeanstd.permute(0, 2, 1)
+                ymean = ymeanstd[:, 0, :].unsqueeze(1)
+                ystd = ymeanstd[:, 1, :].unsqueeze(1)
+                
+                ymean = ymean + model_mustd.revin_in.mean
+                ystd = ystd + model_mustd.revin_in.stdev
+                pred = pred_norm * ystd + ymean
+            else:  # scheme == 2
+                if model_mustd.revin_in:
+                    pred = model_mustd.revin_in(pred_norm, 'denorm')
+                else:
+                    pred = pred_norm
             
             all_preds.append(pred.cpu())
             all_targets.append(batch_y.cpu())
