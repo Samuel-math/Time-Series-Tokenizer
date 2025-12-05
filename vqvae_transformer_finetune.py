@@ -43,7 +43,9 @@ parser.add_argument('--vqvae_checkpoint', type=str, default=None,
 parser.add_argument('--transformer_config_path', type=str, default='', help='Path to transformer config file')
 # Optimization args
 parser.add_argument('--n_epochs_finetune', type=int, default=20, help='number of finetuning epochs')
-parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+parser.add_argument('--n_epochs_head_only', type=int, default=5, help='number of epochs to train only prediction head (freeze transformer)')
+parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for full finetuning')
+parser.add_argument('--lr_head_only', type=float, default=1e-3, help='learning rate for head-only training phase (usually higher)')
 # Model architecture args
 parser.add_argument('--aggregation', type=str, default='mean', 
                    choices=['mean', 'max', 'last', 'attention'],
@@ -259,15 +261,39 @@ def finetune_func(lr=args.lr):
             for param in model.pretrained_model.vq.parameters():
                 param.requires_grad = False
     
+    # 第一阶段：冻结 Transformer，只训练预测头
+    if args.n_epochs_head_only > 0:
+        print(f"\n{'='*60}")
+        print(f"第一阶段：只训练预测头（冻结 Transformer）")
+        print(f"训练轮数: {args.n_epochs_head_only}, 学习率: {args.lr_head_only}")
+        print(f"{'='*60}")
+        
+        # 冻结 Transformer 参数
+        if hasattr(model, 'pretrained_model'):
+            for param in model.pretrained_model.transformer_layers.parameters():
+                param.requires_grad = False
+            for param in model.pretrained_model.projection.parameters():
+                param.requires_grad = False
+            for param in model.pretrained_model.codebook_head.parameters():
+                param.requires_grad = False
+            if hasattr(model, 'attention_aggregation') and model.attention_aggregation is not None:
+                for param in model.attention_aggregation.parameters():
+                    param.requires_grad = False
+                if hasattr(model, '_attention_query'):
+                    model._attention_query.requires_grad = False
+        
+        # 只优化预测头参数
+        head_params = [p for p in model.parameters() if p.requires_grad]
+        print(f"第一阶段可训练参数数量: {sum(p.numel() for p in head_params)}")
+        
+        # 创建第一阶段的 optimizer 和 scheduler
+        head_optimizer = Adam(head_params, lr=args.lr_head_only, weight_decay=1e-5)
+        head_total_steps = len(dls.train) * args.n_epochs_head_only
+        head_scheduler = OneCycleLR(head_optimizer, max_lr=args.lr_head_only, 
+                                   total_steps=head_total_steps, pct_start=0.3)
+    
     # Loss
     loss_func = nn.MSELoss(reduction='mean')
-    
-    # Optimizer and scheduler
-    # 只优化需要梯度的参数
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
-    total_steps = len(dls.train) * args.n_epochs_finetune
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
     
     # 清空 torch 缓存
     if torch.cuda.is_available():
@@ -277,11 +303,111 @@ def finetune_func(lr=args.lr):
     train_losses = []
     valid_losses = []
     best_val_loss = float('inf')
+    current_epoch = 0
     
-    print(f"开始微调，共 {args.n_epochs_finetune} 个 epoch")
-    print(f"可训练参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    # 第一阶段：只训练预测头
+    if args.n_epochs_head_only > 0:
+        for epoch in range(args.n_epochs_head_only):
+            current_epoch = epoch + 1
+            # Training
+            model.train()
+            epoch_train_losses = []
+            
+            for batch_idx, (batch_x, batch_y) in enumerate(dls.train):
+                batch_x = batch_x.to(device)
+                batch_y = batch_y.to(device)
+                
+                # RevIN normalization
+                if revin:
+                    batch_x = revin(batch_x, 'norm')
+                
+                head_optimizer.zero_grad()
+                pred = model(batch_x, args.target_points)
+                
+                # RevIN denormalization
+                if revin:
+                    pred = revin(pred, 'denorm')
+                
+                loss = loss_func(pred, batch_y)
+                
+                # 检查 loss 是否为 NaN 或 Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"警告: Epoch {current_epoch}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
+                    continue
+                
+                loss.backward()
+                
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(head_params, max_norm=100)
+                
+                head_optimizer.step()
+                head_scheduler.step()
+                
+                epoch_train_losses.append(loss.item())
+            
+            avg_train_loss = np.mean(epoch_train_losses)
+            train_losses.append(avg_train_loss)
+            
+            # Validation
+            model.eval()
+            epoch_valid_losses = []
+            
+            with torch.no_grad():
+                for batch_x, batch_y in dls.valid:
+                    batch_x = batch_x.to(device)
+                    batch_y = batch_y.to(device)
+                    
+                    # RevIN normalization
+                    if revin:
+                        batch_x = revin(batch_x, 'norm')
+                    
+                    pred = model(batch_x, args.target_points)
+                    
+                    # RevIN denormalization
+                    if revin:
+                        pred = revin(pred, 'denorm')
+                    
+                    loss = loss_func(pred, batch_y)
+                    epoch_valid_losses.append(loss.item())
+            
+            avg_valid_loss = np.mean(epoch_valid_losses)
+            valid_losses.append(avg_valid_loss)
+            
+            print(f"阶段1 - Epoch {current_epoch}/{args.n_epochs_head_only} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
+        
+        print(f"\n第一阶段训练完成！")
     
-    for epoch in range(args.n_epochs_finetune):
+    # 第二阶段：解冻 Transformer，全量微调
+    print(f"\n{'='*60}")
+    print(f"第二阶段：全量微调（解冻 Transformer）")
+    print(f"训练轮数: {args.n_epochs_finetune - args.n_epochs_head_only}, 学习率: {lr}")
+    print(f"{'='*60}")
+    
+    # 解冻 Transformer 参数
+    if hasattr(model, 'pretrained_model'):
+        for param in model.pretrained_model.transformer_layers.parameters():
+            param.requires_grad = True
+        for param in model.pretrained_model.projection.parameters():
+            param.requires_grad = True
+        for param in model.pretrained_model.codebook_head.parameters():
+            param.requires_grad = True
+        if hasattr(model, 'attention_aggregation') and model.attention_aggregation is not None:
+            for param in model.attention_aggregation.parameters():
+                param.requires_grad = True
+            if hasattr(model, '_attention_query'):
+                model._attention_query.requires_grad = True
+    
+    # 创建第二阶段的 optimizer 和 scheduler
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"第二阶段可训练参数数量: {sum(p.numel() for p in trainable_params)}")
+    
+    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
+    full_finetune_steps = args.n_epochs_finetune - args.n_epochs_head_only
+    total_steps = len(dls.train) * full_finetune_steps
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
+    
+    # 第二阶段训练
+    for epoch in range(full_finetune_steps):
         # Training
         model.train()
         epoch_train_losses = []
@@ -304,8 +430,9 @@ def finetune_func(lr=args.lr):
             loss = loss_func(pred, batch_y)
             
             # 检查 loss 是否为 NaN 或 Inf
+            current_epoch = args.n_epochs_head_only + epoch + 1
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"警告: Epoch {epoch+1}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
+                print(f"警告: Epoch {current_epoch}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
                 continue
             
             loss.backward()
@@ -347,12 +474,13 @@ def finetune_func(lr=args.lr):
         valid_losses.append(avg_valid_loss)
         
         # Save best model
+        current_epoch = args.n_epochs_head_only + epoch + 1
         if avg_valid_loss < best_val_loss:
             best_val_loss = avg_valid_loss
             torch.save(model.state_dict(), os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
-            print(f"Epoch {epoch+1}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Best Model Saved*")
+            print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Best Model Saved*")
         else:
-            print(f"Epoch {epoch+1}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
+            print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
     
     # Save loss history
     df = pd.DataFrame(data={'train_loss': train_losses, 'valid_loss': valid_losses})
