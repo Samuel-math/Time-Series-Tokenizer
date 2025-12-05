@@ -7,6 +7,7 @@ VQVAE + Transformer 微调脚本
 import numpy as np
 import pandas as pd
 import os
+import random
 import torch
 from torch import nn
 from torch.optim import Adam
@@ -337,6 +338,47 @@ def finetune_func(lr=args.lr):
                 
                 loss.backward()
                 
+                # 随机打印梯度信息（用于调试）
+                if random.random() < 0.1:  # 10% 的概率打印
+                    print(f"\n[阶段1 - Epoch {current_epoch}, Batch {batch_idx}] 梯度信息:")
+                    has_grad = False
+                    no_grad_count = 0
+                    grad_stats = []
+                    
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            if param.grad is not None:
+                                grad_norm = param.grad.data.norm(2).item()
+                                grad_mean = param.grad.data.mean().item()
+                                grad_max = param.grad.data.max().item()
+                                grad_min = param.grad.data.min().item()
+                                
+                                if grad_norm > 1e-8:  # 只打印有意义的梯度
+                                    print(f"  {name}:")
+                                    print(f"    norm={grad_norm:.6e}, mean={grad_mean:.6e}, max={grad_max:.6e}, min={grad_min:.6e}")
+                                    print(f"    shape={param.shape}, numel={param.numel()}")
+                                    has_grad = True
+                                    grad_stats.append({
+                                        'name': name,
+                                        'norm': grad_norm,
+                                        'mean': grad_mean,
+                                        'max': grad_max,
+                                        'min': grad_min
+                                    })
+                                    if len(grad_stats) >= 5:  # 只打印前5个有梯度的参数
+                                        break
+                            else:
+                                no_grad_count += 1
+                                if no_grad_count <= 3:  # 只打印前3个没有梯度的参数
+                                    print(f"  {name}: grad is None!")
+                    
+                    if not has_grad:
+                        print("  警告: 没有检测到任何有意义的梯度！")
+                    else:
+                        print(f"  共找到 {len(grad_stats)} 个有梯度的参数，{no_grad_count} 个参数梯度为 None")
+                    
+                    print(f"  Loss: {loss.item():.6f}\n")
+                
                 # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(head_params, max_norm=100)
                 
@@ -373,13 +415,25 @@ def finetune_func(lr=args.lr):
             avg_valid_loss = np.mean(epoch_valid_losses)
             valid_losses.append(avg_valid_loss)
             
-            print(f"阶段1 - Epoch {current_epoch}/{args.n_epochs_head_only} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
+            # 第一阶段也检查是否有改善
+            if avg_valid_loss < best_val_loss:
+                best_val_loss = avg_valid_loss
+                print(f"阶段1 - Epoch {current_epoch}/{args.n_epochs_head_only} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Improved*")
+            else:
+                print(f"阶段1 - Epoch {current_epoch}/{args.n_epochs_head_only} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
+            
+            # 如果 valid loss 完全不变，可能是验证集问题，打印警告
+            if current_epoch > 1 and abs(avg_valid_loss - valid_losses[-2]) < 1e-8:
+                if current_epoch == 2:
+                    print(f"  警告: Valid loss 似乎没有变化，可能是验证集问题或模型输出固定")
         
         print(f"\n第一阶段训练完成！")
+        # 重置 best_val_loss，让第二阶段从零开始
+        best_val_loss = float('inf')
     
-    # 第二阶段：解冻 Transformer，全量微调
+    # 第二阶段：解冻 Transformer 和 VQVAE，全量微调
     print(f"\n{'='*60}")
-    print(f"第二阶段：全量微调（解冻 Transformer）")
+    print(f"第二阶段：全量微调（解冻 Transformer 和 VQVAE）")
     print(f"训练轮数: {args.n_epochs_finetune - args.n_epochs_head_only}, 学习率: {lr}")
     print(f"{'='*60}")
     
@@ -396,6 +450,15 @@ def finetune_func(lr=args.lr):
                 param.requires_grad = True
             if hasattr(model, '_attention_query'):
                 model._attention_query.requires_grad = True
+        
+        # 解冻 VQVAE encoder 和 VQ 参数
+        print("解冻 VQVAE encoder 和 VQ 参数")
+        if hasattr(model.pretrained_model, 'vqvae_encoder'):
+            for param in model.pretrained_model.vqvae_encoder.parameters():
+                param.requires_grad = True
+        if hasattr(model.pretrained_model, 'vq'):
+            for param in model.pretrained_model.vq.parameters():
+                param.requires_grad = True
     
     # 创建第二阶段的 optimizer 和 scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]

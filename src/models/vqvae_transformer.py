@@ -428,6 +428,25 @@ class VQVAETransformerFinetune(nn.Module):
                     nn.Dropout(self.head_dropout),
                     nn.Linear(self.embedding_dim, target_len)
                 )
+        
+        # 初始化预测头权重（使用 Xavier 初始化）
+        self._init_prediction_head()
+    
+    def _init_prediction_head(self):
+        """初始化预测头权重"""
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                # 使用 Xavier 初始化
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+        
+        if self.prediction_head is not None:
+            if isinstance(self.prediction_head, nn.ModuleList):
+                for head in self.prediction_head:
+                    head.apply(init_weights)
+            else:
+                self.prediction_head.apply(init_weights)
     
     def _aggregate_embeddings(self, embeddings):
         """
