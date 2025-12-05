@@ -252,8 +252,8 @@ def finetune_func(lr=args.lr):
     if revin:
         revin = revin.to(device)
     
-    # 冻结 VQVAE encoder、VQ 和 decoder 参数（在预训练模型中）
-    print("冻结 VQVAE encoder、VQ 和 decoder 参数")
+    # 冻结 VQVAE encoder 和 VQ 参数（在预训练模型中）
+    print("冻结 VQVAE encoder 和 VQ 参数")
     if hasattr(model, 'pretrained_model'):
         if hasattr(model.pretrained_model, 'vqvae_encoder'):
             for param in model.pretrained_model.vqvae_encoder.parameters():
@@ -261,11 +261,6 @@ def finetune_func(lr=args.lr):
         if hasattr(model.pretrained_model, 'vq'):
             for param in model.pretrained_model.vq.parameters():
                 param.requires_grad = False
-        # 冻结 decoder（finetune 阶段不使用）
-        if hasattr(model.pretrained_model, 'decoder'):
-            for param in model.pretrained_model.decoder.parameters():
-                param.requires_grad = False
-            print(f"  Decoder 参数数量: {sum(p.numel() for p in model.pretrained_model.decoder.parameters())}")
     
     # 第一阶段：冻结 Transformer，只训练预测头
     if args.n_epochs_head_only > 0:
@@ -456,15 +451,14 @@ def finetune_func(lr=args.lr):
             if hasattr(model, '_attention_query'):
                 model._attention_query.requires_grad = True
         
-        # 解冻 VQVAE encoder 和 VQ 参数（decoder 保持冻结，因为 finetune 阶段不使用）
-        print("解冻 VQVAE encoder 和 VQ 参数（decoder 保持冻结）")
+        # 解冻 VQVAE encoder 和 VQ 参数
+        print("解冻 VQVAE encoder 和 VQ 参数")
         if hasattr(model.pretrained_model, 'vqvae_encoder'):
             for param in model.pretrained_model.vqvae_encoder.parameters():
                 param.requires_grad = True
         if hasattr(model.pretrained_model, 'vq'):
             for param in model.pretrained_model.vq.parameters():
                 param.requires_grad = True
-        # decoder 保持冻结（finetune 阶段不使用 decoder）
     
     # 创建第二阶段的 optimizer 和 scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]

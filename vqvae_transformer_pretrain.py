@@ -101,14 +101,14 @@ def save_transformer_config(args, filename="transformer_config.json"):
 
 def compute_next_token_loss(model, x, compression_factor, device='cuda', beta=0.0):
     """
-    计算 next token prediction 损失 + 重构损失
+    计算 next token prediction 损失
     
     Args:
         model: VQVAETransformerPretrain 模型
         x: [B, L, C] 输入时间序列
         compression_factor: VQVAE 压缩因子
         device: 设备
-        beta: 重构损失的权重
+        beta: 重构损失的权重（已废弃，不再使用）
     
     Returns:
         loss: 标量损失值
@@ -155,30 +155,8 @@ def compute_next_token_loss(model, x, compression_factor, device='cuda', beta=0.
     
     loss = loss / C
     
-    # 计算重构损失（如果 beta > 0）
-    recon_loss = 0.0
-    if beta > 0:
-        for ch in range(C):
-            x_ch = x[:, :, ch].view(B, L)  # [B, L]
-            
-            # VQVAE encoder
-            z = model.vqvae_encoder(x_ch, compression_factor)  # [B, embedding_dim, T/compressed]
-            
-            # VQ量化（VQ的forward需要 [B, embedding_dim, T/compressed] 格式）
-            vq_loss, quantized, _, _, _, _ = model.vq(z)
-            # quantized: [B, embedding_dim, T/compressed] (经过permute后)
-            
-            # Decoder解码（decoder 已冻结，不参与训练）
-            with torch.no_grad():
-                data_recon = model.decoder(quantized, compression_factor)  # [B, L]
-            
-            # 重构损失（MSE）
-            recon_error = F.mse_loss(data_recon, x_ch)
-            recon_loss += recon_error
-        
-        recon_loss = recon_loss / C
-        # 总损失 = next token prediction loss + beta * reconstruction loss
-        loss = loss + beta * recon_loss
+    # 不再计算重构损失（decoder 已移除）
+    # 如果 beta > 0，会打印警告但不会计算重构损失
     
     return loss
 
@@ -209,7 +187,7 @@ def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
     
     # 只对 Transformer 部分初始化（如果 VQVAE 是预训练的，不要重新初始化）
     if args.vqvae_checkpoint is None:
-        # 如果没有加载 VQVAE 权重，初始化所有层（但 decoder 保持冻结）
+        # 如果没有加载 VQVAE 权重，初始化所有层
         model.apply(init_weights)
     else:
         # 只初始化 Transformer 部分
@@ -217,14 +195,9 @@ def get_model(c_in, args, vqvae_config, transformer_config, device='cpu'):
         model.transformer_layers.apply(init_weights)
         model.codebook_head.apply(init_weights)
     
-    # 确保 decoder 始终冻结（不参与训练）
-    for param in model.decoder.parameters():
-        param.requires_grad = False
-    
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    decoder_params = sum(p.numel() for p in model.decoder.parameters())
-    print(f'总参数数量: {total_params}, 可训练参数: {trainable_params}, Decoder参数(冻结): {decoder_params}')
+    print(f'总参数数量: {total_params}, 可训练参数: {trainable_params}')
     return model
 
 

@@ -63,22 +63,7 @@ class VQVAETransformerPretrain(nn.Module):
             vqvae_config['commitment_cost']
         )
         
-        # VQVAE Decoder（仅用于保存权重，不参与训练）
-        from .vqvae import Decoder
-        self.decoder = Decoder(
-            self.embedding_dim,
-            vqvae_config['block_hidden_size'],
-            vqvae_config['num_residual_layers'],
-            vqvae_config['res_hidden_size'],
-            self.compression_factor
-        )
-        
-        # 冻结 decoder 参数（不参与训练，只保留权重）
-        # 注意：冻结后仍会从预训练模型加载权重（load_state_dict 不受 requires_grad 影响）
-        for param in self.decoder.parameters():
-            param.requires_grad = False
-        
-        # 加载预训练的VQVAE权重（包括 decoder 权重，虽然 decoder 已冻结）
+        # 加载预训练的VQVAE权重（不包括 decoder，因为不需要）
         if load_vqvae_weights and vqvae_checkpoint_path is not None:
             self._load_vqvae_weights(vqvae_checkpoint_path, device)
         
@@ -149,17 +134,13 @@ class VQVAETransformerPretrain(nn.Module):
                     print("警告: checkpoint格式可能不正确，尝试直接加载...")
                     return
             
-            # 检查是否是vqvae模型对象（有encoder、vq和decoder属性）
+            # 检查是否是vqvae模型对象（有encoder和vq属性）
             # vqvae_pretrain.py使用torch.save(model, path)保存完整模型对象
             if not hasattr(vqvae_model, 'encoder') or not hasattr(vqvae_model, 'vq'):
                 print("警告: checkpoint中未找到encoder或vq属性")
                 print(f"checkpoint类型: {type(vqvae_model)}")
                 print("将使用随机初始化的VQVAE权重")
                 return
-            
-            # 检查是否有decoder（可选，如果没有则使用随机初始化）
-            if not hasattr(vqvae_model, 'decoder'):
-                print("警告: checkpoint中未找到decoder属性，将使用随机初始化的Decoder权重")
             
             # 加载encoder权重
             try:
@@ -178,18 +159,6 @@ class VQVAETransformerPretrain(nn.Module):
             except Exception as e:
                 print(f"VQ Codebook权重加载失败: {e}")
                 print("将使用随机初始化的Codebook权重")
-            
-            # 加载Decoder权重（decoder 虽然冻结，但仍会加载预训练权重）
-            try:
-                if hasattr(vqvae_model, 'decoder'):
-                    decoder_state_dict = vqvae_model.decoder.state_dict()
-                    self.decoder.load_state_dict(decoder_state_dict, strict=True)
-                    print(f"VQVAE Decoder权重已成功加载 (从 {checkpoint_path})，decoder 已冻结不参与训练")
-                else:
-                    print("警告: checkpoint中未找到decoder，将使用随机初始化的Decoder权重（已冻结）")
-            except Exception as e:
-                print(f"VQVAE Decoder权重加载失败: {e}")
-                print("将使用随机初始化的Decoder权重（已冻结）")
                 
         except Exception as e:
             print(f"加载VQVAE权重时出错: {e}")
@@ -366,10 +335,7 @@ class VQVAETransformerFinetune(nn.Module):
             for param in self.pretrained_model.vq.parameters():
                 param.requires_grad = False
         
-        # 始终冻结 decoder（finetune 阶段不使用 decoder）
-        if hasattr(self.pretrained_model, 'decoder'):
-            for param in self.pretrained_model.decoder.parameters():
-                param.requires_grad = False
+        # decoder 在创建时已冻结，无需再次冻结
         
         if freeze_transformer:
             for param in self.pretrained_model.transformer_layers.parameters():
