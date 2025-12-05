@@ -284,7 +284,7 @@ def find_lr():
     best_lr = args.lr
     best_loss = float('inf')
     
-    for test_lr in [1e-5, 5e-5, 1e-4, 5e-4, 1e-3]:
+    for test_lr in [1e-4, 5e-4, 1e-3]:
         optimizer.param_groups[0]['lr'] = test_lr
         model.train()
         
