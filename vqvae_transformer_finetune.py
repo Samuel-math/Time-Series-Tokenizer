@@ -13,7 +13,6 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import OneCycleLR
 
 from src.models.vqvae_transformer import VQVAETransformerPretrain, VQVAETransformerFinetune
-from src.models.vqvae import vqvae, Decoder
 from src.models.layers.revin import RevIN
 from src.basics import set_device
 from src.utils_vqvae import load_vqvae_config
@@ -39,12 +38,20 @@ parser.add_argument('--pretrained_model', type=str, required=True,
                    help='Path to pretrained VQVAE+Transformer model checkpoint')
 parser.add_argument('--vqvae_config_path', type=str, required=True,
                    help='Path to VQVAE config file')
-parser.add_argument('--vqvae_checkpoint', type=str, required=True,
-                   help='Path to VQVAE checkpoint (for decoder)')
+parser.add_argument('--vqvae_checkpoint', type=str, default=None,
+                   help='Path to VQVAE checkpoint (deprecated, not needed for new architecture)')
 parser.add_argument('--transformer_config_path', type=str, default='', help='Path to transformer config file')
 # Optimization args
 parser.add_argument('--n_epochs_finetune', type=int, default=20, help='number of finetuning epochs')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+# Model architecture args
+parser.add_argument('--aggregation', type=str, default='mean', 
+                   choices=['mean', 'max', 'last', 'attention'],
+                   help='aggregation method for embeddings: mean, max, last, or attention')
+parser.add_argument('--head_type', type=str, default='mlp', choices=['mlp', 'linear'],
+                   help='prediction head type: mlp or linear')
+parser.add_argument('--head_dropout', type=float, default=0.1, help='dropout rate for prediction head')
+parser.add_argument('--individual', type=int, default=0, help='use individual prediction head for each channel')
 # model id to keep track of the number of models saved
 parser.add_argument('--finetuned_model_id', type=int, default=1, help='id of the saved finetuned model')
 parser.add_argument('--model_type', type=str, default='vqvae_transformer', help='model type for saving')
@@ -107,7 +114,7 @@ def load_transformer_config(args, pretrained_checkpoint=None, device='cpu'):
 
 def get_model(c_in, args, vqvae_config, device='cpu'):
     """
-    加载预训练模型 + VQVAE decoder + 构建 Finetune 模型
+    加载预训练模型 + 构建 Finetune 模型（新架构，不需要 decoder）
     c_in: number of input variables
     """
     print(f"加载预训练Transformer模型: {args.pretrained_model}")
@@ -141,23 +148,18 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
     print("预训练Transformer模型已成功加载")
 
     # --------------------------
-    # 4) 加载 VQVAE decoder
-    # --------------------------
-    print(f"加载VQVAE Decoder: {args.vqvae_checkpoint}")
-    vqvae_model = torch.load(args.vqvae_checkpoint, map_location=device)
-    decoder = vqvae_model.decoder
-    print("VQVAE Decoder已加载")
-
-    # --------------------------
-    # 5) Finetune 模型
+    # 4) 构建 Finetune 模型（新架构，不需要 decoder）
     # --------------------------
     finetune_model = VQVAETransformerFinetune(
         pretrained_model,
-        decoder,
         vqvae_config,
-        freeze_transformer=False,
-        freeze_decoder=True,
-        add_finetune_head=False,
+        freeze_encoder=True,      # 冻结 VQVAE encoder
+        freeze_vq=True,           # 冻结 VQ 层
+        freeze_transformer=False,  # 允许微调 Transformer
+        head_type=args.head_type,          # 预测头类型
+        head_dropout=args.head_dropout,    # 预测头 dropout
+        individual=bool(args.individual),   # 是否使用独立预测头
+        aggregation=args.aggregation       # 聚合方法
     )
 
     print('number of trainable params:',

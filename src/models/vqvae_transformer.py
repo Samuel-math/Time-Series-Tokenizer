@@ -312,44 +312,197 @@ class TransformerEncoderLayer(nn.Module):
 
 class VQVAETransformerFinetune(nn.Module):
     """
-    微调模型：预训练的Transformer + VQVAE Decoder
+    微调模型：使用预训练的 VQVAE Encoder + Transformer 获取码本索引，直接预测目标序列
+    
+    设计思路：
+    1. 使用预训练的 VQVAE encoder + Transformer 获取码本索引 [B, T/compression_factor, C]
+    2. 直接使用预训练模型的 codebook (vq._embedding) 将索引转换为向量表示
+    3. 通过简单的预测网络（MLP）直接从索引向量预测目标序列 [B, target_len, C]
+    4. 不需要 decoder，不需要新的 embedding 层，架构更简单高效
     
     输入: [B, T, C] 时间序列
     输出: [B, target_len, C] 预测结果
     """
-    def __init__(self, pretrained_model, vqvae_decoder, vqvae_config, 
-                 freeze_transformer=True, freeze_decoder=True, add_finetune_head=False):
+    def __init__(self, pretrained_model, vqvae_config, 
+                 freeze_encoder=True, freeze_vq=True, freeze_transformer=False,
+                 head_type='mlp', head_dropout=0.1, individual=False,
+                 aggregation='mean'):
+        """
+        Args:
+            pretrained_model: 预训练的 VQVAETransformerPretrain 模型
+            vqvae_config: VQVAE配置字典
+            freeze_encoder: 是否冻结 VQVAE encoder
+            freeze_vq: 是否冻结 VQ 层（包括 codebook）
+            freeze_transformer: 是否冻结 Transformer 层
+            head_type: 预测头类型 ('mlp' 或 'linear')
+            head_dropout: 预测头的 dropout 率
+            individual: 是否为每个通道使用独立的预测头
+            aggregation: 聚合方式 ('mean', 'max', 'last', 'attention')
+        """
         super().__init__()
         
-        # 使用预训练的transformer部分
         self.pretrained_model = pretrained_model
-        
-        # VQVAE decoder
-        self.decoder = vqvae_decoder
-        
         self.compression_factor = vqvae_config['compression_factor']
         self.num_embeddings = vqvae_config['num_embeddings']
-        self.embedding_dim = vqvae_config['embedding_dim']
+        self.embedding_dim = vqvae_config['embedding_dim']  # 使用预训练模型的 embedding_dim
+        self.individual = individual
+        self.aggregation = aggregation
+        self.n_vars = None  # 将在第一次 forward 时确定
         
         # 冻结参数
+        if freeze_encoder:
+            for param in self.pretrained_model.vqvae_encoder.parameters():
+                param.requires_grad = False
+        
+        if freeze_vq:
+            for param in self.pretrained_model.vq.parameters():
+                param.requires_grad = False
+        
         if freeze_transformer:
-            for param in self.pretrained_model.parameters():
+            for param in self.pretrained_model.transformer_layers.parameters():
+                param.requires_grad = False
+            for param in self.pretrained_model.projection.parameters():
+                param.requires_grad = False
+            for param in self.pretrained_model.codebook_head.parameters():
                 param.requires_grad = False
         
-        if freeze_decoder:
-            for param in self.decoder.parameters():
-                param.requires_grad = False
-        
-        # 可选：添加微调头
-        self.add_finetune_head = add_finetune_head
-        if add_finetune_head:
-            self.finetune_head = nn.Sequential(
-                nn.Linear(self.embedding_dim, self.embedding_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.embedding_dim, self.embedding_dim)
+        # 如果使用注意力聚合，需要创建注意力层
+        if aggregation == 'attention':
+            self.attention_aggregation = nn.MultiheadAttention(
+                self.embedding_dim, num_heads=8, dropout=head_dropout, batch_first=True
             )
+            # 注册可学习的 query 参数
+            self._attention_query = nn.Parameter(torch.randn(1, 1, self.embedding_dim))
+        else:
+            self.attention_aggregation = None
+            self._attention_query = None
         
+        # 预测头（延迟初始化，因为需要知道通道数和目标长度）
+        self.head_type = head_type
+        self.head_dropout = head_dropout
+        self.prediction_head = None
+    
+    def _build_prediction_head(self, n_vars, target_len):
+        """
+        构建预测头（使用聚合后的 embedding，输入维度为 embedding_dim）
+        
+        Args:
+            n_vars: 通道数
+            target_len: 预测长度
+        """
+        if self.prediction_head is not None:
+            return
+        
+        # 使用聚合后的 embedding_dim 作为输入（而不是 T_compressed * embedding_dim）
+        input_dim = self.embedding_dim
+        
+        if self.head_type == 'linear':
+            # 简单线性头：从聚合后的 embedding 直接映射到 target_len
+            if self.individual:
+                self.prediction_head = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Dropout(self.head_dropout),
+                        nn.Linear(input_dim, target_len)
+                    ) for _ in range(n_vars)
+                ])
+            else:
+                self.prediction_head = nn.Sequential(
+                    nn.Dropout(self.head_dropout),
+                    nn.Linear(input_dim, target_len)
+                )
+        else:  # 'mlp'
+            # MLP 头：更强大的表达能力
+            if self.individual:
+                self.prediction_head = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(input_dim, self.embedding_dim),
+                        nn.GELU(),
+                        nn.Dropout(self.head_dropout),
+                        nn.Linear(self.embedding_dim, target_len)
+                    ) for _ in range(n_vars)
+                ])
+            else:
+                self.prediction_head = nn.Sequential(
+                    nn.Linear(input_dim, self.embedding_dim),
+                    nn.GELU(),
+                    nn.Dropout(self.head_dropout),
+                    nn.Linear(self.embedding_dim, target_len)
+                )
+    
+    def _aggregate_embeddings(self, embeddings):
+        """
+        对时间维度的 embeddings 进行聚合
+        
+        Args:
+            embeddings: [B, T/compression_factor, C, embedding_dim] 或 [B, T/compression_factor, embedding_dim]
+        
+        Returns:
+            aggregated: [B, C, embedding_dim] 或 [B, embedding_dim]
+        """
+        if embeddings.dim() == 4:
+            # [B, T/compression_factor, C, embedding_dim]
+            B, T_compressed, C, embedding_dim = embeddings.shape
+            
+            if self.aggregation == 'mean':
+                # 平均池化
+                aggregated = embeddings.mean(dim=1)  # [B, C, embedding_dim]
+            elif self.aggregation == 'max':
+                # 最大池化
+                aggregated = embeddings.max(dim=1)[0]  # [B, C, embedding_dim]
+            elif self.aggregation == 'last':
+                # 取最后一个时间步
+                aggregated = embeddings[:, -1, :, :]  # [B, C, embedding_dim]
+            elif self.aggregation == 'attention':
+                # 注意力聚合
+                aggregated_list = []
+                for ch in range(C):
+                    embed_ch = embeddings[:, :, ch, :]  # [B, T_compressed, embedding_dim]
+                    # 使用可学习的 query
+                    query = self._attention_query.expand(B, 1, embedding_dim)
+                    attn_out, _ = self.attention_aggregation(query, embed_ch, embed_ch)
+                    aggregated_list.append(attn_out.squeeze(1))  # [B, embedding_dim]
+                aggregated = torch.stack(aggregated_list, dim=1)  # [B, C, embedding_dim]
+            else:
+                raise ValueError(f"Unknown aggregation method: {self.aggregation}")
+        else:
+            # [B, T/compression_factor, embedding_dim]
+            B, T_compressed, embedding_dim = embeddings.shape
+            
+            if self.aggregation == 'mean':
+                aggregated = embeddings.mean(dim=1)  # [B, embedding_dim]
+            elif self.aggregation == 'max':
+                aggregated = embeddings.max(dim=1)[0]  # [B, embedding_dim]
+            elif self.aggregation == 'last':
+                aggregated = embeddings[:, -1, :]  # [B, embedding_dim]
+            elif self.aggregation == 'attention':
+                # 注意力聚合
+                query = self._attention_query.expand(B, 1, embedding_dim)
+                attn_out, _ = self.attention_aggregation(query, embeddings, embeddings)
+                aggregated = attn_out.squeeze(1)  # [B, embedding_dim]
+            else:
+                raise ValueError(f"Unknown aggregation method: {self.aggregation}")
+        
+        return aggregated
+    
+    def _get_codebook_indices(self, x):
+        """
+        使用预训练模型获取码本索引
+        
+        Args:
+            x: [B, T, C] 输入时间序列
+        
+        Returns:
+            codebook_indices: [B, T/compression_factor, C] 码本索引
+        """
+        # 使用预训练模型获取 logits
+        logits = self.pretrained_model(x, mask=None)  # [B, codebook_size, T/compression_factor, C]
+        
+        # 获取码本索引（argmax）
+        # logits: [B, codebook_size, T/compression_factor, C]
+        codebook_indices = torch.argmax(logits, dim=1)  # [B, T/compression_factor, C]
+        
+        return codebook_indices
+    
     def forward(self, x, target_len):
         """
         Args:
@@ -360,145 +513,53 @@ class VQVAETransformerFinetune(nn.Module):
             pred: [B, target_len, C] 预测结果
         """
         B, T, C = x.shape
-        device = x.device
         
-        # Step 1: 通过 VQVAE encoder 生成 [B, codebook_size, T/compression_factor, C] 的概率分布
-        with torch.no_grad():
-            # 使用预训练模型的 encoder 部分获取 codebook 概率分布
-            codebook_logits = self.pretrained_model(x)  # [B, codebook_size, T/compression_factor, C]
+        # 获取码本索引
+        codebook_indices = self._get_codebook_indices(x)  # [B, T/compression_factor, C]
         
-        # Step 2: 对每个通道独立，使用 decoder-only 生成模式生成未来 tokens
-        T_compressed = codebook_logits.shape[2]
-        target_T_compressed = target_len // self.compression_factor
+        # 直接使用预训练模型的 codebook (vq._embedding) 将索引转换为向量
+        # 使用预训练模型的 codebook embedding
+        codebook_embedding = self.pretrained_model.vq._embedding  # nn.Embedding(num_embeddings, embedding_dim)
         
-        # 创建 causal mask 用于生成（decoder only 模式）
-        total_len = T_compressed + target_T_compressed
-        causal_mask = torch.triu(torch.ones(total_len, total_len, device=device), diagonal=1)
-        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))
-        
-        # 对每个通道分别生成
-        generated_probs = []
-        
+        # 将码本索引转换为 embedding 向量
+        embeddings = []
         for ch in range(C):
-            # 当前通道的 codebook 概率分布: [B, codebook_size, T/compression_factor]
-            logits_ch = codebook_logits[:, :, :, ch]  # [B, codebook_size, T/compression_factor]
-            
-            logits_ch = logits_ch.permute(0, 2, 1)  # [B, T/compression_factor, codebook_size]
-            
-            # 投影到 d_model 维度
-            # 使用预训练模型的 projection 层
-            # 首先需要将 codebook indices 转换为 embeddings
-            # 选择最可能的 codebook index
-            codebook_indices = torch.argmax(probs_ch, dim=1)  # [B, T/compression_factor]
-            
-            # 从 VQ 层获取 codebook embeddings
-            codebook_embeddings = self.pretrained_model.vq._embedding.weight  # [num_embeddings, embedding_dim]
-            
-            # 获取对应的 embeddings
-            indices_flat = codebook_indices.view(-1)  # [B*T/compression_factor]
-            z_ch = codebook_embeddings[indices_flat]  # [B*T/compression_factor, embedding_dim]
-            z_ch = z_ch.view(B, T_compressed, self.embedding_dim)  # [B, T/compression_factor, embedding_dim]
-            
-            # 投影到 d_model
-            z_ch = self.pretrained_model.projection(z_ch)  # [B, T/compression_factor, d_model]
-            
-            # 位置编码
-            W_pos = positional_encoding(
-                self.pretrained_model.pe, 
-                self.pretrained_model.learn_pe, 
-                total_len, 
-                self.pretrained_model.d_model
-            )
-            z_ch = z_ch + W_pos[:T_compressed].to(device)
-            z_ch = self.pretrained_model.dropout_layer(z_ch)
-            
-            # 自回归生成未来的 tokens
-            generated_tokens = []
-            current_z = z_ch  # [B, T/compression_factor, d_model]
-            
-            for step in range(target_T_compressed):
-                # 对当前整个序列（包括已生成的）通过 Transformer layers
-                current_seq_len = current_z.shape[1]
-                z_processed = current_z
-                
-                # 创建当前序列的 causal mask
-                seq_mask = causal_mask[:current_seq_len, :current_seq_len]
-                
-                # 通过所有 Transformer layers（decoder only，使用 causal mask）
-                for layer in self.pretrained_model.transformer_layers:
-                    z_processed = layer(z_processed, mask=seq_mask)
-                
-                # 获取最后一个位置的表示（用于预测下一个 token）
-                last_z = z_processed[:, -1:, :]  # [B, 1, d_model]
-                
-                # 更新 current_z 为处理后的序列（用于下一次迭代，避免重复处理）
-                current_z = z_processed
-                
-                # 预测下一个 codebook token 的概率分布
-                next_logits = self.pretrained_model.codebook_head(last_z)  # [B, 1, codebook_size]
-                next_probs = F.softmax(next_logits, dim=-1)  # [B, 1, codebook_size]
-                
-                # 选择最可能的 codebook index
-                next_index = torch.argmax(next_probs, dim=-1)  # [B, 1]
-                
-                # 获取对应的 embedding
-                next_index_flat = next_index.view(-1)  # [B]
-                next_embedding = codebook_embeddings[next_index_flat]  # [B, embedding_dim]
-                next_embedding = next_embedding.unsqueeze(1)  # [B, 1, embedding_dim]
-                
-                # 投影到 d_model
-                next_z = self.pretrained_model.projection(next_embedding)  # [B, 1, d_model]
-                
-                # 添加位置编码
-                pos_idx = T_compressed + step
-                next_z = next_z + W_pos[pos_idx:pos_idx+1].to(device)
-                next_z = self.pretrained_model.dropout_layer(next_z)
-                
-                # 添加到序列中（用于下一次迭代）
-                current_z = torch.cat([current_z, next_z], dim=1)  # [B, current_seq_len+1, d_model]
-                generated_tokens.append(next_probs)
-            
-            # 合并所有生成的概率分布
-            if generated_tokens:
-                generated_probs_ch = torch.cat(generated_tokens, dim=1)  # [B, target_T/compression_factor, codebook_size]
-                generated_probs_ch = generated_probs_ch.permute(0, 2, 1)  # [B, codebook_size, target_T/compression_factor]
-            else:
-                # 如果没有生成任何 token，创建一个空的
-                generated_probs_ch = torch.zeros(B, self.num_embeddings, target_T_compressed, device=device)
-            
-            generated_probs.append(generated_probs_ch)
+            indices_ch = codebook_indices[:, :, ch]  # [B, T/compression_factor]
+            # 使用预训练的 codebook 查找 embedding
+            embed_ch = codebook_embedding(indices_ch)  # [B, T/compression_factor, embedding_dim]
+            embeddings.append(embed_ch)
         
-        # Stack: [B, codebook_size, target_T/compression_factor, C]
-        generated_probs = torch.stack(generated_probs, dim=3)  # [B, codebook_size, target_T/compression_factor, C]
+        # Stack: [B, T/compression_factor, C, embedding_dim]
+        embeddings = torch.stack(embeddings, dim=2)
         
-        # Step 3: 从生成的概率分布中选择最可能的 codebook indices
-        codebook_indices = torch.argmax(generated_probs, dim=1)  # [B, target_T/compression_factor, C]
+        # 对时间维度进行聚合，减少参数
+        aggregated = self._aggregate_embeddings(embeddings)  # [B, C, embedding_dim]
         
-        # Step 4: 通过 VQVAE decoder 解码得到最终预测
-        codebook_embeddings = self.pretrained_model.vq._embedding.weight  # [num_embeddings, embedding_dim]
-        decoded = []
+        # 延迟初始化预测头（第一次 forward 时）
+        if self.prediction_head is None:
+            self._build_prediction_head(C, target_len)
+            self.prediction_head = self.prediction_head.to(x.device)
+            if self.attention_aggregation is not None:
+                self.attention_aggregation = self.attention_aggregation.to(x.device)
         
-        for ch in range(C):
-            indices_ch = codebook_indices[:, :, ch]  # [B, target_T/compression_factor]
-            
-            # 获取对应的 embeddings
-            indices_flat = indices_ch.view(-1)  # [B*target_T/compression_factor]
-            quantized_ch = codebook_embeddings[indices_flat]  # [B*target_T/compression_factor, embedding_dim]
-            quantized_ch = quantized_ch.view(B, -1, self.embedding_dim)  # [B, target_T/compression_factor, embedding_dim]
-            
-            # 如果添加了 finetune head，通过它处理
-            if self.add_finetune_head:
-                quantized_ch = self.finetune_head(quantized_ch)
-            
-            # 转换为 decoder 需要的格式 [B, embedding_dim, target_T/compression_factor]
-            quantized_ch = quantized_ch.permute(0, 2, 1)
-            
-            # 通过 decoder 解码
-            decoded_ch = self.decoder(quantized_ch, self.compression_factor)  # [B, target_len]
-            decoded.append(decoded_ch)
-        
-        # Stack: [B, target_len, C]
-        pred = torch.stack(decoded, dim=2)  # [B, target_len, C]
+        # 通过预测头生成预测
+        if self.individual:
+            # 每个通道独立预测
+            preds = []
+            for ch in range(C):
+                embed_ch = aggregated[:, ch, :]  # [B, embedding_dim]
+                pred_ch = self.prediction_head[ch](embed_ch)  # [B, target_len]
+                preds.append(pred_ch)
+            pred = torch.stack(preds, dim=2)  # [B, target_len, C]
+        else:
+            # 共享预测头
+            # 对每个通道分别处理
+            preds = []
+            for ch in range(C):
+                embed_ch = aggregated[:, ch, :]  # [B, embedding_dim]
+                pred_ch = self.prediction_head(embed_ch)  # [B, target_len]
+                preds.append(pred_ch)
+            pred = torch.stack(preds, dim=2)  # [B, target_len, C]
         
         return pred
 
