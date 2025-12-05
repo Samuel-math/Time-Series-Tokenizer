@@ -339,7 +339,7 @@ def finetune_func(lr=args.lr):
                 loss.backward()
                 
                 # 随机打印梯度信息（用于调试）
-                if random.random() < 0.1:  # 10% 的概率打印
+                if random.random() < 0.005:  # 10% 的概率打印
                     print(f"\n[阶段1 - Epoch {current_epoch}, Batch {batch_idx}] 梯度信息:")
                     has_grad = False
                     no_grad_count = 0
