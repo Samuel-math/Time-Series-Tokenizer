@@ -147,12 +147,6 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
     
     print("Transformer 配置:", transformer_config)
     
-    # 根据初始化模式决定是否冻结 encoder 和 vq
-    # random 模式：不冻结，允许训练所有参数
-    # vqvae_only 和 vqvae_transformer 模式：冻结 encoder 和 vq（已加载预训练权重）
-    freeze_encoder = (args.init_mode != 'random')
-    freeze_vq = (args.init_mode != 'random')
-    
     # 根据初始化模式构建 Finetune 模型
     if args.init_mode == 'random':
         print("模式: 完全随机初始化（所有参数随机初始化）")
@@ -161,8 +155,8 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
             vqvae_config,
             transformer_config,
             pretrained_model=None,  # 不提供预训练模型
-            freeze_encoder=freeze_encoder,
-            freeze_vq=freeze_vq,
+            freeze_encoder=False,
+            freeze_vq=False,
             freeze_transformer=False,
             head_type=args.head_type,
             head_dropout=args.head_dropout,
@@ -182,8 +176,8 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
             vqvae_config,
             transformer_config,
             pretrained_model=None,  # 不提供预训练模型
-            freeze_encoder=freeze_encoder,
-            freeze_vq=freeze_vq,
+            freeze_encoder=False,
+            freeze_vq=False,
             freeze_transformer=False,
             head_type=args.head_type,
             head_dropout=args.head_dropout,
@@ -244,8 +238,8 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
             vqvae_config,
             transformer_config,
             pretrained_model=pretrained_model,  # 提供预训练模型
-            freeze_encoder=freeze_encoder,
-            freeze_vq=freeze_vq,
+            freeze_encoder=False,
+            freeze_vq=False,
             freeze_transformer=False,
             head_type=args.head_type,
             head_dropout=args.head_dropout,
@@ -342,15 +336,6 @@ def finetune_func(lr=args.lr):
     if revin:
         revin = revin.to(device)
     
-    # 冻结逻辑已在 VQVAETransformerFinetune.__init__ 中根据 freeze_encoder 和 freeze_vq 参数处理
-    # 这里只需要打印当前冻结状态（用于调试）
-    encoder_params = sum(p.numel() for p in model.vqvae_encoder.parameters())
-    encoder_trainable = sum(p.numel() for p in model.vqvae_encoder.parameters() if p.requires_grad)
-    vq_params = sum(p.numel() for p in model.vq.parameters())
-    vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
-    print(f"VQVAE Encoder: {encoder_trainable}/{encoder_params} 参数可训练")
-    print(f"VQ Codebook: {vq_trainable}/{vq_params} 参数可训练")
-    
     # 第一阶段：冻结 Transformer，只训练预测头
     if args.n_epochs_head_only > 0:
         print(f"\n{'='*60}")
@@ -359,18 +344,12 @@ def finetune_func(lr=args.lr):
         print(f"{'='*60}")
         
         # 冻结 Transformer 参数
-        if hasattr(model, 'pretrained_model'):
-            for param in model.pretrained_model.transformer_layers.parameters():
-                param.requires_grad = False
-            for param in model.pretrained_model.projection.parameters():
-                param.requires_grad = False
-            for param in model.pretrained_model.codebook_head.parameters():
-                param.requires_grad = False
-            if hasattr(model, 'attention_aggregation') and model.attention_aggregation is not None:
-                for param in model.attention_aggregation.parameters():
-                    param.requires_grad = False
-                if hasattr(model, '_attention_query'):
-                    model._attention_query.requires_grad = False
+        for param in model.transformer_layers.parameters():
+            param.requires_grad = False
+        for param in model.projection.parameters():
+            param.requires_grad = False
+        for param in model.codebook_head.parameters():
+            param.requires_grad = False
         
         # 只优化预测头参数
         head_params = [p for p in model.parameters() if p.requires_grad]
@@ -427,47 +406,6 @@ def finetune_func(lr=args.lr):
                 
                 loss.backward()
                 
-                # 随机打印梯度信息（用于调试）
-                if random.random() < 0.005:  # 10% 的概率打印
-                    print(f"\n[阶段1 - Epoch {current_epoch}, Batch {batch_idx}] 梯度信息:")
-                    has_grad = False
-                    no_grad_count = 0
-                    grad_stats = []
-                    
-                    for name, param in model.named_parameters():
-                        if param.requires_grad:
-                            if param.grad is not None:
-                                grad_norm = param.grad.data.norm(2).item()
-                                grad_mean = param.grad.data.mean().item()
-                                grad_max = param.grad.data.max().item()
-                                grad_min = param.grad.data.min().item()
-                                
-                                if grad_norm > 1e-8:  # 只打印有意义的梯度
-                                    print(f"  {name}:")
-                                    print(f"    norm={grad_norm:.6e}, mean={grad_mean:.6e}, max={grad_max:.6e}, min={grad_min:.6e}")
-                                    print(f"    shape={param.shape}, numel={param.numel()}")
-                                    has_grad = True
-                                    grad_stats.append({
-                                        'name': name,
-                                        'norm': grad_norm,
-                                        'mean': grad_mean,
-                                        'max': grad_max,
-                                        'min': grad_min
-                                    })
-                                    if len(grad_stats) >= 5:  # 只打印前5个有梯度的参数
-                                        break
-                            else:
-                                no_grad_count += 1
-                                if no_grad_count <= 3:  # 只打印前3个没有梯度的参数
-                                    print(f"  {name}: grad is None!")
-                    
-                    if not has_grad:
-                        print("  警告: 没有检测到任何有意义的梯度！")
-                    else:
-                        print(f"  共找到 {len(grad_stats)} 个有梯度的参数，{no_grad_count} 个参数梯度为 None")
-                    
-                    print(f"  Loss: {loss.item():.6f}\n")
-                
                 # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(head_params, max_norm=100)
                 
@@ -520,34 +458,19 @@ def finetune_func(lr=args.lr):
         # 重置 best_val_loss，让第二阶段从零开始
         best_val_loss = float('inf')
     
-    # 第二阶段：解冻 Transformer 和 VQVAE，全量微调
+    # 第二阶段：解冻 Transformer，全量微调
     print(f"\n{'='*60}")
-    print(f"第二阶段：全量微调（解冻 Transformer 和 VQVAE）")
+    print(f"第二阶段：全量微调（解冻 Transformer）")
     print(f"训练轮数: {args.n_epochs_finetune - args.n_epochs_head_only}, 学习率: {lr}")
     print(f"{'='*60}")
     
     # 解冻 Transformer 参数
-    if hasattr(model, 'pretrained_model'):
-        for param in model.pretrained_model.transformer_layers.parameters():
-            param.requires_grad = True
-        for param in model.pretrained_model.projection.parameters():
-            param.requires_grad = True
-        for param in model.pretrained_model.codebook_head.parameters():
-            param.requires_grad = True
-        if hasattr(model, 'attention_aggregation') and model.attention_aggregation is not None:
-            for param in model.attention_aggregation.parameters():
-                param.requires_grad = True
-            if hasattr(model, '_attention_query'):
-                model._attention_query.requires_grad = True
-        
-        # 解冻 VQVAE encoder 和 VQ 参数
-        print("解冻 VQVAE encoder 和 VQ 参数")
-        if hasattr(model.pretrained_model, 'vqvae_encoder'):
-            for param in model.pretrained_model.vqvae_encoder.parameters():
-                param.requires_grad = True
-        if hasattr(model.pretrained_model, 'vq'):
-            for param in model.pretrained_model.vq.parameters():
-                param.requires_grad = True
+    for param in model.transformer_layers.parameters():
+        param.requires_grad = True
+    for param in model.projection.parameters():
+        param.requires_grad = True
+    for param in model.codebook_head.parameters():
+        param.requires_grad = True
     
     # 创建第二阶段的 optimizer 和 scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]
