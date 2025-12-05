@@ -47,7 +47,7 @@ parser.add_argument('--vqvae_checkpoint', type=str, default=None,
 parser.add_argument('--transformer_config_path', type=str, default='', help='Path to transformer config file')
 # Optimization args
 parser.add_argument('--n_epochs_finetune', type=int, default=20, help='number of finetuning epochs')
-parser.add_argument('--n_epochs_head_only', type=int, default=10, help='number of epochs to train only prediction head (freeze transformer)')
+parser.add_argument('--n_epochs_head_only', type=int, default=0, help='number of epochs to train only prediction head (freeze transformer)')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for full finetuning')
 parser.add_argument('--lr_head_only', type=float, default=1e-3, help='learning rate for head-only training phase (usually higher)')
 # Model architecture args
