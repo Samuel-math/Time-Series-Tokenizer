@@ -63,6 +63,16 @@ class VQVAETransformerPretrain(nn.Module):
             vqvae_config['commitment_cost']
         )
         
+        # VQVAE Decoder（用于重构loss计算）
+        from .vqvae import Decoder
+        self.decoder = Decoder(
+            self.embedding_dim,
+            vqvae_config['block_hidden_size'],
+            vqvae_config['num_residual_layers'],
+            vqvae_config['res_hidden_size'],
+            self.compression_factor
+        )
+        
         # 加载预训练的VQVAE权重
         if load_vqvae_weights and vqvae_checkpoint_path is not None:
             self._load_vqvae_weights(vqvae_checkpoint_path, device)
@@ -134,13 +144,17 @@ class VQVAETransformerPretrain(nn.Module):
                     print("警告: checkpoint格式可能不正确，尝试直接加载...")
                     return
             
-            # 检查是否是vqvae模型对象（有encoder和vq属性）
+            # 检查是否是vqvae模型对象（有encoder、vq和decoder属性）
             # vqvae_pretrain.py使用torch.save(model, path)保存完整模型对象
             if not hasattr(vqvae_model, 'encoder') or not hasattr(vqvae_model, 'vq'):
                 print("警告: checkpoint中未找到encoder或vq属性")
                 print(f"checkpoint类型: {type(vqvae_model)}")
                 print("将使用随机初始化的VQVAE权重")
                 return
+            
+            # 检查是否有decoder（可选，如果没有则使用随机初始化）
+            if not hasattr(vqvae_model, 'decoder'):
+                print("警告: checkpoint中未找到decoder属性，将使用随机初始化的Decoder权重")
             
             # 加载encoder权重
             try:
@@ -159,6 +173,15 @@ class VQVAETransformerPretrain(nn.Module):
             except Exception as e:
                 print(f"VQ Codebook权重加载失败: {e}")
                 print("将使用随机初始化的Codebook权重")
+            
+            # 加载Decoder权重
+            try:
+                decoder_state_dict = vqvae_model.decoder.state_dict()
+                self.decoder.load_state_dict(decoder_state_dict, strict=True)
+                print(f"VQVAE Decoder权重已成功加载 (从 {checkpoint_path})")
+            except Exception as e:
+                print(f"VQVAE Decoder权重加载失败: {e}")
+                print("将使用随机初始化的Decoder权重")
                 
         except Exception as e:
             print(f"加载VQVAE权重时出错: {e}")

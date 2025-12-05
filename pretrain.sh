@@ -11,4 +11,5 @@ python vqvae_transformer_pretrain.py \
     --n_layers 3 \
     --n_heads 8 \
     --d_ff 256 \
-    --dropout 0.3
+    --dropout 0.3 \
+    --beta 0.1

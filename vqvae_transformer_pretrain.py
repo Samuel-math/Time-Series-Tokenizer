@@ -9,6 +9,7 @@ import os
 import json
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import OneCycleLR
 
@@ -36,6 +37,8 @@ parser.add_argument('--vqvae_config_path', type=str,
                    default='saved_models/vqvae/vqvae64_CW256_CF4_BS64_ITR15000/configs/config_file.json')
 parser.add_argument('--vqvae_checkpoint', type=str, default=None,
                    help='Path to pretrained VQVAE checkpoint (optional)')
+parser.add_argument('--beta', type=float, default=0.0,
+                   help='Weight for reconstruction loss (0.0 means no reconstruction loss)')
 # Transformer config
 parser.add_argument('--d_model', type=int, default=128, help='Transformer d_model')
 parser.add_argument('--n_layers', type=int, default=3, help='number of Transformer layers')
@@ -96,15 +99,16 @@ def save_transformer_config(args, filename="transformer_config.json"):
 
     print(f"Transformer 参数已保存到 {save_path}")
 
-def compute_next_token_loss(model, x, compression_factor, device='cuda'):
+def compute_next_token_loss(model, x, compression_factor, device='cuda', beta=0.0):
     """
-    计算 next token prediction 损失
+    计算 next token prediction 损失 + 重构损失
     
     Args:
         model: VQVAETransformerPretrain 模型
         x: [B, L, C] 输入时间序列
         compression_factor: VQVAE 压缩因子
         device: 设备
+        beta: 重构损失的权重
     
     Returns:
         loss: 标量损失值
@@ -150,6 +154,31 @@ def compute_next_token_loss(model, x, compression_factor, device='cuda'):
         loss += ce_criterion(pred_logits, target_tokens)
     
     loss = loss / C
+    
+    # 计算重构损失（如果 beta > 0）
+    recon_loss = 0.0
+    if beta > 0:
+        for ch in range(C):
+            x_ch = x[:, :, ch].view(B, L)  # [B, L]
+            
+            # VQVAE encoder
+            z = model.vqvae_encoder(x_ch, compression_factor)  # [B, embedding_dim, T/compressed]
+            
+            # VQ量化（VQ的forward需要 [B, embedding_dim, T/compressed] 格式）
+            vq_loss, quantized, _, _, _, _ = model.vq(z)
+            # quantized: [B, embedding_dim, T/compressed] (经过permute后)
+            
+            # Decoder解码
+            data_recon = model.decoder(quantized, compression_factor)  # [B, L]
+            
+            # 重构损失（MSE）
+            recon_error = F.mse_loss(data_recon, x_ch)
+            recon_loss += recon_error
+        
+        recon_loss = recon_loss / C
+        # 总损失 = next token prediction loss + beta * reconstruction loss
+        loss = loss + beta * recon_loss
+    
     return loss
 
 
@@ -243,7 +272,7 @@ def find_lr():
                 batch_x = revin(batch_x, 'norm')
             
             optimizer.zero_grad()
-            loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device)
+            loss = compute_next_token_loss(model, batch_x, vqvae_config['compression_factor'], device, beta=args.beta)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
