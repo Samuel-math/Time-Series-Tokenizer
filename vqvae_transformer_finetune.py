@@ -387,6 +387,15 @@ def finetune_func(lr=args.lr):
         if valid_loss < best_val_loss:
             best_val_loss = valid_loss
             checkpoint = {'model_state_dict': model.state_dict(), 'args': args}
+            # 保存 prediction_head 的配置信息（如果已初始化）
+            if model.prediction_head is not None:
+                checkpoint['prediction_head_config'] = {
+                    'n_vars': dls.vars,
+                    'target_len': args.target_points,
+                    'head_type': args.head_type,
+                    'head_dropout': args.head_dropout,
+                    'individual': bool(args.individual)
+                }
             if model_mustd:
                 checkpoint['mustd_state_dict'] = model_mustd.state_dict()
             torch.save(checkpoint, os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
@@ -447,12 +456,45 @@ def test_func(weight_path):
     
     # 加载权重
     checkpoint = torch.load(weight_path + '.pth', map_location=device)
+    
+    # 在加载权重之前，先初始化 prediction_head（如果 checkpoint 中包含它）
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        # 检查是否有 prediction_head 的权重
+        has_prediction_head = any(key.startswith('prediction_head') for key in state_dict.keys())
+        
+        if has_prediction_head and model.prediction_head is None:
+            # 优先使用保存的配置信息初始化
+            if 'prediction_head_config' in checkpoint:
+                config = checkpoint['prediction_head_config']
+                model._build_prediction_head(
+                    config['n_vars'], 
+                    config['target_len'], 
+                    num_tokens=1
+                )
+                model.prediction_head = model.prediction_head.to(device)
+                print(f"根据 checkpoint 配置初始化 prediction_head: n_vars={config['n_vars']}, target_len={config['target_len']}")
+            else:
+                # 如果没有配置信息，使用 dummy forward 初始化（向后兼容）
+                print("警告: checkpoint 中没有 prediction_head_config，使用 dummy forward 初始化")
+                dummy_x = torch.zeros(1, args.context_points, dls.vars).to(device)
+                _ = model(dummy_x, args.target_points)
+    
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        # 使用 strict=False 以处理可能的键不匹配（向后兼容）
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if missing_keys:
+            print(f"警告: 加载权重时缺少以下键: {missing_keys}")
+        if unexpected_keys:
+            print(f"警告: 加载权重时发现意外的键: {unexpected_keys}")
         if model_mustd and 'mustd_state_dict' in checkpoint:
             model_mustd.load_state_dict(checkpoint['mustd_state_dict'])
     else:
-        model.load_state_dict(checkpoint)
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+        if missing_keys:
+            print(f"警告: 加载权重时缺少以下键: {missing_keys}")
+        if unexpected_keys:
+            print(f"警告: 加载权重时发现意外的键: {unexpected_keys}")
     
     model.eval()
     if model_mustd:
