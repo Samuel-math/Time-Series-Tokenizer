@@ -1,13 +1,11 @@
 """
 VQVAE + Transformer 微调脚本
-使用标准 PyTorch 训练循环，不使用 Learner
-在微调完成后直接输出测试集结果
+使用标准 PyTorch 训练循环，参考 TOTEM 设计
 """
 
 import numpy as np
 import pandas as pd
 import os
-import random
 import torch
 from torch import nn
 from torch.optim import Adam
@@ -38,29 +36,25 @@ parser.add_argument('--revin', type=int, default=1, help='reversible instance no
 # Pretrained model paths
 parser.add_argument('--init_mode', type=str, default='vqvae_transformer',
                    choices=['random', 'vqvae_only', 'vqvae_transformer'],
-                   help='Initialization mode: random (fully random), vqvae_only (load VQVAE only), vqvae_transformer (load VQVAE+Transformer)')
+                   help='Initialization mode')
 parser.add_argument('--pretrained_model', type=str, default=None,
-                   help='Path to pretrained VQVAE+Transformer model checkpoint (required if init_mode is vqvae_transformer)')
-parser.add_argument('--vqvae_config_path', type=str, required=True,
-                   help='Path to VQVAE config file')
-parser.add_argument('--vqvae_checkpoint', type=str, default=None,
-                   help='Path to VQVAE checkpoint (required if init_mode is vqvae_only or vqvae_transformer)')
+                   help='Path to pretrained VQVAE+Transformer model checkpoint')
+parser.add_argument('--vqvae_config_path', type=str, required=True, help='Path to VQVAE config file')
+parser.add_argument('--vqvae_checkpoint', type=str, default=None, help='Path to VQVAE checkpoint')
 parser.add_argument('--transformer_config_path', type=str, default='', help='Path to transformer config file')
 # Optimization args
 parser.add_argument('--n_epochs_finetune', type=int, default=20, help='number of finetuning epochs')
-parser.add_argument('--n_epochs_head_only', type=int, default=0, help='number of epochs to train only prediction head (freeze transformer)')
+parser.add_argument('--n_epochs_head_only', type=int, default=0, help='number of epochs to train only prediction head')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for full finetuning')
-parser.add_argument('--lr_head_only', type=float, default=1e-3, help='learning rate for head-only training phase (usually higher)')
+parser.add_argument('--lr_head_only', type=float, default=1e-3, help='learning rate for head-only training phase')
 # Model architecture args
-parser.add_argument('--head_type', type=str, default='mlp', choices=['mlp', 'linear'],
-                   help='prediction head type: mlp or linear')
+parser.add_argument('--head_type', type=str, default='mlp', choices=['mlp', 'linear'], help='prediction head type')
 parser.add_argument('--head_dropout', type=float, default=0.1, help='dropout rate for prediction head')
 parser.add_argument('--individual', type=int, default=0, help='use individual prediction head for each channel')
 # TOTEM-style training args
 parser.add_argument('--scheme', type=int, default=2, choices=[1, 2],
-                   help='prediction scheme: 1 predicts mu/std separately, 2 uses RevIN denorm (like PatchTST)')
-parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'smoothl1'],
-                   help='loss function type: mse or smoothl1')
+                   help='prediction scheme: 1 predicts mu/std separately, 2 uses RevIN denorm')
+parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'smoothl1'], help='loss function type')
 parser.add_argument('--beta', type=float, default=0.1, help='beta for smoothl1 loss')
 # model id to keep track of the number of models saved
 parser.add_argument('--finetuned_model_id', type=int, default=1, help='id of the saved finetuned model')
@@ -80,20 +74,13 @@ suffix_name = (
 )
 args.save_finetuned_model = args.dset_finetune + '_vqvae_transformer_finetuned' + suffix_name
 
-# get available GPU device
 set_device()
 
 
 class MuStdModel(nn.Module):
-    """
-    MuStdModel: 预测未来序列的均值和标准差（参考 TOTEM）
-    用于 RevIN 的 denormalization
-    """
+    """MuStdModel: 预测未来序列的均值和标准差（参考 TOTEM）"""
     def __init__(self, Tin, Tout, hidden_dims=[512, 512], dropout=0.2, is_mlp=True):
         super().__init__()
-        self.Tin = Tin
-        self.Tout = Tout
-        
         if is_mlp:
             layers = []
             input_dim = Tin
@@ -102,18 +89,13 @@ class MuStdModel(nn.Module):
                 layers.append(nn.GELU())
                 layers.append(nn.Dropout(dropout))
                 input_dim = hidden_dim
-            layers.append(nn.Linear(input_dim, 2))  # 输出 mean 和 std
+            layers.append(nn.Linear(input_dim, 2))
             self.model = nn.Sequential(*layers)
         else:
             self.model = nn.Linear(Tin, 2)
     
     def forward(self, x):
-        """
-        Args:
-            x: [B*C, Tin] 输入时间序列（flattened）
-        Returns:
-            ymeanstd: [B*C, 2] 均值和标准差
-        """
+        """x: [B*C, Tin] -> [B*C, 2]"""
         return self.model(x)
 
 
@@ -124,16 +106,7 @@ def load_json_config(path):
 
 
 def load_transformer_config(args, pretrained_checkpoint=None, device='cpu'):
-    """
-    统一加载 transformer_config 的辅助函数
-    优先从 checkpoint 加载，其次从配置文件加载
-    
-    Args:
-        args: 命令行参数
-        pretrained_checkpoint: 已加载的 checkpoint（可选，避免重复加载）
-        device: 设备
-    """
-    # 如果未提供 checkpoint，则加载
+    """统一加载 transformer_config 的辅助函数"""
     if pretrained_checkpoint is None:
         print(f"加载预训练Transformer模型: {args.pretrained_model}")
         pretrained_checkpoint = torch.load(args.pretrained_model, map_location=device)
@@ -145,106 +118,56 @@ def load_transformer_config(args, pretrained_checkpoint=None, device='cpu'):
         transformer_config = load_json_config(args.transformer_config_path)
         print(f"从文件加载 transformer_config: {args.transformer_config_path}")
     else:
-        raise ValueError(
-            "找不到 Transformer 配置！请确保 checkpoint 包含 transformer_config，"
-            "或通过 --transformer_config_path 指定配置文件。"
-        )
+        raise ValueError("找不到 Transformer 配置！")
     
     print("Transformer 配置:", transformer_config)
     return transformer_config
 
 
 def get_model(c_in, args, vqvae_config, device='cpu'):
-    """
-    根据初始化模式构建 Finetune 模型（使用解耦后的 API）
-    
-    支持三种初始化模式：
-    1. random: 完全随机初始化
-    2. vqvae_only: 加载训练好的 VQVAE，其余参数随机初始化
-    3. vqvae_transformer: 加载训练好的 VQVAE 和 Transformer，其余参数随机初始化
-    
-    c_in: number of input variables
-    """
+    """根据初始化模式构建 Finetune 模型"""
     print(f"\n初始化模式: {args.init_mode}")
     
-    # 获取 transformer_config（如果提供了配置文件）
+    # 获取 transformer_config
     transformer_config = None
     if args.transformer_config_path and os.path.exists(args.transformer_config_path):
         transformer_config = load_json_config(args.transformer_config_path)
-        print(f"从文件加载 transformer_config: {args.transformer_config_path}")
     else:
-        # 如果没有配置文件，使用默认配置
         transformer_config = {
-            'd_model': 128,
-            'n_layers': 3,
-            'n_heads': 8,
-            'd_ff': 256,
-            'dropout': 0.1,
-            'attn_dropout': 0.1
+            'd_model': 128, 'n_layers': 3, 'n_heads': 8, 'd_ff': 256,
+            'dropout': 0.1, 'attn_dropout': 0.1
         }
         print("使用默认 transformer_config")
     
-    print("Transformer 配置:", transformer_config)
-    
-    # 根据初始化模式构建 Finetune 模型
+    # 构建模型
     if args.init_mode == 'random':
-        print("模式: 完全随机初始化（所有参数随机初始化）")
-        # 直接构建，不加载任何权重
         finetune_model = VQVAETransformerFinetune(
-            vqvae_config,
-            transformer_config,
-            pretrained_model=None,  # 不提供预训练模型
-            freeze_encoder=False,
-            freeze_vq=False,
-            freeze_transformer=False,
-            head_type=args.head_type,
-            head_dropout=args.head_dropout,
-            individual=bool(args.individual),
-            load_vqvae_weights=False,
-            vqvae_checkpoint_path=None,
-            device=device
+            vqvae_config, transformer_config, pretrained_model=None,
+            freeze_encoder=False, freeze_vq=False, freeze_transformer=False,
+            head_type=args.head_type, head_dropout=args.head_dropout,
+            individual=bool(args.individual), load_vqvae_weights=False,
+            vqvae_checkpoint_path=None, device=device
         )
-        
     elif args.init_mode == 'vqvae_only':
-        print("模式: 加载 VQVAE 权重，Transformer 随机初始化")
         if args.vqvae_checkpoint is None:
             raise ValueError("vqvae_only 模式需要提供 --vqvae_checkpoint")
-        
-        # 直接构建，只加载 VQVAE 权重
         finetune_model = VQVAETransformerFinetune(
-            vqvae_config,
-            transformer_config,
-            pretrained_model=None,  # 不提供预训练模型
-            freeze_encoder=False,
-            freeze_vq=False,
-            freeze_transformer=False,
-            head_type=args.head_type,
-            head_dropout=args.head_dropout,
-            individual=bool(args.individual),
-            load_vqvae_weights=True,  # 加载 VQVAE 权重
-            vqvae_checkpoint_path=args.vqvae_checkpoint,
-            device=device
+            vqvae_config, transformer_config, pretrained_model=None,
+            freeze_encoder=False, freeze_vq=False, freeze_transformer=False,
+            head_type=args.head_type, head_dropout=args.head_dropout,
+            individual=bool(args.individual), load_vqvae_weights=True,
+            vqvae_checkpoint_path=args.vqvae_checkpoint, device=device
         )
-        
     elif args.init_mode == 'vqvae_transformer':
-        print("模式: 加载 VQVAE 和 Transformer 权重")
         if args.pretrained_model is None:
             raise ValueError("vqvae_transformer 模式需要提供 --pretrained_model")
         
-        # 先加载预训练的 VQVAETransformerPretrain 模型
-        print(f"加载预训练模型: {args.pretrained_model}")
         pretrained_checkpoint = torch.load(args.pretrained_model, map_location=device)
-        
-        # 构建预训练模型骨架
         pretrained_model = VQVAETransformerPretrain(
-            vqvae_config, 
-            transformer_config,
-            load_vqvae_weights=False,  # 先不加载，后面统一加载
-            vqvae_checkpoint_path=None,
-            device=device
+            vqvae_config, transformer_config, load_vqvae_weights=False,
+            vqvae_checkpoint_path=None, device=device
         )
         
-        # 加载 state_dict
         try:
             if isinstance(pretrained_checkpoint, dict) and 'model_state_dict' in pretrained_checkpoint:
                 pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'], strict=False)
@@ -253,130 +176,258 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
             else:
                 if hasattr(pretrained_checkpoint, 'state_dict'):
                     pretrained_model.load_state_dict(pretrained_checkpoint.state_dict(), strict=False)
-                else:
-                    print("警告: checkpoint格式异常，尝试直接使用")
-                    pretrained_model = pretrained_checkpoint
         except Exception as e:
             print(f"加载预训练模型权重时出错: {e}")
-            print("将尝试仅加载 VQVAE 权重...")
             if args.vqvae_checkpoint is not None:
                 pretrained_model._load_vqvae_weights(args.vqvae_checkpoint, device)
             else:
                 raise ValueError("无法加载预训练权重，且未提供 --vqvae_checkpoint")
         
-        # 如果还提供了单独的 VQVAE checkpoint，也加载（可能会覆盖）
         if args.vqvae_checkpoint is not None:
-            print(f"额外加载 VQVAE 权重: {args.vqvae_checkpoint}")
             pretrained_model._load_vqvae_weights(args.vqvae_checkpoint, device)
         
         pretrained_model.eval()
-        print("预训练模型骨架构建完成")
-        
-        # 使用预训练模型构建 Finetune 模型
         finetune_model = VQVAETransformerFinetune(
-            vqvae_config,
-            transformer_config,
-            pretrained_model=pretrained_model,  # 提供预训练模型
-            freeze_encoder=False,
-            freeze_vq=False,
-            freeze_transformer=False,
-            head_type=args.head_type,
-            head_dropout=args.head_dropout,
-            individual=bool(args.individual),
-            load_vqvae_weights=False,  # 已通过 pretrained_model 加载
-            vqvae_checkpoint_path=None,
-            device=device
+            vqvae_config, transformer_config, pretrained_model=pretrained_model,
+            freeze_encoder=False, freeze_vq=False, freeze_transformer=False,
+            head_type=args.head_type, head_dropout=args.head_dropout,
+            individual=bool(args.individual), load_vqvae_weights=False,
+            vqvae_checkpoint_path=None, device=device
         )
 
-    print('可训练参数数量:',
-          sum(p.numel() for p in finetune_model.parameters() if p.requires_grad))
-
+    print('可训练参数数量:', sum(p.numel() for p in finetune_model.parameters() if p.requires_grad))
     return finetune_model
 
 
-def find_lr():
-    """简单的学习率查找：使用一个小的训练循环"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 1) dataloader
-    dls = get_dls(args)
-
-    # 2) 加载 VQVAE config
+def setup_models_and_revin(dls, args, device):
+    """设置模型和 RevIN"""
     vqvae_config = load_vqvae_config(args.vqvae_config_path)
-
-    # 3) 构建 model
     model = get_model(dls.vars, args, vqvae_config)
     model = model.to(device)
     
-    # RevIN (参考 TOTEM)
-    revin_in = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    revin_out = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    if revin_in:
-        revin_in = revin_in.to(device)
-    if revin_out:
-        revin_out = revin_out.to(device)
+    # 只使用一个 RevIN（用于输入归一化和输出反归一化）
+    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
-    # MuStdModel
-    model_mustd = MuStdModel(
-        Tin=args.context_points,
-        Tout=args.target_points,
-        hidden_dims=[512, 512],
-        dropout=0.2,
-        is_mlp=True
-    )
-    model_mustd.revin_in = revin_in
-    model_mustd.revin_out = revin_out
-    model_mustd = model_mustd.to(device)
+    # Scheme 1 才需要 MuStdModel
+    model_mustd = None
+    if args.scheme == 1:
+        model_mustd = MuStdModel(
+            Tin=args.context_points, Tout=args.target_points,
+            hidden_dims=[512, 512], dropout=0.2, is_mlp=True
+        ).to(device)
+        # Scheme 1 需要两个 RevIN（输入和输出分别归一化）
+        revin_in = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+        revin_out = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+        model_mustd.revin_in = revin_in
+        model_mustd.revin_out = revin_out
     
-    # Loss function
-    def loss_fn(type, beta=1.0):
-        if type == "mse":
-            return nn.MSELoss(reduction='mean')
-        elif type == "smoothl1":
-            return nn.SmoothL1Loss(beta=beta, reduction='mean')
+    return model, revin, model_mustd, vqvae_config
+
+
+def compute_loss(pred_norm, batch_x, batch_y, norm_y, revin, model_mustd, loss_func, args, n_vars):
+    """计算损失（统一处理 scheme 1 和 2）"""
+    if args.scheme == 1:
+        # Scheme 1: 预测 mu 和 std（需要 MuStdModel）
+        times = batch_x.permute(0, 2, 1).reshape(-1, batch_x.shape[1])  # [B*C, Tin]
+        ymeanstd = model_mustd(times).reshape(batch_x.shape[0], n_vars, 2).permute(0, 2, 1)  # [B, 2, C]
+        ymean, ystd = ymeanstd[:, 0:1, :], ymeanstd[:, 1:2, :]  # [B, 1, C]
+        
+        loss_mu = loss_func(model_mustd.revin_out.mean - model_mustd.revin_in.mean, ymean)
+        loss_std = loss_func(model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, ystd)
+        loss_decode = loss_func(pred_norm, norm_y)
+        loss_all = loss_func(
+            pred_norm * (ystd.detach() + model_mustd.revin_in.stdev) + 
+            (ymean.detach() + model_mustd.revin_in.mean),
+            batch_y
+        )
+        return loss_decode + loss_mu + loss_std + loss_all
+    else:
+        # Scheme 2: 直接使用 RevIN 反归一化（不需要 MuStdModel）
+        pred = revin(pred_norm, 'denorm') if revin else pred_norm
+        return loss_func(pred, batch_y)
+
+
+def forward_pass(batch_x, batch_y, model, revin, model_mustd, args):
+    """前向传播：归一化和预测"""
+    if args.scheme == 1:
+        # Scheme 1: 使用两个 RevIN
+        if model_mustd.revin_in:
+            _ = model_mustd.revin_in(batch_x, 'norm')
+        norm_y = model_mustd.revin_out(batch_y, 'norm') if model_mustd.revin_out else batch_y
+    else:
+        # Scheme 2: 只使用一个 RevIN
+        if revin:
+            _ = revin(batch_x, 'norm')
+        norm_y = batch_y  # Scheme 2 不需要对 target 归一化
+    
+    pred_norm = model(batch_x, args.target_points)
+    return pred_norm, norm_y
+
+
+def train_epoch(model, revin, model_mustd, dataloader, optimizer, scheduler, loss_func, args, device, n_vars):
+    """训练一个 epoch"""
+    model.train()
+    if model_mustd:
+        model_mustd.train()
+    losses = []
+    
+    for batch_x, batch_y in dataloader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        pred_norm, norm_y = forward_pass(batch_x, batch_y, model, revin, model_mustd, args)
+        
+        loss = compute_loss(pred_norm, batch_x, batch_y, norm_y, revin, model_mustd, loss_func, args, n_vars)
+        
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue
+        
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], max_norm=100)
+        optimizer.step()
+        if scheduler:
+            scheduler.step()
+        
+        losses.append(loss.item())
+    
+    return np.mean(losses) if losses else float('inf')
+
+
+def validate_epoch(model, revin, model_mustd, dataloader, loss_func, args, device, n_vars):
+    """验证一个 epoch"""
+    model.eval()
+    if model_mustd:
+        model_mustd.eval()
+    losses = []
+    
+    with torch.no_grad():
+        for batch_x, batch_y in dataloader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            pred_norm, norm_y = forward_pass(batch_x, batch_y, model, revin, model_mustd, args)
+            loss = compute_loss(pred_norm, batch_x, batch_y, norm_y, revin, model_mustd, loss_func, args, n_vars)
+            losses.append(loss.item())
+    
+    return np.mean(losses) if losses else float('inf')
+
+
+def freeze_transformer(model, freeze=True):
+    """冻结或解冻 Transformer 参数"""
+    for param in model.transformer_layers.parameters():
+        param.requires_grad = not freeze
+    for param in model.projection.parameters():
+        param.requires_grad = not freeze
+    for param in model.codebook_head.parameters():
+        param.requires_grad = not freeze
+
+
+def finetune_func(lr=args.lr):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dls = get_dls(args)
+    model, revin, model_mustd, vqvae_config = setup_models_and_revin(dls, args, device)
+    
+    # 损失函数
+    loss_func = nn.MSELoss() if args.loss_type == 'mse' else nn.SmoothL1Loss(beta=args.beta)
+    
+    # 第一阶段：只训练预测头
+    train_losses, valid_losses = [], []
+    best_val_loss = float('inf')
+    
+    if args.n_epochs_head_only > 0:
+        print(f"\n{'='*60}\n第一阶段：只训练预测头（冻结 Transformer）\n{'='*60}")
+        freeze_transformer(model, freeze=True)
+        head_params = [p for p in model.parameters() if p.requires_grad]
+        if model_mustd:
+            head_params += list(model_mustd.parameters())
+        print(f"可训练参数数量: {sum(p.numel() for p in head_params)}")
+        
+        optimizer = Adam(head_params, lr=args.lr_head_only, weight_decay=1e-5)
+        scheduler = OneCycleLR(optimizer, max_lr=args.lr_head_only, 
+                               total_steps=len(dls.train) * args.n_epochs_head_only, pct_start=0.3)
+        
+        for epoch in range(args.n_epochs_head_only):
+            train_loss = train_epoch(model, revin, model_mustd, dls.train, optimizer, scheduler, 
+                                     loss_func, args, device, dls.vars)
+            valid_loss = validate_epoch(model, revin, model_mustd, dls.valid, loss_func, args, device, dls.vars)
+            
+            train_losses.append(train_loss)
+            valid_losses.append(valid_loss)
+            
+            if valid_loss < best_val_loss:
+                best_val_loss = valid_loss
+                print(f"阶段1 - Epoch {epoch+1}/{args.n_epochs_head_only} | "
+                      f"Train: {train_loss:.6f} | Valid: {valid_loss:.6f} | *Improved*")
+            else:
+                print(f"阶段1 - Epoch {epoch+1}/{args.n_epochs_head_only} | "
+                      f"Train: {train_loss:.6f} | Valid: {valid_loss:.6f}")
+        
+        print("第一阶段训练完成！")
+        best_val_loss = float('inf')
+    
+    # 第二阶段：全量微调
+    print(f"\n{'='*60}\n第二阶段：全量微调（解冻 Transformer）\n{'='*60}")
+    freeze_transformer(model, freeze=False)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if model_mustd:
+        trainable_params += list(model_mustd.parameters())
+    print(f"可训练参数数量: {sum(p.numel() for p in trainable_params)}")
+    
+    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
+    full_finetune_steps = args.n_epochs_finetune - args.n_epochs_head_only
+    scheduler = OneCycleLR(optimizer, max_lr=lr, 
+                          total_steps=len(dls.train) * full_finetune_steps, pct_start=0.3)
+    
+    for epoch in range(full_finetune_steps):
+        train_loss = train_epoch(model, revin, model_mustd, dls.train, optimizer, scheduler, 
+                                loss_func, args, device, dls.vars)
+        valid_loss = validate_epoch(model, revin, model_mustd, dls.valid, loss_func, args, device, dls.vars)
+        
+        train_losses.append(train_loss)
+        valid_losses.append(valid_loss)
+        
+        current_epoch = args.n_epochs_head_only + epoch + 1
+        if valid_loss < best_val_loss:
+            best_val_loss = valid_loss
+            checkpoint = {'model_state_dict': model.state_dict(), 'args': args}
+            if model_mustd:
+                checkpoint['mustd_state_dict'] = model_mustd.state_dict()
+            torch.save(checkpoint, os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
+            print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | "
+                  f"Train: {train_loss:.6f} | Valid: {valid_loss:.6f} | *Best Model Saved*")
         else:
-            raise ValueError("Invalid loss type")
+            print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | "
+                  f"Train: {train_loss:.6f} | Valid: {valid_loss:.6f}")
     
-    loss_func = loss_fn(args.loss_type, beta=args.beta)
+    # 保存损失历史
+    df = pd.DataFrame({'train_loss': train_losses, 'valid_loss': valid_losses})
+    df.to_csv(args.save_path + args.save_finetuned_model + '_losses.csv', float_format='%.6f', index=False)
+    print(f"微调完成！损失历史已保存")
+
+
+def find_lr():
+    """简单的学习率查找"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dls = get_dls(args)
+    model, revin, model_mustd, _ = setup_models_and_revin(dls, args, device)
     
-    # Optimizer (包含 MuStdModel)
-    optimizer = Adam(list(model.parameters()) + list(model_mustd.parameters()), lr=args.lr)
+    loss_func = nn.MSELoss() if args.loss_type == 'mse' else nn.SmoothL1Loss(beta=args.beta)
+    params = list(model.parameters())
+    if model_mustd:
+        params += list(model_mustd.parameters())
+    optimizer = Adam(params, lr=args.lr)
     
-    # 简单的学习率查找：尝试几个不同的学习率
-    best_lr = args.lr
-    best_loss = float('inf')
+    best_lr, best_loss = args.lr, float('inf')
     
     for test_lr in [1e-4, 5e-4, 1e-3]:
         optimizer.param_groups[0]['lr'] = test_lr
         model.train()
-        model_mustd.train()
+        if model_mustd:
+            model_mustd.train()
         
-        # 使用一个 batch 测试
         for batch_x, batch_y in dls.train:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            
-            # RevIN normalization
-            if model_mustd.revin_in:
-                _ = model_mustd.revin_in(batch_x, 'norm')
-            if model_mustd.revin_out:
-                norm_y = model_mustd.revin_out(batch_y, 'norm')
-            else:
-                norm_y = batch_y
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            pred_norm, norm_y = forward_pass(batch_x, batch_y, model, revin, model_mustd, args)
+            loss = compute_loss(pred_norm, batch_x, batch_y, norm_y, revin, model_mustd, loss_func, args, dls.vars)
             
             optimizer.zero_grad()
-            pred_norm = model(batch_x, args.target_points)
-            
-            # 根据 scheme 计算损失
-            if args.scheme == 2:
-                if model_mustd.revin_in:
-                    pred = model_mustd.revin_in(pred_norm, 'denorm')
-                else:
-                    pred = pred_norm
-                loss = loss_func(pred, batch_y)
-            else:
-                # Scheme 1 需要 MuStdModel，这里简化处理
-                loss = loss_func(pred_norm, norm_y)
             loss.backward()
             optimizer.step()
             
@@ -389,521 +440,70 @@ def find_lr():
     return best_lr
 
 
-def finetune_func(lr=args.lr):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print('end-to-end finetuning')
-    # get dataloader
-    dls = get_dls(args)
-    
-    # 加载配置
-    vqvae_config = load_vqvae_config(args.vqvae_config_path)
-    
-    # get model (transformer_config 会在 get_model 内部自动加载)
-    model = get_model(dls.vars, args, vqvae_config)
-    model = model.to(device)
-    
-    # RevIN (参考 TOTEM: 使用两个 RevIN，一个用于输入，一个用于输出)
-    revin_in = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    revin_out = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    if revin_in:
-        revin_in = revin_in.to(device)
-    if revin_out:
-        revin_out = revin_out.to(device)
-    
-    # MuStdModel (参考 TOTEM: 用于预测均值和标准差)
-    model_mustd = MuStdModel(
-        Tin=args.context_points,
-        Tout=args.target_points,
-        hidden_dims=[512, 512],
-        dropout=0.2,
-        is_mlp=True
-    )
-    model_mustd.revin_in = revin_in
-    model_mustd.revin_out = revin_out
-    model_mustd = model_mustd.to(device)
-    
-    # 第一阶段：冻结 Transformer，只训练预测头
-    if args.n_epochs_head_only > 0:
-        print(f"\n{'='*60}")
-        print(f"第一阶段：只训练预测头（冻结 Transformer）")
-        print(f"训练轮数: {args.n_epochs_head_only}, 学习率: {args.lr_head_only}")
-        print(f"{'='*60}")
-        
-        # 冻结 Transformer 参数
-        for param in model.transformer_layers.parameters():
-            param.requires_grad = False
-        for param in model.projection.parameters():
-            param.requires_grad = False
-        for param in model.codebook_head.parameters():
-            param.requires_grad = False
-        
-        # 只优化预测头参数和 MuStdModel
-        head_params = [p for p in model.parameters() if p.requires_grad]
-        head_params += list(model_mustd.parameters())  # 包含 MuStdModel
-        print(f"第一阶段可训练参数数量: {sum(p.numel() for p in head_params)}")
-        
-        # 创建第一阶段的 optimizer 和 scheduler
-        head_optimizer = Adam(head_params, lr=args.lr_head_only, weight_decay=1e-5)
-        head_total_steps = len(dls.train) * args.n_epochs_head_only
-        head_scheduler = OneCycleLR(head_optimizer, max_lr=args.lr_head_only, 
-                                   total_steps=head_total_steps, pct_start=0.3)
-    
-    # Loss
-    loss_func = nn.MSELoss(reduction='mean')
-    
-    # 清空 torch 缓存
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Training loop
-    train_losses = []
-    valid_losses = []
-    best_val_loss = float('inf')
-    current_epoch = 0
-    
-    # 第一阶段：只训练预测头
-    if args.n_epochs_head_only > 0:
-        for epoch in range(args.n_epochs_head_only):
-            current_epoch = epoch + 1
-            # Training
-            model.train()
-            epoch_train_losses = []
-            
-            for batch_idx, (batch_x, batch_y) in enumerate(dls.train):
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
-                
-                # RevIN normalization (参考 TOTEM)
-                if model_mustd.revin_in:
-                    _ = model_mustd.revin_in(batch_x, 'norm')
-                if model_mustd.revin_out:
-                    norm_y = model_mustd.revin_out(batch_y, 'norm')
-                else:
-                    norm_y = batch_y
-                
-                head_optimizer.zero_grad()
-                
-                # 预测（模型内部已经处理了 codebook 转换）
-                pred_norm = model(batch_x, args.target_points)  # [B, target_len, C]
-                
-                # 根据 scheme 计算损失（参考 TOTEM）
-                if args.scheme == 1:
-                    # Scheme 1: 预测 mu 和 std
-                    # 准备输入用于 MuStdModel
-                    times = batch_x.permute(0, 2, 1)  # [B, C, Tin]
-                    times = times.reshape(-1, times.shape[-1])  # [B*C, Tin]
-                    ymeanstd = model_mustd(times)  # [B*C, 2]
-                    
-                    # Reshape
-                    ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)  # [B, C, 2]
-                    ymeanstd = ymeanstd.permute(0, 2, 1)  # [B, 2, C]
-                    ymean = ymeanstd[:, 0, :].unsqueeze(1)  # [B, 1, C]
-                    ystd = ymeanstd[:, 1, :].unsqueeze(1)  # [B, 1, C]
-                    
-                    # 计算多个损失项
-                    loss_mu = loss_func(
-                        model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
-                        ymean
-                    )
-                    loss_std = loss_func(
-                        model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
-                        ystd
-                    )
-                    loss_decode = loss_func(pred_norm, norm_y)
-                    loss_all = loss_func(
-                        pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
-                        + (ymean.detach() + model_mustd.revin_in.mean),
-                        batch_y
-                    )
-                    loss = loss_decode + loss_mu + loss_std + loss_all
-                else:  # scheme == 2
-                    # Scheme 2: 直接预测，然后通过 RevIN denorm（类似 PatchTST）
-                    if model_mustd.revin_in:
-                        pred = model_mustd.revin_in(pred_norm, 'denorm')
-                    else:
-                        pred = pred_norm
-                    loss = loss_func(pred, batch_y)
-                
-                # 检查 loss 是否为 NaN 或 Inf
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"警告: Epoch {current_epoch}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
-                    continue
-                
-                loss.backward()
-                
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(head_params, max_norm=100)
-                
-                head_optimizer.step()
-                head_scheduler.step()
-                
-                epoch_train_losses.append(loss.item())
-            
-            avg_train_loss = np.mean(epoch_train_losses)
-            train_losses.append(avg_train_loss)
-            
-            # Validation
-            model.eval()
-            epoch_valid_losses = []
-            
-            with torch.no_grad():
-                for batch_x, batch_y in dls.valid:
-                    batch_x = batch_x.to(device)
-                    batch_y = batch_y.to(device)
-                    
-                    # RevIN normalization
-                    if model_mustd.revin_in:
-                        _ = model_mustd.revin_in(batch_x, 'norm')
-                    if model_mustd.revin_out:
-                        norm_y = model_mustd.revin_out(batch_y, 'norm')
-                    else:
-                        norm_y = batch_y
-                    
-                    pred_norm = model(batch_x, args.target_points)
-                    
-                    # 根据 scheme 计算损失
-                    if args.scheme == 1:
-                        times = batch_x.permute(0, 2, 1)
-                        times = times.reshape(-1, times.shape[-1])
-                        ymeanstd = model_mustd(times)
-                        ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
-                        ymeanstd = ymeanstd.permute(0, 2, 1)
-                        ymean = ymeanstd[:, 0, :].unsqueeze(1)
-                        ystd = ymeanstd[:, 1, :].unsqueeze(1)
-                        
-                        loss_mu = loss_func(
-                            model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
-                            ymean
-                        )
-                        loss_std = loss_func(
-                            model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
-                            ystd
-                        )
-                        loss_decode = loss_func(pred_norm, norm_y)
-                        loss_all = loss_func(
-                            pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
-                            + (ymean.detach() + model_mustd.revin_in.mean),
-                            batch_y
-                        )
-                        loss = loss_decode + loss_mu + loss_std + loss_all
-                    else:
-                        if model_mustd.revin_in:
-                            pred = model_mustd.revin_in(pred_norm, 'denorm')
-                        else:
-                            pred = pred_norm
-                        loss = loss_func(pred, batch_y)
-                    epoch_valid_losses.append(loss.item())
-            
-            avg_valid_loss = np.mean(epoch_valid_losses)
-            valid_losses.append(avg_valid_loss)
-            
-            # 第一阶段也检查是否有改善
-            if avg_valid_loss < best_val_loss:
-                best_val_loss = avg_valid_loss
-                print(f"阶段1 - Epoch {current_epoch}/{args.n_epochs_head_only} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Improved*")
-            else:
-                print(f"阶段1 - Epoch {current_epoch}/{args.n_epochs_head_only} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
-            
-            # 如果 valid loss 完全不变，可能是验证集问题，打印警告
-            if current_epoch > 1 and abs(avg_valid_loss - valid_losses[-2]) < 1e-8:
-                if current_epoch == 2:
-                    print(f"  警告: Valid loss 似乎没有变化，可能是验证集问题或模型输出固定")
-        
-        print(f"\n第一阶段训练完成！")
-        # 重置 best_val_loss，让第二阶段从零开始
-        best_val_loss = float('inf')
-    
-    # 第二阶段：解冻 Transformer，全量微调
-    print(f"\n{'='*60}")
-    print(f"第二阶段：全量微调（解冻 Transformer）")
-    print(f"训练轮数: {args.n_epochs_finetune - args.n_epochs_head_only}, 学习率: {lr}")
-    print(f"{'='*60}")
-    
-    # 解冻 Transformer 参数
-    for param in model.transformer_layers.parameters():
-        param.requires_grad = True
-    for param in model.projection.parameters():
-        param.requires_grad = True
-    for param in model.codebook_head.parameters():
-        param.requires_grad = True
-    
-    # 创建第二阶段的 optimizer 和 scheduler（包含 MuStdModel）
-    trainable_params = list(model.parameters()) + list(model_mustd.parameters())
-    trainable_params = [p for p in trainable_params if p.requires_grad]
-    print(f"第二阶段可训练参数数量: {sum(p.numel() for p in trainable_params)}")
-    
-    optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-5)
-    full_finetune_steps = args.n_epochs_finetune - args.n_epochs_head_only
-    total_steps = len(dls.train) * full_finetune_steps
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.3)
-    
-    # 第二阶段训练
-    for epoch in range(full_finetune_steps):
-        # Training
-        model.train()
-        epoch_train_losses = []
-        
-        for batch_idx, (batch_x, batch_y) in enumerate(dls.train):
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            
-            # RevIN normalization
-            if model_mustd.revin_in:
-                _ = model_mustd.revin_in(batch_x, 'norm')
-            if model_mustd.revin_out:
-                norm_y = model_mustd.revin_out(batch_y, 'norm')
-            else:
-                norm_y = batch_y
-            
-            optimizer.zero_grad()
-            pred_norm = model(batch_x, args.target_points)
-            
-            # 根据 scheme 计算损失
-            if args.scheme == 1:
-                times = batch_x.permute(0, 2, 1)
-                times = times.reshape(-1, times.shape[-1])
-                ymeanstd = model_mustd(times)
-                ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
-                ymeanstd = ymeanstd.permute(0, 2, 1)
-                ymean = ymeanstd[:, 0, :].unsqueeze(1)
-                ystd = ymeanstd[:, 1, :].unsqueeze(1)
-                
-                loss_mu = loss_func(
-                    model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
-                    ymean
-                )
-                loss_std = loss_func(
-                    model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
-                    ystd
-                )
-                loss_decode = loss_func(pred_norm, norm_y)
-                loss_all = loss_func(
-                    pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
-                    + (ymean.detach() + model_mustd.revin_in.mean),
-                    batch_y
-                )
-                loss = loss_decode + loss_mu + loss_std + loss_all
-            else:
-                if model_mustd.revin_in:
-                    pred = model_mustd.revin_in(pred_norm, 'denorm')
-                else:
-                    pred = pred_norm
-                loss = loss_func(pred, batch_y)
-            
-            # 检查 loss 是否为 NaN 或 Inf
-            current_epoch = args.n_epochs_head_only + epoch + 1
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"警告: Epoch {current_epoch}, Batch {batch_idx}, Loss is NaN/Inf: {loss.item()}!")
-                continue
-            
-            loss.backward()
-            
-            # 梯度裁剪（防止梯度爆炸）
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=100)
-            
-            optimizer.step()
-            scheduler.step()
-            
-            epoch_train_losses.append(loss.item())
-        
-        avg_train_loss = np.mean(epoch_train_losses)
-        train_losses.append(avg_train_loss)
-        
-        # Validation
-        model.eval()
-        epoch_valid_losses = []
-        
-        with torch.no_grad():
-            for batch_x, batch_y in dls.valid:
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
-                
-                # RevIN normalization
-                if model_mustd.revin_in:
-                    _ = model_mustd.revin_in(batch_x, 'norm')
-                if model_mustd.revin_out:
-                    norm_y = model_mustd.revin_out(batch_y, 'norm')
-                else:
-                    norm_y = batch_y
-                
-                pred_norm = model(batch_x, args.target_points)
-                
-                # 根据 scheme 计算损失
-                if args.scheme == 1:
-                    times = batch_x.permute(0, 2, 1)
-                    times = times.reshape(-1, times.shape[-1])
-                    ymeanstd = model_mustd(times)
-                    ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
-                    ymeanstd = ymeanstd.permute(0, 2, 1)
-                    ymean = ymeanstd[:, 0, :].unsqueeze(1)
-                    ystd = ymeanstd[:, 1, :].unsqueeze(1)
-                    
-                    loss_mu = loss_func(
-                        model_mustd.revin_out.mean - model_mustd.revin_in.mean, 
-                        ymean
-                    )
-                    loss_std = loss_func(
-                        model_mustd.revin_out.stdev - model_mustd.revin_in.stdev, 
-                        ystd
-                    )
-                    loss_decode = loss_func(pred_norm, norm_y)
-                    loss_all = loss_func(
-                        pred_norm * (ystd.detach() + model_mustd.revin_in.stdev)
-                        + (ymean.detach() + model_mustd.revin_in.mean),
-                        batch_y
-                    )
-                    loss = loss_decode + loss_mu + loss_std + loss_all
-                else:
-                    if model_mustd.revin_in:
-                        pred = model_mustd.revin_in(pred_norm, 'denorm')
-                    else:
-                        pred = pred_norm
-                    loss = loss_func(pred, batch_y)
-                epoch_valid_losses.append(loss.item())
-        
-        avg_valid_loss = np.mean(epoch_valid_losses)
-        valid_losses.append(avg_valid_loss)
-        
-        # Save best model (包含 MuStdModel)
-        current_epoch = args.n_epochs_head_only + epoch + 1
-        if avg_valid_loss < best_val_loss:
-            best_val_loss = avg_valid_loss
-            # 保存两个模型的状态
-            checkpoint = {
-                'model_state_dict': model.state_dict(),
-                'mustd_state_dict': model_mustd.state_dict(),
-                'args': args
-            }
-            torch.save(checkpoint, os.path.join(args.save_path, args.save_finetuned_model + '.pth'))
-            print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f} | *Best Model Saved*")
-        else:
-            print(f"阶段2 - Epoch {current_epoch}/{args.n_epochs_finetune} | Train Loss: {avg_train_loss:.6f} | Valid Loss: {avg_valid_loss:.6f}")
-    
-    # Save loss history
-    df = pd.DataFrame(data={'train_loss': train_losses, 'valid_loss': valid_losses})
-    df.to_csv(args.save_path + args.save_finetuned_model + '_losses.csv', float_format='%.6f', index=False)
-    print(f"微调完成！损失历史已保存到 {args.save_path + args.save_finetuned_model + '_losses.csv'}")
-
-
 def test_func(weight_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # get dataloader
     dls = get_dls(args)
+    model, revin, model_mustd, _ = setup_models_and_revin(dls, args, device)
     
-    # 加载配置
-    vqvae_config = load_vqvae_config(args.vqvae_config_path)
-    
-    # get model (transformer_config 会在 get_model 内部自动加载)
-    model = get_model(dls.vars, args, vqvae_config)
-    model = model.to(device)
-    
-    # Load weights (包含 MuStdModel)
+    # 加载权重
     checkpoint = torch.load(weight_path + '.pth', map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
-        if 'mustd_state_dict' in checkpoint:
+        if model_mustd and 'mustd_state_dict' in checkpoint:
             model_mustd.load_state_dict(checkpoint['mustd_state_dict'])
     else:
-        # 兼容旧格式（只有主模型）
         model.load_state_dict(checkpoint)
+    
     model.eval()
-    model_mustd.eval()
+    if model_mustd:
+        model_mustd.eval()
     
-    # RevIN (参考 TOTEM)
-    revin_in = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    revin_out = RevIN(dls.vars, eps=1e-5, affine=False) if args.revin else None
-    if revin_in:
-        revin_in = revin_in.to(device)
-    if revin_out:
-        revin_out = revin_out.to(device)
-    
-    # MuStdModel
-    model_mustd = MuStdModel(
-        Tin=args.context_points,
-        Tout=args.target_points,
-        hidden_dims=[512, 512],
-        dropout=0.2,
-        is_mlp=True
-    )
-    model_mustd.revin_in = revin_in
-    model_mustd.revin_out = revin_out
-    model_mustd = model_mustd.to(device)
-    
-    # Test
-    all_preds = []
-    all_targets = []
+    all_preds, all_targets = [], []
     
     with torch.no_grad():
         for batch_x, batch_y in dls.test:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            
-            # RevIN normalization
-            if model_mustd.revin_in:
-                _ = model_mustd.revin_in(batch_x, 'norm')
-            if model_mustd.revin_out:
-                _ = model_mustd.revin_out(batch_y, 'norm')
-            
-            pred_norm = model(batch_x, args.target_points)
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            pred_norm, _ = forward_pass(batch_x, batch_y, model, revin, model_mustd, args)
             
             # 根据 scheme 进行 denormalization
             if args.scheme == 1:
-                times = batch_x.permute(0, 2, 1)
-                times = times.reshape(-1, times.shape[-1])
-                ymeanstd = model_mustd(times)
-                ymeanstd = ymeanstd.reshape(batch_x.shape[0], dls.vars, 2)
-                ymeanstd = ymeanstd.permute(0, 2, 1)
-                ymean = ymeanstd[:, 0, :].unsqueeze(1)
-                ystd = ymeanstd[:, 1, :].unsqueeze(1)
-                
-                ymean = ymean + model_mustd.revin_in.mean
-                ystd = ystd + model_mustd.revin_in.stdev
+                # Scheme 1: 使用 MuStdModel 预测的 mean/std
+                times = batch_x.permute(0, 2, 1).reshape(-1, batch_x.shape[1])
+                ymeanstd = model_mustd(times).reshape(batch_x.shape[0], dls.vars, 2).permute(0, 2, 1)
+                ymean, ystd = ymeanstd[:, 0:1, :] + model_mustd.revin_in.mean, ymeanstd[:, 1:2, :] + model_mustd.revin_in.stdev
                 pred = pred_norm * ystd + ymean
-            else:  # scheme == 2
-                if model_mustd.revin_in:
-                    pred = model_mustd.revin_in(pred_norm, 'denorm')
-                else:
-                    pred = pred_norm
+            else:
+                # Scheme 2: 直接使用 RevIN 反归一化（更简单高效）
+                pred = revin(pred_norm, 'denorm') if revin else pred_norm
             
             all_preds.append(pred.cpu())
             all_targets.append(batch_y.cpu())
     
-    # Concatenate all predictions and targets
     preds = torch.cat(all_preds, dim=0).numpy()
     targets = torch.cat(all_targets, dim=0).numpy()
     
-    # Calculate metrics
     mse = np.mean((preds - targets) ** 2)
     mae = np.mean(np.abs(preds - targets))
     
-    scores = [mse, mae]
     print(f'score: MSE={mse:.6f}, MAE={mae:.6f}')
     
-    # save results
-    pd.DataFrame(np.array(scores).reshape(1, -1), columns=['mse', 'mae']).to_csv(
+    pd.DataFrame([[mse, mae]], columns=['mse', 'mae']).to_csv(
         args.save_path + args.save_finetuned_model + '_acc.csv', 
-        float_format='%.6f', 
-        index=False
+        float_format='%.6f', index=False
     )
     
-    return [preds, targets, scores]
+    return [preds, targets, [mse, mae]]
 
 
 if __name__ == '__main__':
     if args.is_finetune:
         args.dset = args.dset_finetune
-        # Finetune
         suggested_lr = find_lr()
         finetune_func(suggested_lr)
         print('finetune completed')
-        # Test - 直接输出测试集结果
         out = test_func(args.save_path + args.save_finetuned_model)
         print('----------- Complete! -----------')
     else:
         args.dset = args.dset_finetune
-        weight_path = args.save_path + args.save_finetuned_model
-        # Test only
-        out = test_func(weight_path)
+        out = test_func(args.save_path + args.save_finetuned_model)
         print('----------- Complete! -----------')

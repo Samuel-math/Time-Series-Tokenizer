@@ -1,7 +1,7 @@
 dset=ettm1
 python vqvae_transformer_finetune.py \
     --dset_finetune ${dset} \
-    --context_points 512 \
+    --context_points 128 \
     --target_points 96 \
     --batch_size 64 \
     --n_epochs_finetune 50 \
