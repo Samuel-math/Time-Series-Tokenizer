@@ -297,7 +297,7 @@ def finetune_func(lr=args.lr):
         print(f"可训练参数数量: {sum(p.numel() for p in head_params)}")
 
         optimizer = Adam(head_params, lr=args.lr_head_only, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs_head_only, eta_min=1e-6)
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs_head_only, eta_min=1e-4)
 
         for epoch in range(args.n_epochs_head_only):
             train_loss = trainer.train_epoch(optimizer)
@@ -326,7 +326,7 @@ def finetune_func(lr=args.lr):
 
     optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-4)
     full_finetune_steps = args.n_epochs_finetune - args.n_epochs_head_only
-    scheduler = CosineAnnealingLR(optimizer, T_max=full_finetune_steps, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=full_finetune_steps, eta_min=1e-4)
 
     for epoch in range(full_finetune_steps):
         train_loss = trainer.train_epoch(optimizer)
