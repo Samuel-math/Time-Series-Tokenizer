@@ -15,7 +15,7 @@ python patch_vqvae_pretrain.py \
     --patch_size 16 \
     --embedding_dim 64 \
     --compression_factor 4 \
-    --codebook_size 256 \
+    --codebook_size 14 \
     --n_layers 4 \
     --n_heads 4 \
     --d_ff 256 \

@@ -245,19 +245,22 @@ def main():
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f}")
         
-        # 保存最佳模型 (前1/10 epoch不保存，仅根据val的ntp_loss判断)
+        # 保存最佳模型 (前1/10 epoch不保存，根据train_loss和val_loss均值判断)
         warmup_epochs = args.n_epochs // 10
-        if epoch >= warmup_epochs and val_metrics['ntp_loss'] < best_val_loss:
-            best_val_loss = val_metrics['ntp_loss']
+        avg_loss = (train_metrics['loss'] + val_metrics['loss']) / 2
+        if epoch >= warmup_epochs and avg_loss < best_val_loss:
+            best_val_loss = avg_loss
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'config': config,
                 'args': vars(args),
                 'epoch': epoch,
-                'val_ntp_loss': best_val_loss,
+                'train_loss': train_metrics['loss'],
+                'val_loss': val_metrics['loss'],
+                'avg_loss': avg_loss,
             }
             torch.save(checkpoint, save_dir / f'{model_name}.pth')
-            print(f"  -> Best model saved (val_ntp_loss: {best_val_loss:.4f})")
+            print(f"  -> Best model saved (avg_loss: {avg_loss:.4f}, train: {train_metrics['loss']:.4f}, val: {val_metrics['loss']:.4f})")
         
         # 每10个epoch检查码本使用率
         if (epoch + 1) % 10 == 0:
@@ -282,7 +285,7 @@ def main():
     
     print('=' * 80)
     print(f'预训练完成！')
-    print(f'最佳验证NTP损失: {best_val_loss:.4f}')
+    print(f'最佳平均损失 (train_loss+val_loss)/2: {best_val_loss:.4f}')
     print(f'模型保存至: {save_dir / model_name}.pth')
 
 
