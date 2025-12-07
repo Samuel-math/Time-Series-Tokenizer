@@ -48,6 +48,8 @@ parser.add_argument('--n_epochs_head_only', type=int, default=0, help='number of
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for full finetuning')
 parser.add_argument('--lr_head_only', type=float, default=1e-3, help='learning rate for head-only training phase')
 # Model architecture args
+parser.add_argument('--patch_size', type=int, default=16, help='patch size for time series patching')
+parser.add_argument('--stride', type=int, default=None, help='stride for patching (default: patch_size, non-overlapping)')
 parser.add_argument('--head_type', type=str, default='mlp', choices=['mlp', 'linear'], help='prediction head type')
 parser.add_argument('--head_dropout', type=float, default=0.1, help='dropout rate for prediction head')
 parser.add_argument('--individual', type=int, default=0, help='use individual prediction head for each channel')
@@ -142,8 +144,10 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
     # 构建模型
     if args.init_mode == 'random':
         finetune_model = VQVAETransformerFinetune(
-            vqvae_config, transformer_config, pretrained_model=None,
-            freeze_encoder=False, freeze_vq=False, freeze_transformer=False,
+            vqvae_config, transformer_config,
+            patch_size=args.patch_size, stride=args.stride,
+            pretrained_model=None,
+            freeze_vq=False, freeze_transformer=False,
             head_type=args.head_type, head_dropout=args.head_dropout,
             individual=bool(args.individual), load_vqvae_weights=False,
             vqvae_checkpoint_path=None, device=device
@@ -152,8 +156,10 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
         if args.vqvae_checkpoint is None:
             raise ValueError("vqvae_only 模式需要提供 --vqvae_checkpoint")
         finetune_model = VQVAETransformerFinetune(
-            vqvae_config, transformer_config, pretrained_model=None,
-            freeze_encoder=False, freeze_vq=False, freeze_transformer=False,
+            vqvae_config, transformer_config,
+            patch_size=args.patch_size, stride=args.stride,
+            pretrained_model=None,
+            freeze_vq=False, freeze_transformer=False,
             head_type=args.head_type, head_dropout=args.head_dropout,
             individual=bool(args.individual), load_vqvae_weights=True,
             vqvae_checkpoint_path=args.vqvae_checkpoint, device=device
@@ -202,7 +208,9 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
         
         pretrained_model.eval()
         finetune_model = VQVAETransformerFinetune(
-            vqvae_config, transformer_config, pretrained_model=pretrained_model,
+            vqvae_config, transformer_config,
+            patch_size=args.patch_size, stride=args.stride,
+            pretrained_model=pretrained_model,
             freeze_vq=False, freeze_transformer=False,
             head_type=args.head_type, head_dropout=args.head_dropout,
             individual=bool(args.individual), load_vqvae_weights=False,
