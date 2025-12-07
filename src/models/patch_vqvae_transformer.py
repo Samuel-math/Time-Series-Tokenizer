@@ -261,8 +261,11 @@ class PatchVQVAETransformer(nn.Module):
                 z_c = current_z[:, :, c, :]  # [B, seq_len, code_dim]
                 h = self.transformer(z_c)  # [B, seq_len, code_dim]
                 logits = self.output_head(h[:, -1, :])  # [B, codebook_size]
-                pred_idx = torch.argmax(logits, dim=-1)  # [B]
-                pred_code = self.vq.get_embedding(pred_idx)  # [B, code_dim]
+                
+                # 使用 softmax + 加权求和 替代 argmax，保持可微分
+                weights = F.softmax(logits, dim=-1)  # [B, codebook_size]
+                codebook = self.vq._embedding.weight  # [codebook_size, code_dim]
+                pred_code = torch.matmul(weights, codebook)  # [B, code_dim]
                 next_codes.append(pred_code)
             
             next_codes = torch.stack(next_codes, dim=1)  # [B, C, code_dim]

@@ -4,7 +4,7 @@
 # 默认冻结 encoder 和 VQ 层，只训练 Transformer 和 Decoder
 
 # 预训练模型路径 (根据实际情况修改)
-PRETRAINED_MODEL="saved_models/patch_vqvae/ettm1/patch_vqvae_ps16_cb256_d128_l4_model1.pth"
+PRETRAINED_MODEL="saved_models/patch_vqvae/ettm1/patch_vqvae_ps16_cb14_cd256_l3_model1.pth"
 
 python patch_vqvae_finetune.py \
     --dset ettm1 \
