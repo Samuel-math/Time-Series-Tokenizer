@@ -178,7 +178,6 @@ class Trainer:
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], max_norm=100)
             optimizer.step()
             if scheduler:
                 scheduler.step()
