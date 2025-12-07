@@ -12,6 +12,9 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import OneCycleLR
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 from src.models.vqvae_transformer import VQVAETransformerPretrain
 from src.models.layers.revin import RevIN
@@ -98,6 +101,104 @@ def save_transformer_config(args, filename="transformer_config.json"):
         json.dump(transformer_config, f, indent=4)
 
     print(f"Transformer 参数已保存到 {save_path}")
+
+
+def visualize_codebook(model, save_path, args):
+    """可视化码本向量并保存图像"""
+    if not hasattr(model, 'vq'):
+        print("模型不包含VQ层，跳过码本可视化")
+        return
+
+    codebook = model.vq._embedding.weight.data.cpu().numpy()  # [num_embeddings, embedding_dim]
+    num_embeddings, embedding_dim = codebook.shape
+
+    print(f"\n=== 最终码本可视化 ===")
+    print(f"码本大小: {num_embeddings}, 嵌入维度: {embedding_dim}")
+
+    # 计算码本统计信息
+    norms = np.linalg.norm(codebook, axis=1)
+    print(f"码本向量范数 - 平均: {norms.mean():.4f}, 最大: {norms.max():.4f}, 最小: {norms.min():.4f}")
+
+    # 降维可视化
+    if embedding_dim == 2:
+        # 2D直接可视化
+        reduced_codebook = codebook
+        method = "原始2D"
+    elif embedding_dim > 2:
+        # 使用t-SNE降维到2D（如果码本不大）
+        if num_embeddings <= 1000:
+            try:
+                tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, num_embeddings-1))
+                reduced_codebook = tsne.fit_transform(codebook)
+                method = "t-SNE"
+            except:
+                # t-SNE失败时使用PCA
+                pca = PCA(n_components=2, random_state=42)
+                reduced_codebook = pca.fit_transform(codebook)
+                method = "PCA"
+        else:
+            # 大码本使用PCA
+            pca = PCA(n_components=2, random_state=42)
+            reduced_codebook = pca.fit_transform(codebook)
+            method = "PCA"
+    else:
+        print("嵌入维度小于2，跳过可视化")
+        return
+
+    # 创建可视化
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+    # 子图1：码本向量分布
+    scatter = axes[0].scatter(reduced_codebook[:, 0], reduced_codebook[:, 1],
+                             c=norms, cmap='viridis', alpha=0.7, s=50)
+    axes[0].set_title(f'码本向量分布 ({method}降维)')
+    axes[0].set_xlabel('维度1')
+    axes[0].set_ylabel('维度2')
+    axes[0].grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=axes[0], label='向量范数')
+
+    # 添加向量索引标签（只对小码本）
+    if num_embeddings <= 50:
+        for i, (x, y) in enumerate(reduced_codebook):
+            axes[0].annotate(str(i), (x, y), xytext=(3, 3), textcoords='offset points',
+                           fontsize=8, alpha=0.8)
+
+    # 子图2：码本向量范数分布直方图
+    axes[1].hist(norms, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+    axes[1].set_title('码本向量范数分布')
+    axes[1].set_xlabel('向量范数')
+    axes[1].set_ylabel('频次')
+    axes[1].grid(True, alpha=0.3)
+
+    # 添加统计信息文本
+    stats_text = f"""
+数据集: {args.dset_pretrain}
+码本大小: {num_embeddings}
+嵌入维度: {embedding_dim}
+降维方法: {method}
+平均范数: {norms.mean():.4f}
+范数标准差: {norms.std():.4f}
+最大范数: {norms.max():.4f}
+最小范数: {norms.min():.4f}
+"""
+    fig.suptitle('VQVAE Transformer 码本分析', fontsize=14, fontweight='bold')
+    plt.figtext(0.02, 0.02, stats_text, fontsize=10, verticalalignment='bottom',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+
+    plt.tight_layout()
+
+    # 保存图像
+    viz_path = os.path.join(save_path, f'{args.save_pretrained_model}_codebook_visualization.png')
+    plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+    print(f"码本可视化已保存到: {viz_path}")
+
+    # 保存码本数据为numpy文件（用于后续分析）
+    npz_path = os.path.join(save_path, f'{args.save_pretrained_model}_codebook.npz')
+    np.savez(npz_path, codebook=codebook, norms=norms, reduced_codebook=reduced_codebook)
+    print(f"码本数据已保存到: {npz_path}")
+
+    plt.close()
+
 
 def compute_next_token_loss(model, x, compression_factor, device='cuda', beta=0.0):
     """
@@ -402,6 +503,12 @@ def pretrain_func(lr=args.lr):
     df = pd.DataFrame(data={'train_loss': train_losses, 'valid_loss': valid_losses})
     df.to_csv(args.save_path + args.save_pretrained_model + '_losses.csv', float_format='%.6f', index=False)
     print(f"训练完成！损失历史已保存到 {args.save_path + args.save_pretrained_model + '_losses.csv'}")
+
+    # 可视化最终码本
+    try:
+        visualize_codebook(model, args.save_path, args)
+    except Exception as e:
+        print(f"码本可视化失败: {e}")
 
 
 if __name__ == '__main__':
