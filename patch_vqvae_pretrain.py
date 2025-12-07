@@ -33,22 +33,21 @@ def parse_args():
     parser.add_argument('--scaler', type=str, default='standard', help='数据缩放方式')
     parser.add_argument('--features', type=str, default='M', help='特征类型')
     
-    # 模型参数
+    # 模型参数 (Transformer输入维度 = embedding_dim * patch_size/compression_factor)
     parser.add_argument('--patch_size', type=int, default=16, help='Patch大小')
-    parser.add_argument('--embedding_dim', type=int, default=64, help='VQVAE embedding维度')
+    parser.add_argument('--embedding_dim', type=int, default=32, help='VQVAE embedding维度')
     parser.add_argument('--compression_factor', type=int, default=4, help='压缩因子')
-    parser.add_argument('--codebook_size', type=int, default=512, help='码本大小')
-    parser.add_argument('--d_model', type=int, default=256, help='Transformer隐藏维度')
-    parser.add_argument('--n_layers', type=int, default=6, help='Transformer层数')
-    parser.add_argument('--n_heads', type=int, default=8, help='注意力头数')
-    parser.add_argument('--d_ff', type=int, default=1024, help='FFN维度')
+    parser.add_argument('--codebook_size', type=int, default=256, help='码本大小')
+    parser.add_argument('--n_layers', type=int, default=4, help='Transformer层数')
+    parser.add_argument('--n_heads', type=int, default=4, help='注意力头数 (需整除 code_dim)')
+    parser.add_argument('--d_ff', type=int, default=256, help='FFN维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
     
-    # VQVAE Encoder/Decoder 参数 (复用 vqvae.py)
-    parser.add_argument('--num_hiddens', type=int, default=128, help='VQVAE隐藏层维度')
+    # VQVAE Encoder/Decoder 参数 (轻量化)
+    parser.add_argument('--num_hiddens', type=int, default=64, help='VQVAE隐藏层维度')
     parser.add_argument('--num_residual_layers', type=int, default=2, help='残差层数')
-    parser.add_argument('--num_residual_hiddens', type=int, default=64, help='残差隐藏层维度')
+    parser.add_argument('--num_residual_hiddens', type=int, default=32, help='残差隐藏层维度')
     parser.add_argument('--vqvae_checkpoint', type=str, default=None, help='预训练VQVAE模型路径(可选)')
     
     # 训练参数
@@ -68,18 +67,21 @@ def parse_args():
 
 def get_model_config(args):
     """构建模型配置"""
+    # code_dim = embedding_dim * (patch_size / compression_factor)
+    code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
+    print(f"Transformer 输入维度 (code_dim) = {code_dim}")
+    
     return {
         'patch_size': args.patch_size,
         'embedding_dim': args.embedding_dim,
         'compression_factor': args.compression_factor,
         'codebook_size': args.codebook_size,
-        'd_model': args.d_model,
         'n_layers': args.n_layers,
         'n_heads': args.n_heads,
         'd_ff': args.d_ff,
         'dropout': args.dropout,
         'commitment_cost': args.commitment_cost,
-        # VQVAE Encoder/Decoder 配置 (复用 vqvae.py)
+        # VQVAE Encoder/Decoder 配置
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,

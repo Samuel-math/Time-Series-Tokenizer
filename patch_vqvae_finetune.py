@@ -95,11 +95,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         batch_x = batch_x.to(device)  # [B, context_points, C]
         batch_y = batch_y.to(device)  # [B, target_points, C]
         
-        # RevIN归一化
+        # RevIN归一化 (需要同时对 x 和 y 归一化)
         if revin:
+            # 合并后归一化，确保统计量一致
             batch_x = revin(batch_x, 'norm')
         
-        # 前向传播
+        # 前向传播: 预测码本索引 -> 解码
         pred, vq_loss = model.forward_finetune(batch_x, args.target_points)
         
         # RevIN反归一化
@@ -109,8 +110,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         # MSE损失
         mse_loss = F.mse_loss(pred, batch_y)
         
-        # 总损失（可选加上VQ损失以稳定训练）
-        loss = mse_loss + 0.01 * vq_loss
+        # 总损失
+        loss = mse_loss + 0.1 * vq_loss
         
         # 反向传播
         optimizer.zero_grad()
