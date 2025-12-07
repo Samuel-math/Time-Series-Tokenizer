@@ -245,21 +245,18 @@ def main():
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f}")
         
-        # 保存最佳模型 (前5个epoch不保存，让模型先稳定)
-        if val_metrics['loss'] < best_val_loss:
+        # 保存最佳模型 (前5个epoch不保存也不记录best_loss，让模型先稳定)
+        if epoch >= 5 and val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
-            if epoch >= 5:
-                checkpoint = {
-                    'model_state_dict': model.state_dict(),
-                    'config': config,
-                    'args': vars(args),
-                    'epoch': epoch,
-                    'val_loss': best_val_loss,
-                }
-                torch.save(checkpoint, save_dir / f'{model_name}.pth')
-                print(f"  -> Best model saved (val_loss: {best_val_loss:.4f})")
-            else:
-                print(f"  -> New best (val_loss: {best_val_loss:.4f}), skipping save (epoch < 5)")
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'config': config,
+                'args': vars(args),
+                'epoch': epoch,
+                'val_loss': best_val_loss,
+            }
+            torch.save(checkpoint, save_dir / f'{model_name}.pth')
+            print(f"  -> Best model saved (val_loss: {best_val_loss:.4f})")
         
         # 每10个epoch检查码本使用率
         if (epoch + 1) % 10 == 0:
