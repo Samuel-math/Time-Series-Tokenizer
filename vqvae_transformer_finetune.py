@@ -237,7 +237,7 @@ def parse_args():
     # 训练参数
     parser.add_argument('--n_epochs_finetune', type=int, default=20, help='微调总轮数')
     parser.add_argument('--n_epochs_head_only', type=int, default=0, help='仅训练预测头轮数')
-    parser.add_argument('--lr', type=float, default=1e-4, help='全量微调学习率')
+    parser.add_argument('--lr', type=float, default=1e-3, help='全量微调学习率')
     parser.add_argument('--lr_head_only', type=float, default=1e-3, help='仅训练预测头学习率')
 
     # 模型架构参数
@@ -253,7 +253,6 @@ def parse_args():
 
     # 运行模式
     parser.add_argument('--is_finetune', type=int, default=1, help='是否进行微调')
-    parser.add_argument('--find_lr', type=int, default=0, help='是否进行学习率查找')
 
     return parser.parse_args()
 
@@ -271,51 +270,6 @@ args.save_finetuned_model = f'{args.dset_finetune}_vqvae_transformer_finetuned{s
 set_device()
 
 
-def find_learning_rate(model, dls, args, device):
-    """简单的学习率查找 (可选)"""
-    if not args.find_lr:
-        return args.lr
-
-    print("执行学习率查找...")
-
-    model.train()
-    loss_func = nn.MSELoss()
-    optimizer = Adam(model.parameters(), lr=1e-6)
-
-    lr_range = [1e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
-    best_lr, best_loss = args.lr, float('inf')
-
-    for lr in lr_range:
-        optimizer.param_groups[0]['lr'] = lr
-        total_loss = 0
-        n_batches = 0
-
-        for batch_x, batch_y in dls.train:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-
-            if args.revin:
-                revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device)
-                _ = revin(batch_x, 'norm')
-                pred_norm = model(batch_x, args.target_points)
-                pred = revin(pred_norm, 'denorm')
-            else:
-                pred_norm = model(batch_x, args.target_points)
-                pred = pred_norm
-
-            loss = loss_func(pred, batch_y)
-            total_loss += loss.item()
-            n_batches += 1
-
-            if n_batches >= 5:  # 只用前5个batch
-                break
-
-        avg_loss = total_loss / n_batches
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_lr = lr
-
-    print(f"建议学习率: {best_lr}")
-    return best_lr
 
 
 def finetune_func(lr=args.lr):
@@ -454,17 +408,8 @@ if __name__ == '__main__':
     if args.is_finetune:
         print("开始微调流程...")
 
-        # 初始化模型用于学习率查找
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        dls = get_dls(args)
-        model_manager = ModelManager(args)
-        temp_model = model_manager.create_model(dls.vars, device)
-
-        # 学习率查找（如果启用）
-        suggested_lr = find_learning_rate(temp_model, dls, args, device)
-
-        # 执行微调
-        finetune_func(suggested_lr)
+        # 执行微调，使用指定的学习率
+        finetune_func(args.lr)
         print('微调完成')
 
         # 测试最佳模型
