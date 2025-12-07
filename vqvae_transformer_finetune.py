@@ -9,7 +9,7 @@ import os
 import torch
 from torch import nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 import json
 from pathlib import Path
 
@@ -162,7 +162,7 @@ class Trainer:
             for param in self.model.codebook_projection.parameters():
                 param.requires_grad = not freeze
 
-    def train_epoch(self, optimizer):
+    def train_epoch(self, optimizer, scheduler=None):
         """训练一个epoch"""
         self.model.train()
         losses = []
@@ -180,6 +180,8 @@ class Trainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=100)
             optimizer.step()
+            if scheduler:
+                scheduler.step()
 
             losses.append(loss.item())
 
@@ -235,7 +237,7 @@ def parse_args():
 
     # 训练参数
     parser.add_argument('--n_epochs_finetune', type=int, default=20, help='微调总轮数')
-    parser.add_argument('--n_epochs_head_only', type=int, default=5, help='仅训练预测头轮数')
+    parser.add_argument('--n_epochs_head_only', type=int, default=0, help='仅训练预测头轮数')
     parser.add_argument('--lr', type=float, default=1e-4, help='全量微调学习率')
     parser.add_argument('--lr_head_only', type=float, default=1e-3, help='仅训练预测头学习率')
 
@@ -297,12 +299,12 @@ def finetune_func(lr=args.lr):
         print(f"可训练参数数量: {sum(p.numel() for p in head_params)}")
 
         optimizer = Adam(head_params, lr=args.lr_head_only, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs_head_only, eta_min=1e-4)
+        scheduler = OneCycleLR(optimizer, max_lr=args.lr_head_only,
+                               total_steps=len(dls.train) * args.n_epochs_head_only, pct_start=0.3)
 
         for epoch in range(args.n_epochs_head_only):
-            train_loss = trainer.train_epoch(optimizer)
+            train_loss = trainer.train_epoch(optimizer, scheduler)
             valid_loss = trainer.validate_epoch()
-            scheduler.step()
 
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
@@ -326,12 +328,12 @@ def finetune_func(lr=args.lr):
 
     optimizer = Adam(trainable_params, lr=lr, weight_decay=1e-4)
     full_finetune_steps = args.n_epochs_finetune - args.n_epochs_head_only
-    scheduler = CosineAnnealingLR(optimizer, T_max=full_finetune_steps, eta_min=1e-4)
+    scheduler = OneCycleLR(optimizer, max_lr=lr,
+                          total_steps=len(dls.train) * full_finetune_steps, pct_start=0.3)
 
     for epoch in range(full_finetune_steps):
-        train_loss = trainer.train_epoch(optimizer)
+        train_loss = trainer.train_epoch(optimizer, scheduler)
         valid_loss = trainer.validate_epoch()
-        scheduler.step()
 
         train_losses.append(train_loss)
         valid_losses.append(valid_loss)
