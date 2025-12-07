@@ -264,7 +264,7 @@ class PatchVQVAETransformer(nn.Module):
                 
                 # 使用 softmax + 加权求和 替代 argmax，保持可微分
                 weights = F.softmax(logits, dim=-1)  # [B, codebook_size]
-                codebook = self.vq._embedding.weight  # [codebook_size, code_dim]
+                codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
                 pred_code = torch.matmul(weights, codebook)  # [B, code_dim]
                 next_codes.append(pred_code)
             
