@@ -168,23 +168,37 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
             vqvae_checkpoint_path=None, device=device
         )
         
+        # 尝试从 pretrained_model 加载权重（应该包含 VQVAE 和 Transformer 的权重）
+        load_success = False
         try:
             if isinstance(pretrained_checkpoint, dict) and 'model_state_dict' in pretrained_checkpoint:
                 pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'], strict=False)
+                load_success = True
+                print(f"成功从预训练模型加载权重: {args.pretrained_model}")
             elif isinstance(pretrained_checkpoint, dict):
                 pretrained_model.load_state_dict(pretrained_checkpoint, strict=False)
+                load_success = True
+                print(f"成功从预训练模型加载权重: {args.pretrained_model}")
             else:
                 if hasattr(pretrained_checkpoint, 'state_dict'):
                     pretrained_model.load_state_dict(pretrained_checkpoint.state_dict(), strict=False)
+                    load_success = True
+                    print(f"成功从预训练模型加载权重: {args.pretrained_model}")
         except Exception as e:
             print(f"加载预训练模型权重时出错: {e}")
+            load_success = False
+        
+        # 只有在从 pretrained_model 加载失败时，才使用 vqvae_checkpoint 作为后备
+        if not load_success:
             if args.vqvae_checkpoint is not None:
+                print(f"使用 vqvae_checkpoint 作为后备: {args.vqvae_checkpoint}")
                 pretrained_model._load_vqvae_weights(args.vqvae_checkpoint, device)
             else:
                 raise ValueError("无法加载预训练权重，且未提供 --vqvae_checkpoint")
-        
-        if args.vqvae_checkpoint is not None:
-            pretrained_model._load_vqvae_weights(args.vqvae_checkpoint, device)
+        else:
+            # 如果成功从 pretrained_model 加载，就不应该再加载 vqvae_checkpoint
+            # 因为 pretrained_model 已经包含了 VQVAE 的权重
+            print("预训练模型已包含 VQVAE 权重，跳过 vqvae_checkpoint 加载")
         
         pretrained_model.eval()
         finetune_model = VQVAETransformerFinetune(
