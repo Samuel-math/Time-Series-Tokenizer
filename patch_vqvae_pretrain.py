@@ -191,8 +191,9 @@ def main():
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 模型文件名
-    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_d{args.d_model}_l{args.n_layers}_model{args.model_id}'
+    # 模型文件名 (code_dim = embedding_dim * patch_size / compression_factor)
+    code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
+    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
