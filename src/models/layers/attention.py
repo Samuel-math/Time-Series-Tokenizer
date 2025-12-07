@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch import Tensor
 import torch.nn.functional as F
+import numpy as np
 from typing import Callable, Optional
 
 class MultiheadAttention(nn.Module):

@@ -287,400 +287,350 @@ class TransformerEncoderLayer(nn.Module):
         return x
 
 
+class CrossAttentionLayer(nn.Module):
+    """Cross-Attention Layer: Query from input patches, Key and Value from codebook"""
+    def __init__(self, d_model, n_heads, d_ff=256, dropout=0.1, attn_dropout=0.1):
+        super().__init__()
+        self.cross_attn = MultiheadAttention(
+            d_model, n_heads, 
+            attn_dropout=attn_dropout, 
+            proj_dropout=dropout
+        )
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        
+    def forward(self, query, key_value):
+        """
+        Args:
+            query: [B, T_q, d_model] - patch后的时间序列
+            key_value: [B, num_embeddings, d_model] - 码本embeddings
+        """
+        # Cross-attention: Q from query, K and V from codebook
+        x2, _ = self.cross_attn(query, key_value, key_value)
+        query = query + self.dropout1(x2)
+        query = self.norm1(query)
+        
+        # Feed-forward
+        x2 = self.ff(query)
+        query = query + self.dropout2(x2)
+        query = self.norm2(query)
+        
+        return query
+
+
 class VQVAETransformerFinetune(nn.Module):
     """
-    微调模型：参考 TOTEM 方式，使用 Transformer 预测未来的 codebook tokens，通过 codebook 转换为预测结果
-    
-    设计思路（参考 TOTEM）：
-    1. 使用 VQVAE encoder + Transformer 获取输入序列的 codebook 表示
-    2. 使用 Transformer 预测未来的 codebook tokens（target_len / compression_factor 个 tokens）
-    3. 将预测的 codebook tokens 通过 codebook embedding 转换为向量
-    4. 使用这些向量直接预测目标序列 [B, target_len, C]
+    微调模型：使用 Cross-Attention 架构，将训练出的码本作为 K 和 V，与 patch 后的时间序列做 cross-attention
     
     输入: [B, T, C] 时间序列
     输出: [B, target_len, C] 预测结果
-    
-    支持三种初始化方式：
-    1. 完全独立构建（所有组件随机初始化）
-    2. 从预训练的 VQVAETransformerPretrain 模型加载
-    3. 从 checkpoint 加载各个组件
     """
     def __init__(self, vqvae_config, transformer_config,
+                 patch_size=16, stride=None,
                  pretrained_model=None,
-                 freeze_encoder=True, freeze_vq=True, freeze_transformer=False,
+                 freeze_vq=True, freeze_transformer=False,
                  head_type='mlp', head_dropout=0.1, individual=False,
                  load_vqvae_weights=False, vqvae_checkpoint_path=None,
                  device='cpu'):
         """
         Args:
-            vqvae_config: VQVAE配置字典
+            vqvae_config: VQVAE配置字典（主要用于获取码本）
             transformer_config: Transformer配置字典
-            pretrained_model: 可选的预训练 VQVAETransformerPretrain 模型（如果提供，将使用其组件）
-            freeze_encoder: 是否冻结 VQVAE encoder
+            patch_size: patch 大小
+            stride: patch 步长，默认等于 patch_size（非重叠）
+            pretrained_model: 可选的预训练模型（如果提供，将使用其 VQ 层）
             freeze_vq: 是否冻结 VQ 层（包括 codebook）
             freeze_transformer: 是否冻结 Transformer 层
             head_type: 预测头类型 ('mlp' 或 'linear')
             head_dropout: 预测头的 dropout 率
             individual: 是否为每个通道使用独立的预测头
-            load_vqvae_weights: 是否加载预训练的VQVAE权重（如果pretrained_model为None）
-            vqvae_checkpoint_path: VQVAE模型checkpoint路径（如果load_vqvae_weights=True）
+            load_vqvae_weights: 是否加载预训练的VQVAE权重
+            vqvae_checkpoint_path: VQVAE模型checkpoint路径
             device: 加载模型时的设备
         """
         super().__init__()
         
-        # 配置信息
-        self.compression_factor = vqvae_config['compression_factor']
+        self.patch_size = patch_size
+        self.stride = stride if stride is not None else patch_size
         self.num_embeddings = vqvae_config['num_embeddings']
         self.embedding_dim = vqvae_config['embedding_dim']
-        
-        # Transformer配置
         self.d_model = transformer_config.get('d_model', 128)
         self.n_layers = transformer_config.get('n_layers', 3)
         self.n_heads = transformer_config.get('n_heads', 8)
         self.d_ff = transformer_config.get('d_ff', 256)
         self.dropout = transformer_config.get('dropout', 0.1)
         self.attn_dropout = transformer_config.get('attn_dropout', 0.1)
-        
         self.individual = individual
-        self.n_vars = None  # 将在第一次 forward 时确定
         
-        # 如果提供了预训练模型，使用其组件
+        # VQ层（用于获取码本）
         if pretrained_model is not None:
-            self.vqvae_encoder = pretrained_model.vqvae_encoder
             self.vq = pretrained_model.vq
-            self.projection = pretrained_model.projection
-            self.transformer_layers = pretrained_model.transformer_layers
-            self.codebook_head = pretrained_model.codebook_head
-            self.pe = pretrained_model.pe
-            self.learn_pe = pretrained_model.learn_pe
-            self.dropout_layer = pretrained_model.dropout_layer
         else:
-            # 独立构建所有组件
-            # VQVAE encoder
-            self.vqvae_encoder = Encoder(
-                1, 
-                vqvae_config['block_hidden_size'],
-                vqvae_config['num_residual_layers'],
-                vqvae_config['res_hidden_size'],
-                self.embedding_dim,
-                self.compression_factor
-            )
-            
-            # VQ层
             self.vq = VectorQuantizer(
-                self.num_embeddings,
-                self.embedding_dim,
-                vqvae_config['commitment_cost']
+                self.num_embeddings, self.embedding_dim,
+                vqvae_config.get('commitment_cost', 0.25)
             )
-            
-            # 加载预训练的VQVAE权重（如果指定）
             if load_vqvae_weights and vqvae_checkpoint_path is not None:
-                self._load_vqvae_weights(vqvae_checkpoint_path, device)
-            
-            # 投影层：将embedding_dim投影到d_model
-            self.projection = nn.Linear(self.embedding_dim, self.d_model)
-            
-            # 位置编码
-            self.pe = 'zeros'
-            self.learn_pe = True
-            
-            # Transformer Encoder（mask attention）
-            self.transformer_layers = nn.ModuleList([
-                TransformerEncoderLayer(
-                    d_model=self.d_model,
-                    n_heads=self.n_heads,
-                    d_ff=self.d_ff,
-                    dropout=self.dropout,
-                    attn_dropout=self.attn_dropout
-                ) for _ in range(self.n_layers)
-            ])
-            
-            # Codebook预测头
-            self.codebook_head = nn.Linear(self.d_model, self.num_embeddings)
-            
-            self.dropout_layer = nn.Dropout(self.dropout)
+                self._load_vq_weights(vqvae_checkpoint_path, device)
+        
+        # Patch投影层（参考PatchTST）
+        self.patch_projection = nn.Linear(self.patch_size, self.d_model)
+        
+        # 码本投影层
+        self.codebook_projection = nn.Linear(self.embedding_dim, self.d_model)
+        
+        # 位置编码
+        self.W_pos = None  # 延迟初始化
+        self.pe = 'zeros'
+        self.learn_pe = True
+        self.dropout_layer = nn.Dropout(self.dropout)
+        
+        # Cross-Attention Layers
+        self.cross_attention_layers = nn.ModuleList([
+            CrossAttentionLayer(self.d_model, self.n_heads, self.d_ff,
+                              self.dropout, self.attn_dropout)
+            for _ in range(self.n_layers)
+        ])
+        
+        # 如果提供了预训练模型，加载其transformer层的K和V参数
+        if pretrained_model is not None:
+            self._load_transformer_kv_weights(pretrained_model)
         
         # 冻结参数
-        if freeze_encoder:
-            for param in self.vqvae_encoder.parameters():
-                param.requires_grad = False
-        
         if freeze_vq:
             for param in self.vq.parameters():
                 param.requires_grad = False
-        
         if freeze_transformer:
-            for param in self.transformer_layers.parameters():
+            for param in self.cross_attention_layers.parameters():
                 param.requires_grad = False
-            for param in self.projection.parameters():
+            for param in self.patch_projection.parameters():
                 param.requires_grad = False
-            for param in self.codebook_head.parameters():
+            for param in self.codebook_projection.parameters():
                 param.requires_grad = False
         
-        # 预测头（延迟初始化，因为需要知道通道数和目标长度）
+        # 预测头（延迟初始化）
         self.head_type = head_type
         self.head_dropout = head_dropout
         self.prediction_head = None
     
-    def _load_vqvae_weights(self, checkpoint_path, device='cpu'):
-        """
-        从checkpoint加载预训练的VQVAE权重
-        
-        Args:
-            checkpoint_path: VQVAE模型checkpoint路径
-            device: 加载模型时的设备
-        """
+    def _load_vq_weights(self, checkpoint_path, device='cpu'):
+        """从checkpoint加载预训练的VQ（码本）权重"""
         import os
-        
         if not os.path.exists(checkpoint_path):
             print(f"警告: VQVAE checkpoint路径不存在: {checkpoint_path}")
-            print("将使用随机初始化的VQVAE权重")
             return
         
         try:
-            # 加载VQVAE模型
             vqvae_model = torch.load(checkpoint_path, map_location=device)
+            if isinstance(vqvae_model, dict) and 'model_state_dict' in vqvae_model:
+                from .vqvae import vqvae as VQVAE
+                temp_model = VQVAE({
+                    'block_hidden_size': 128, 'num_residual_layers': 2, 'res_hidden_size': 64,
+                    'embedding_dim': self.embedding_dim, 'num_embeddings': self.num_embeddings,
+                    'commitment_cost': 0.25, 'compression_factor': 4
+                })
+                temp_model.load_state_dict(vqvae_model['model_state_dict'])
+                vqvae_model = temp_model
             
-            # 如果checkpoint是字典格式（包含state_dict），需要提取模型
-            if isinstance(vqvae_model, dict):
-                if 'model_state_dict' in vqvae_model:
-                    # 如果是保存的state_dict格式，需要重新构建模型
-                    from .vqvae import vqvae as VQVAE
-                    # 从当前encoder获取配置信息
-                    temp_model = VQVAE({
-                        'block_hidden_size': getattr(self.vqvae_encoder, '_conv_1', None) and self.vqvae_encoder._conv_1.out_channels * 2 or 128,
-                        'num_residual_layers': 2,
-                        'res_hidden_size': 64,
-                        'embedding_dim': self.embedding_dim,
-                        'num_embeddings': self.num_embeddings,
-                        'commitment_cost': 0.25,
-                        'compression_factor': self.compression_factor
-                    })
-                    temp_model.load_state_dict(vqvae_model['model_state_dict'])
-                    vqvae_model = temp_model
-                elif 'encoder' in vqvae_model:
-                    # 如果字典中直接包含encoder和vq
-                    vqvae_model = type('VQVAE', (), vqvae_model)()
-                else:
-                    print("警告: checkpoint格式可能不正确，尝试直接加载...")
-                    return
-            
-            # 检查是否是vqvae模型对象（有encoder和vq属性）
-            if not hasattr(vqvae_model, 'encoder') or not hasattr(vqvae_model, 'vq'):
-                print("警告: checkpoint中未找到encoder或vq属性")
-                print(f"checkpoint类型: {type(vqvae_model)}")
-                print("将使用随机初始化的VQVAE权重")
-                return
-            
-            # 加载encoder权重
-            try:
-                encoder_state_dict = vqvae_model.encoder.state_dict()
-                self.vqvae_encoder.load_state_dict(encoder_state_dict, strict=True)
-                print(f"VQVAE Encoder权重已成功加载 (从 {checkpoint_path})")
-            except Exception as e:
-                print(f"VQVAE Encoder权重加载失败: {e}")
-                print("将使用随机初始化的Encoder权重")
-            
-            # 加载VQ（codebook）权重
-            try:
-                vq_state_dict = vqvae_model.vq.state_dict()
-                self.vq.load_state_dict(vq_state_dict, strict=True)
+            if hasattr(vqvae_model, 'vq'):
+                self.vq.load_state_dict(vqvae_model.vq.state_dict(), strict=True)
                 print(f"VQ Codebook权重已成功加载 (从 {checkpoint_path})")
-            except Exception as e:
-                print(f"VQ Codebook权重加载失败: {e}")
-                print("将使用随机初始化的Codebook权重")
-                
         except Exception as e:
-            print(f"加载VQVAE权重时出错: {e}")
-            import traceback
-            traceback.print_exc()
-            print("将使用随机初始化的VQVAE权重")
+            print(f"加载VQ权重时出错: {e}")
     
-    def _encode_with_transformer(self, x, mask=None):
+    def _load_transformer_kv_weights(self, pretrained_model):
         """
-        使用 VQVAE encoder + Transformer 获取 codebook logits
+        从预训练模型加载transformer层的K和V参数到cross_attention_layers
+        Q参数保持随机初始化
+        
+        Args:
+            pretrained_model: VQVAETransformerPretrain 模型实例
+        """
+        if not hasattr(pretrained_model, 'transformer_layers'):
+            print("警告: 预训练模型中没有 transformer_layers，跳过K和V参数加载")
+            return
+        
+        pretrained_layers = pretrained_model.transformer_layers
+        num_layers = min(len(pretrained_layers), len(self.cross_attention_layers))
+        
+        loaded_count = 0
+        for i in range(num_layers):
+            try:
+                # 获取预训练模型的self-attention层
+                pretrained_attn = pretrained_layers[i].self_attn
+                # 获取当前模型的cross-attention层
+                current_attn = self.cross_attention_layers[i].cross_attn
+                
+                # 检查维度是否匹配
+                if (pretrained_attn.W_K.weight.shape == current_attn.W_K.weight.shape and
+                    pretrained_attn.W_V.weight.shape == current_attn.W_V.weight.shape):
+                    
+                    # 加载K和V的权重和偏置
+                    current_attn.W_K.weight.data.copy_(pretrained_attn.W_K.weight.data)
+                    if pretrained_attn.W_K.bias is not None and current_attn.W_K.bias is not None:
+                        current_attn.W_K.bias.data.copy_(pretrained_attn.W_K.bias.data)
+                    
+                    current_attn.W_V.weight.data.copy_(pretrained_attn.W_V.weight.data)
+                    if pretrained_attn.W_V.bias is not None and current_attn.W_V.bias is not None:
+                        current_attn.W_V.bias.data.copy_(pretrained_attn.W_V.bias.data)
+                    
+                    loaded_count += 1
+                else:
+                    print(f"警告: 第 {i} 层维度不匹配，跳过K和V参数加载")
+                    print(f"  预训练 K: {pretrained_attn.W_K.weight.shape}, 当前 K: {current_attn.W_K.weight.shape}")
+                    print(f"  预训练 V: {pretrained_attn.W_V.weight.shape}, 当前 V: {current_attn.W_V.weight.shape}")
+            except Exception as e:
+                print(f"警告: 加载第 {i} 层的K和V参数时出错: {e}")
+        
+        if loaded_count > 0:
+            print(f"成功加载 {loaded_count}/{num_layers} 层的K和V参数（Q参数保持随机初始化）")
+        else:
+            print("警告: 未能加载任何K和V参数")
+    
+    def _create_patches(self, x):
+        """
+        参考PatchTST的patch方法：使用unfold创建patches
+        
+        Args:
+            x: [B, T] 输入序列
+        
+        Returns:
+            patches: [B, num_patches, patch_size] patch 序列
+        """
+        B, T = x.shape
+        patch_len = self.patch_size
+        stride = self.stride
+        
+        # 计算patch数量（参考PatchTST）
+        num_patches = (max(T, patch_len) - patch_len) // stride + 1
+        tgt_len = patch_len + stride * (num_patches - 1)
+        s_begin = max(0, T - tgt_len)  # 确保非负
+        
+        # 从末尾截取（确保最后一个patch包含最新数据）
+        x = x[:, s_begin:]  # [B, tgt_len]
+        
+        # 如果序列太短，进行padding
+        if x.shape[1] < patch_len:
+            x = F.pad(x, (0, patch_len - x.shape[1]), mode='constant', value=0)
+        
+        # 使用unfold创建patches（参考PatchTST）
+        patches = x.unfold(dimension=1, size=patch_len, step=stride)  # [B, num_patches, patch_len]
+        
+        return patches
+    
+    def _get_codebook_kv(self, B):
+        """获取码本作为 K 和 V"""
+        codebook_emb = self.vq._embedding.weight  # [num_embeddings, embedding_dim]
+        codebook_kv = self.codebook_projection(codebook_emb)  # [num_embeddings, d_model]
+        return codebook_kv.unsqueeze(0).expand(B, -1, -1)  # [B, num_embeddings, d_model]
+    
+    def _encode_with_cross_attention(self, x):
+        """
+        使用 patch + Cross-Attention 处理输入序列（参考PatchTST的处理方式）
         
         Args:
             x: [B, T, C] 输入时间序列
-            mask: 可选的 attention mask
         
         Returns:
-            logits: [B, codebook_size, T/compression_factor, C] codebook logits
+            output: [B, num_patches, C, d_model] cross-attention 输出
         """
         B, T, C = x.shape
         
-        # 对每个通道分别编码
-        encoded_features = []
+        # 创建patches（参考PatchTST）
+        patches_list = []
         for ch in range(C):
-            x_ch = x[:, :, ch]  # [B, T]
-            x_ch = x_ch.view(B, T)
-            
-            # VQVAE encoder
-            z = self.vqvae_encoder(x_ch, self.compression_factor)  # [B, embedding_dim, T/compression_factor]
-            z = z.permute(0, 2, 1)  # [B, T/compression_factor, embedding_dim]
-            encoded_features.append(z)
+            patches = self._create_patches(x[:, :, ch])  # [B, num_patches, patch_size]
+            patches_list.append(patches)
         
-        # Stack: [B, T/compression_factor, C, embedding_dim]
-        z = torch.stack(encoded_features, dim=2)  # [B, T/compression_factor, C, embedding_dim]
+        # Stack: [B, num_patches, C, patch_size]
+        patches = torch.stack(patches_list, dim=2)
         
-        # 投影到d_model
-        z = self.projection(z)  # [B, T/compression_factor, C, d_model]
+        # 投影到d_model（参考PatchTST的W_P）
+        z = self.patch_projection(patches)  # [B, num_patches, C, d_model]
         
-        # Channel independent处理：对每个通道分别通过transformer
-        T_compressed = z.shape[1]
+        # 获取码本作为K和V
+        codebook_kv = self._get_codebook_kv(B)  # [B, num_embeddings, d_model]
+        
+        # Channel independent处理
+        num_patches = z.shape[1]
+        if self.W_pos is None or self.W_pos.shape[0] != num_patches:
+            self.W_pos = positional_encoding(self.pe, self.learn_pe, num_patches, self.d_model)
+        
         outputs = []
-        
         for ch in range(C):
-            z_ch = z[:, :, ch, :]  # [B, T/compression_factor, d_model]
-            
-            # 位置编码
-            W_pos = positional_encoding(self.pe, self.learn_pe, T_compressed, self.d_model)
-            z_ch = z_ch + W_pos.to(z_ch.device)
+            z_ch = z[:, :, ch, :]  # [B, num_patches, d_model]
+            z_ch = z_ch + self.W_pos.to(z_ch.device)
             z_ch = self.dropout_layer(z_ch)
             
-            # Transformer layers with mask attention
-            for layer in self.transformer_layers:
-                z_ch = layer(z_ch, mask=mask)
+            # Cross-Attention
+            for layer in self.cross_attention_layers:
+                z_ch = layer(z_ch, codebook_kv)
             
             outputs.append(z_ch)
         
-        # Stack: [B, T/compression_factor, C, d_model]
-        z = torch.stack(outputs, dim=2)
-        
-        # Codebook预测
-        logits = self.codebook_head(z)  # [B, T/compression_factor, C, codebook_size]
-        logits = logits.permute(0, 3, 1, 2)  # [B, codebook_size, T/compression_factor, C]
-        
-        return logits
+        return torch.stack(outputs, dim=2)  # [B, num_patches, C, d_model]
     
-    def _build_prediction_head(self, n_vars, target_len, num_tokens=1):
-        """
-        构建预测头：从 codebook embeddings 预测目标序列（参考 TOTEM）
-        
-        Args:
-            n_vars: 通道数
-            target_len: 预测长度
-            num_tokens: codebook token 数量（默认 1，使用最后一个位置的 token）
-        """
+    def _build_prediction_head(self, n_vars, target_len):
+        """构建预测头（参考PatchTST的PredictionHead）"""
         if self.prediction_head is not None:
             return
         
-        # 输入维度：embedding_dim（codebook embedding）
-        input_dim = self.embedding_dim
-        
         if self.head_type == 'linear':
-            # 简单线性头：从未来的 codebook embeddings 直接映射到 target_len
             if self.individual:
                 self.prediction_head = nn.ModuleList([
-                    nn.Sequential(
-                        nn.Dropout(self.head_dropout),
-                        nn.Linear(input_dim, target_len)
-                    ) for _ in range(n_vars)
+                    nn.Sequential(nn.Dropout(self.head_dropout), nn.Linear(self.d_model, target_len))
+                    for _ in range(n_vars)
                 ])
             else:
                 self.prediction_head = nn.Sequential(
-                    nn.Dropout(self.head_dropout),
-                    nn.Linear(input_dim, target_len)
+                    nn.Dropout(self.head_dropout), nn.Linear(self.d_model, target_len)
                 )
         else:  # 'mlp'
-            # MLP 头：更强大的表达能力
             if self.individual:
                 self.prediction_head = nn.ModuleList([
                     nn.Sequential(
-                        nn.Linear(input_dim, self.embedding_dim),
-                        nn.GELU(),
-                        nn.Dropout(self.head_dropout),
-                        nn.Linear(self.embedding_dim, target_len)
+                        nn.Linear(self.d_model, self.d_model), nn.GELU(),
+                        nn.Dropout(self.head_dropout), nn.Linear(self.d_model, target_len)
                     ) for _ in range(n_vars)
                 ])
             else:
                 self.prediction_head = nn.Sequential(
-                    nn.Linear(input_dim, self.embedding_dim),
-                    nn.GELU(),
-                    nn.Dropout(self.head_dropout),
-                    nn.Linear(self.embedding_dim, target_len)
+                    nn.Linear(self.d_model, self.d_model), nn.GELU(),
+                    nn.Dropout(self.head_dropout), nn.Linear(self.d_model, target_len)
                 )
-        
-        # 初始化预测头权重（使用 Xavier 初始化）
-        self._init_prediction_head()
-    
-    def _init_prediction_head(self):
-        """初始化预测头权重"""
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                # 使用 Xavier 初始化
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-        
-        if self.prediction_head is not None:
-            if isinstance(self.prediction_head, nn.ModuleList):
-                for head in self.prediction_head:
-                    head.apply(init_weights)
-            else:
-                self.prediction_head.apply(init_weights)
     
     def forward(self, x, target_len):
         """
-        参考 TOTEM 方式：使用 Transformer 预测未来的 codebook tokens，通过 codebook 转换为预测结果
-        
-        流程：
-        1. 使用 VQVAE encoder + Transformer 获取输入序列的 codebook logits
-        2. 从最后一个位置预测未来的 codebook tokens（使用 soft assignment）
-        3. 将预测的 codebook tokens 通过 codebook embedding 转换为向量
-        4. 使用预测头从 codebook embeddings 预测目标序列
-        
         Args:
             x: [B, T, C] 输入时间序列
             target_len: 预测长度
-        
         Returns:
             pred: [B, target_len, C] 预测结果
         """
         B, T, C = x.shape
         
-        # 1. 使用 VQVAE encoder + Transformer 获取输入序列的 codebook logits
-        logits = self._encode_with_transformer(x, mask=None)  # [B, codebook_size, T/compression_factor, C]
+        # Patch + Cross-Attention
+        cross_attn_output = self._encode_with_cross_attention(x)  # [B, num_patches, C, d_model]
+        last_features = cross_attn_output[:, -1, :, :]  # [B, C, d_model]
         
-        # 2. 从最后一个位置获取 codebook 表示（用于预测未来）
-        # 获取最后一个位置的 codebook logits
-        last_logits = logits[:, :, -1, :]  # [B, codebook_size, C]
-        last_logits = last_logits.permute(0, 2, 1)  # [B, C, codebook_size]
-        
-        # 使用 softmax 获取概率分布（可微分，参考 TOTEM 的 soft assignment）
-        probs = F.softmax(last_logits, dim=-1)  # [B, C, codebook_size]
-        
-        # 3. 将 codebook tokens 转换为 embeddings（参考 TOTEM）
-        # 获取 codebook embeddings
-        codebook_embedding = self.vq._embedding  # [num_embeddings, embedding_dim]
-        
-        # 使用概率分布加权求和 codebook embeddings（可微分）
-        # probs: [B, C, codebook_size] @ [codebook_size, embedding_dim]
-        codebook_emb = torch.matmul(probs, codebook_embedding.weight)  # [B, C, embedding_dim]
-        
-        # 4. 使用预测头从 codebook embeddings 预测目标序列
-        # 延迟初始化预测头（第一次 forward 时）
+        # 延迟初始化预测头
         if self.prediction_head is None:
-            self._build_prediction_head(C, target_len, 1)
+            self._build_prediction_head(C, target_len)
             self.prediction_head = self.prediction_head.to(x.device)
         
-        # 通过预测头生成预测
+        # 生成预测
         if self.individual:
-            # 每个通道独立预测
-            preds = []
-            for ch in range(C):
-                embed_ch = codebook_emb[:, ch, :]  # [B, embedding_dim]
-                pred_ch = self.prediction_head[ch](embed_ch)  # [B, target_len]
-                preds.append(pred_ch)
-            pred = torch.stack(preds, dim=2)  # [B, target_len, C]
+            preds = [self.prediction_head[ch](last_features[:, ch, :]) for ch in range(C)]
         else:
-            # 共享预测头
-            preds = []
-            for ch in range(C):
-                embed_ch = codebook_emb[:, ch, :]  # [B, embedding_dim]
-                pred_ch = self.prediction_head(embed_ch)  # [B, target_len]
-                preds.append(pred_ch)
-            pred = torch.stack(preds, dim=2)  # [B, target_len, C]
+            preds = [self.prediction_head(last_features[:, ch, :]) for ch in range(C)]
         
-        return pred
+        return torch.stack(preds, dim=2)  # [B, target_len, C]
 

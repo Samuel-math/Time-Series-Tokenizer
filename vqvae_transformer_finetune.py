@@ -203,7 +203,7 @@ def get_model(c_in, args, vqvae_config, device='cpu'):
         pretrained_model.eval()
         finetune_model = VQVAETransformerFinetune(
             vqvae_config, transformer_config, pretrained_model=pretrained_model,
-            freeze_encoder=False, freeze_vq=False, freeze_transformer=False,
+            freeze_vq=False, freeze_transformer=False,
             head_type=args.head_type, head_dropout=args.head_dropout,
             individual=bool(args.individual), load_vqvae_weights=False,
             vqvae_checkpoint_path=None, device=device
@@ -325,12 +325,13 @@ def validate_epoch(model, revin, model_mustd, dataloader, loss_func, args, devic
 
 def freeze_transformer(model, freeze=True):
     """冻结或解冻 Transformer 参数"""
-    for param in model.transformer_layers.parameters():
+    for param in model.cross_attention_layers.parameters():
         param.requires_grad = not freeze
-    for param in model.projection.parameters():
+    for param in model.patch_projection.parameters():
         param.requires_grad = not freeze
-    for param in model.codebook_head.parameters():
-        param.requires_grad = not freeze
+    if hasattr(model, 'codebook_projection'):
+        for param in model.codebook_projection.parameters():
+            param.requires_grad = not freeze
 
 
 def finetune_func(lr=args.lr):
