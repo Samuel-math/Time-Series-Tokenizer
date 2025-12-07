@@ -245,8 +245,9 @@ def main():
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f}")
         
-        # 保存最佳模型 (前5个epoch不保存也不记录best_loss，让模型先稳定)
-        if epoch >= 5 and val_metrics['loss'] < best_val_loss:
+        # 保存最佳模型 (前1/10 epoch不保存也不记录best_loss，让模型先稳定)
+        warmup_epochs = args.n_epochs // 10
+        if epoch >= warmup_epochs and val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             checkpoint = {
                 'model_state_dict': model.state_dict(),
