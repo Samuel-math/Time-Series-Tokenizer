@@ -35,8 +35,6 @@ def parse_args():
     
     # 预训练模型参数
     parser.add_argument('--pretrained_model', type=str, required=True, help='预训练模型路径')
-    parser.add_argument('--freeze_encoder', type=int, default=0, help='是否冻结编码器')
-    parser.add_argument('--freeze_transformer', type=int, default=0, help='是否冻结Transformer')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -66,27 +64,19 @@ def load_pretrained_model(checkpoint_path, device):
     return model, config
 
 
-def freeze_parameters(model, freeze_encoder=False, freeze_transformer=False):
-    """冻结模型参数"""
-    if freeze_encoder:
-        for param in model.patch_encoder.parameters():
-            param.requires_grad = False
-        for param in model.vq.parameters():
-            param.requires_grad = False
-        print('冻结了编码器和VQ层')
-    
-    if freeze_transformer:
-        for param in model.transformer_blocks.parameters():
-            param.requires_grad = False
-        for param in model.token_embedding.parameters():
-            param.requires_grad = False
-        for param in model.pos_embedding.parameters():
-            param.requires_grad = False
-        print('冻结了Transformer层')
+def freeze_encoder_vq(model):
+    """冻结encoder和VQ层（将patch映射成码本前的所有参数）"""
+    # 冻结 encoder
+    for param in model.encoder.parameters():
+        param.requires_grad = False
+    # 冻结 VQ 层
+    for param in model.vq.parameters():
+        param.requires_grad = False
+    print('冻结了 Encoder 和 VQ 层（将patch映射成码本前的所有参数）')
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
-    """训练一个epoch"""
+    """训练一个epoch (只使用MSE loss)"""
     model.train()
     total_loss = 0
     n_batches = 0
@@ -101,17 +91,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
             batch_x = revin(batch_x, 'norm')
         
         # 前向传播: 预测码本索引 -> 解码
-        pred, vq_loss = model.forward_finetune(batch_x, args.target_points)
+        pred, _ = model.forward_finetune(batch_x, args.target_points)
         
         # RevIN反归一化
         if revin:
             pred = revin(pred, 'denorm')
         
-        # MSE损失
-        mse_loss = F.mse_loss(pred, batch_y)
-        
-        # 总损失
-        loss = mse_loss + 0.1 * vq_loss
+        # 只使用 MSE 损失
+        loss = F.mse_loss(pred, batch_y)
         
         # 反向传播
         optimizer.zero_grad()
@@ -119,7 +106,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
-        total_loss += mse_loss.item()
+        total_loss += loss.item()
         n_batches += 1
     
     scheduler.step()
@@ -200,8 +187,8 @@ def main():
     model, config = load_pretrained_model(args.pretrained_model, device)
     model = model.to(device)
     
-    # 冻结参数（如果需要）
-    freeze_parameters(model, args.freeze_encoder, args.freeze_transformer)
+    # 冻结 encoder 和 VQ 层（将patch映射成码本前的所有参数）
+    freeze_encoder_vq(model)
     
     # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
