@@ -38,7 +38,7 @@ python two_stage_pretrain_stage1.py \
     --dropout 0.1 \
     --mask_ratio $MASK_RATIO \
     --codebook_size $CODEBOOK_SIZE \
-    --n_epochs 100 \
+    --n_epochs 50 \
     --lr 1e-3 \
     --weight_decay 1e-4 \
     --revin 1 \
@@ -78,7 +78,7 @@ python two_stage_pretrain_stage2.py \
     --context_points $CONTEXT_POINTS_STAGE2 \
     --batch_size 64 \
     --model_with_codebook $MODEL_WITH_CB \
-    --n_epochs 100 \
+    --n_epochs 30 \
     --lr 1e-3 \
     --weight_decay 1e-4 \
     --revin 1 \
@@ -112,7 +112,7 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
         --batch_size 64 \
         --pretrained_model $STAGE2_MODEL \
         --finetune_mode linear_probe \
-        --n_epochs 50 \
+        --n_epochs 10 \
         --lr 1e-3 \
         --weight_decay 1e-4 \
         --revin 1 \
@@ -128,7 +128,7 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
         --batch_size 64 \
         --pretrained_model $STAGE2_MODEL \
         --finetune_mode full \
-        --n_epochs 50 \
+        --n_epochs 20 \
         --lr 1e-4 \
         --weight_decay 1e-4 \
         --revin 1 \

@@ -222,8 +222,8 @@ def main():
               f"Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f} | "
               f"Accuracy: {accuracy*100:.2f}%", end="")
         
-        # 保存最佳模型 (前10个epoch不保存)
-        if epoch >= 10 and val_loss < best_val_loss:
+        # 保存最佳模型
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             checkpoint = {
                 'model_state_dict': model.state_dict(),

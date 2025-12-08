@@ -182,8 +182,8 @@ def main():
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train Loss: {train_loss:.6f} | Valid Loss: {val_loss:.6f}", end="")
         
-        # 保存最佳模型 (前10个epoch不保存)
-        if epoch >= 10 and val_loss < best_val_loss:
+        # 保存最佳模型
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             checkpoint = {
                 'model_state_dict': model.state_dict(),
