@@ -4,12 +4,12 @@
 # 
 # 阶段1: Masked Reconstruction (类似 PatchTST)
 # 中间步骤: 构建码本 (聚类)
-# 阶段2: Next Token Prediction (NTP)
-# 微调: 时间序列预测 (MSE)
+# 阶段2: Next Token Prediction (NTP) - 使用更长的上下文
+# 微调: 时间序列预测 (MSE) - 多个预测长度
 
 DSET="ettm1"
-CONTEXT_POINTS=512
-TARGET_POINTS=96
+CONTEXT_POINTS=512           # 阶段1和构建码本使用
+CONTEXT_POINTS_STAGE2=1024   # 阶段2使用更长的上下文
 PATCH_SIZE=16
 D_MODEL=128
 N_HEADS=8
@@ -19,15 +19,16 @@ MASK_RATIO=0.4
 MODEL_ID=1
 
 SAVE_PATH="saved_models/two_stage/"
+FINETUNE_SAVE_PATH="saved_models/two_stage_finetune/"
 
 echo "=========================================="
 echo "阶段1: Masked Reconstruction"
+echo "Context Points: $CONTEXT_POINTS"
 echo "=========================================="
 
 python two_stage_pretrain_stage1.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
-    --target_points $TARGET_POINTS \
     --batch_size 128 \
     --patch_size $PATCH_SIZE \
     --d_model $D_MODEL \
@@ -50,12 +51,12 @@ STAGE1_MODEL="${SAVE_PATH}${DSET}/stage1_ps${PATCH_SIZE}_dm${D_MODEL}_l${N_LAYER
 echo ""
 echo "=========================================="
 echo "中间步骤: 构建码本"
+echo "Context Points: $CONTEXT_POINTS"
 echo "=========================================="
 
 python two_stage_build_codebook.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
-    --target_points $TARGET_POINTS \
     --batch_size 128 \
     --stage1_model $STAGE1_MODEL \
     --codebook_size $CODEBOOK_SIZE \
@@ -69,13 +70,13 @@ MODEL_WITH_CB="${SAVE_PATH}${DSET}/stage1_ps${PATCH_SIZE}_dm${D_MODEL}_l${N_LAYE
 echo ""
 echo "=========================================="
 echo "阶段2: Next Token Prediction"
+echo "Context Points: $CONTEXT_POINTS_STAGE2 (更长)"
 echo "=========================================="
 
 python two_stage_pretrain_stage2.py \
     --dset $DSET \
-    --context_points $CONTEXT_POINTS \
-    --target_points $TARGET_POINTS \
-    --batch_size 128 \
+    --context_points $CONTEXT_POINTS_STAGE2 \
+    --batch_size 64 \
     --model_with_codebook $MODEL_WITH_CB \
     --n_epochs 100 \
     --lr 1e-3 \
@@ -87,45 +88,57 @@ python two_stage_pretrain_stage2.py \
 # 阶段2模型路径
 STAGE2_MODEL="${SAVE_PATH}${DSET}/stage1_ps${PATCH_SIZE}_dm${D_MODEL}_l${N_LAYERS}_mask${MASK_RATIO}_model${MODEL_ID}_cb${CODEBOOK_SIZE}_ntp_model${MODEL_ID}.pth"
 
-echo ""
-echo "=========================================="
-echo "微调1: Linear Probe (只训练 pred_head)"
-echo "=========================================="
-
-python two_stage_finetune.py \
-    --dset $DSET \
-    --context_points $CONTEXT_POINTS \
-    --target_points $TARGET_POINTS \
-    --batch_size 64 \
-    --pretrained_model $STAGE2_MODEL \
-    --finetune_mode linear_probe \
-    --n_epochs 50 \
-    --lr 1e-3 \
-    --weight_decay 1e-4 \
-    --revin 1 \
-    --save_path "saved_models/two_stage_finetune/" \
-    --model_id $MODEL_ID
+# 多个预测长度
+TARGET_POINTS_LIST=(96 192 336 512)
 
 echo ""
 echo "=========================================="
-echo "微调2: Full Finetune (全量微调)"
+echo "微调: 多个预测长度"
+echo "Target Points: ${TARGET_POINTS_LIST[@]}"
 echo "=========================================="
 
-python two_stage_finetune.py \
-    --dset $DSET \
-    --context_points $CONTEXT_POINTS \
-    --target_points $TARGET_POINTS \
-    --batch_size 64 \
-    --pretrained_model $STAGE2_MODEL \
-    --finetune_mode full \
-    --n_epochs 50 \
-    --lr 1e-4 \
-    --weight_decay 1e-4 \
-    --revin 1 \
-    --save_path "saved_models/two_stage_finetune/" \
-    --model_id $MODEL_ID
+for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
+    echo ""
+    echo "------------------------------------------"
+    echo "Target Points: $TARGET_POINTS"
+    echo "------------------------------------------"
+    
+    echo ""
+    echo ">>> Linear Probe (TARGET=$TARGET_POINTS)"
+    python two_stage_finetune.py \
+        --dset $DSET \
+        --context_points $CONTEXT_POINTS \
+        --target_points $TARGET_POINTS \
+        --batch_size 64 \
+        --pretrained_model $STAGE2_MODEL \
+        --finetune_mode linear_probe \
+        --n_epochs 50 \
+        --lr 1e-3 \
+        --weight_decay 1e-4 \
+        --revin 1 \
+        --save_path $FINETUNE_SAVE_PATH \
+        --model_id $MODEL_ID
+    
+    echo ""
+    echo ">>> Full Finetune (TARGET=$TARGET_POINTS)"
+    python two_stage_finetune.py \
+        --dset $DSET \
+        --context_points $CONTEXT_POINTS \
+        --target_points $TARGET_POINTS \
+        --batch_size 64 \
+        --pretrained_model $STAGE2_MODEL \
+        --finetune_mode full \
+        --n_epochs 50 \
+        --lr 1e-4 \
+        --weight_decay 1e-4 \
+        --revin 1 \
+        --save_path $FINETUNE_SAVE_PATH \
+        --model_id $MODEL_ID
+done
 
 echo ""
 echo "=========================================="
-echo "完成！"
+echo "完成！所有预测长度的结果已保存"
 echo "=========================================="
+echo "结果保存在: $FINETUNE_SAVE_PATH"
+echo "预测长度: ${TARGET_POINTS_LIST[@]}"
