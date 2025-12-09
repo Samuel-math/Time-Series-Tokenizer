@@ -106,16 +106,24 @@ class PatchDecoder(nn.Module):
 class VectorQuantizer(nn.Module):
     """
     Vector Quantizer with Straight-Through Estimator
+    支持 EMA 更新码本 (更稳定的训练)
     """
-    def __init__(self, codebook_size, d_model, commitment_cost=0.25):
+    def __init__(self, codebook_size, d_model, commitment_cost=0.25, use_ema=True, ema_decay=0.99):
         super().__init__()
         self.codebook_size = codebook_size
         self.d_model = d_model
         self.commitment_cost = commitment_cost
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
         
         # 码本: [codebook_size, d_model]
         self.embedding = nn.Embedding(codebook_size, d_model)
         self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        
+        if use_ema:
+            # EMA 相关的 buffer
+            self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))
+            self.register_buffer('ema_embedding_avg', self.embedding.weight.data.clone())
     
     def forward(self, z):
         """
@@ -136,12 +144,36 @@ class VectorQuantizer(nn.Module):
         
         # 找最近的码本向量
         indices = torch.argmin(distances, dim=1)
+        
+        # One-hot encoding
+        encodings = F.one_hot(indices, self.codebook_size).float()
+        
+        # 量化
         quantized = self.embedding(indices)
         
-        # VQ Loss
-        e_latent_loss = F.mse_loss(quantized.detach(), flat)
-        q_latent_loss = F.mse_loss(quantized, flat.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+        if self.use_ema and self.training:
+            # EMA 更新
+            with torch.no_grad():
+                # 更新聚类大小
+                cluster_size = encodings.sum(0)
+                self.ema_cluster_size.data.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
+                
+                # 更新嵌入平均值
+                dw = encodings.t() @ flat
+                self.ema_embedding_avg.data.mul_(self.ema_decay).add_(dw, alpha=1 - self.ema_decay)
+                
+                # 归一化得到新的码本向量
+                n = self.ema_cluster_size.sum()
+                cluster_size = (self.ema_cluster_size + 1e-5) / (n + self.codebook_size * 1e-5) * n
+                self.embedding.weight.data.copy_(self.ema_embedding_avg / cluster_size.unsqueeze(1))
+            
+            # EMA 模式下只需要 commitment loss
+            loss = self.commitment_cost * F.mse_loss(quantized.detach(), flat)
+        else:
+            # 原始 VQ Loss
+            e_latent_loss = F.mse_loss(quantized.detach(), flat)
+            q_latent_loss = F.mse_loss(quantized, flat.detach())
+            loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
         # Straight-through estimator
         quantized = flat + (quantized - flat).detach()
@@ -154,6 +186,42 @@ class VectorQuantizer(nn.Module):
     
     def get_embedding(self, indices):
         return self.embedding(indices)
+    
+    def reset_unused_codes(self, z, threshold=1.0):
+        """
+        重置未使用的码本向量
+        将使用频率低于 threshold 的码本向量重置为随机的 encoder 输出
+        """
+        with torch.no_grad():
+            flat = z.reshape(-1, self.d_model)
+            
+            # 找到使用频率低的码本
+            if self.use_ema:
+                usage = self.ema_cluster_size
+            else:
+                # 计算当前 batch 的使用情况
+                distances = (
+                    torch.sum(flat ** 2, dim=1, keepdim=True) +
+                    torch.sum(self.embedding.weight ** 2, dim=1) -
+                    2 * torch.matmul(flat, self.embedding.weight.t())
+                )
+                indices = torch.argmin(distances, dim=1)
+                usage = torch.bincount(indices, minlength=self.codebook_size).float()
+            
+            # 重置使用率低的码本
+            unused_mask = usage < threshold
+            n_unused = unused_mask.sum().item()
+            
+            if n_unused > 0:
+                # 随机选择 encoder 输出来重置
+                random_indices = torch.randperm(flat.size(0))[:int(n_unused)]
+                self.embedding.weight.data[unused_mask] = flat[random_indices]
+                
+                if self.use_ema:
+                    self.ema_cluster_size.data[unused_mask] = 1.0
+                    self.ema_embedding_avg.data[unused_mask] = flat[random_indices]
+            
+            return n_unused
 
 
 class CausalTransformer(nn.Module):
@@ -211,6 +279,7 @@ class PatchVQTransformer(nn.Module):
         self.d_model = config.get('d_model', 128)
         self.codebook_size = config.get('codebook_size', 256)
         self.commitment_cost = config.get('commitment_cost', 0.25)
+        self.use_ema = config.get('use_ema', True)  # 默认使用 EMA
         
         # ========== Transformer 配置 ==========
         self.n_layers = config.get('n_layers', 4)
@@ -228,11 +297,12 @@ class PatchVQTransformer(nn.Module):
             dropout=self.dropout
         )
         
-        # 2. Vector Quantizer
+        # 2. Vector Quantizer (支持 EMA)
         self.vq = VectorQuantizer(
             codebook_size=self.codebook_size,
             d_model=self.d_model,
-            commitment_cost=self.commitment_cost
+            commitment_cost=self.commitment_cost,
+            use_ema=self.use_ema
         )
         
         # 3. Causal Transformer
@@ -465,6 +535,7 @@ def get_model_config(args):
         'd_model': args.d_model,
         'codebook_size': args.codebook_size,
         'commitment_cost': getattr(args, 'commitment_cost', 0.25),
+        'use_ema': getattr(args, 'use_ema', True),  # 默认使用 EMA
         
         # Transformer
         'n_layers': args.n_layers,

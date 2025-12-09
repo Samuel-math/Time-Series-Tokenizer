@@ -1,7 +1,9 @@
 """
-Patch-based VQVAE + Transformer 预训练脚本 (v2)
+Patch-based VQVAE + Transformer 预训练脚本
+
+特性:
 - Overlapping Patches with stride
-- Intra-Patch Attention (learnable query cross-attention)
+- EMA 更新码本 (更稳定)
 - Next Token Prediction (NTP) 损失
 """
 
@@ -27,7 +29,7 @@ from datautils import get_dls
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 预训练 (v2)')
+    parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 预训练')
     
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
@@ -46,13 +48,13 @@ def parse_args():
     parser.add_argument('--d_model', type=int, default=128, help='模型维度')
     parser.add_argument('--codebook_size', type=int, default=256, help='码本大小')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
+    parser.add_argument('--use_ema', type=int, default=1, help='是否使用 EMA 更新码本')
     
     # Transformer 参数
     parser.add_argument('--n_layers', type=int, default=4, help='Transformer层数')
     parser.add_argument('--n_heads', type=int, default=8, help='注意力头数')
     parser.add_argument('--d_ff', type=int, default=512, help='FFN维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
-    
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')
@@ -63,8 +65,9 @@ def parse_args():
     parser.add_argument('--recon_weight', type=float, default=0.1, help='重构损失权重')
     
     # 保存参数
-    parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_v2/', help='模型保存路径')
+    parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
+    parser.add_argument('--min_codebook_usage', type=float, default=0.75, help='保存模型的最低码本使用率')
     
     return parser.parse_args()
 
@@ -188,7 +191,7 @@ def main():
     
     print(f'\n配置信息:')
     print(f'  Patch: size={args.patch_size}, stride={args.stride}, overlap={overlap}, num_patches={num_patches}')
-    print(f'  Model: d_model={args.d_model}, codebook_size={args.codebook_size}')
+    print(f'  Model: d_model={args.d_model}, codebook_size={args.codebook_size}, use_ema={args.use_ema}')
     
     # 模型文件名 (包含窗口大小)
     model_name = f'patch_vqvae_v2_cw{args.context_points}_ps{args.patch_size}_st{args.stride}_d{args.d_model}_cb{args.codebook_size}_model{args.model_id}'
@@ -219,16 +222,15 @@ def main():
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
-    # 训练
+    # 训练状态
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
     codebook_usages = []
-    model_saved = False  # 跟踪是否保存过模型
-    MIN_CODEBOOK_USAGE = 0.75  # 最低码本使用率要求
+    model_saved = False
     
     print(f'\n开始预训练，共 {args.n_epochs} 个 epoch')
-    print(f'注意: 只有当码本使用率 >= {MIN_CODEBOOK_USAGE*100:.0f}% 时才会保存模型')
-    print('=' * 80)
+    print(f'注意: 只有当码本使用率 >= {args.min_codebook_usage*100:.0f}% 时才会保存模型')
+    print('=' * 100)
     
     for epoch in range(args.n_epochs):
         # 训练
@@ -248,16 +250,18 @@ def main():
         valid_losses.append(val_metrics['loss'])
         codebook_usages.append(codebook_usage)
         
-        # 打印进度
-        usage_status = "✓" if codebook_usage >= MIN_CODEBOOK_USAGE else "✗"
-        print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} (NTP: {train_metrics['ntp_loss']:.4f}, "
-              f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
-              f"Valid Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']*100:.1f}% | "
-              f"CB Usage: {codebook_usage*100:.1f}% {usage_status}")
+        # 状态
+        usage_status = "✓" if codebook_usage >= args.min_codebook_usage else "✗"
         
-        # 只有当码本使用率超过阈值时才保存最佳模型
-        if codebook_usage >= MIN_CODEBOOK_USAGE:
+        # 打印进度
+        print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
+              f"Loss: {train_metrics['loss']:.4f} (NTP: {train_metrics['ntp_loss']:.4f}, "
+              f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
+              f"Val: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']*100:.1f}% | "
+              f"CB: {codebook_usage*100:.1f}% {usage_status}")
+        
+        # 保存逻辑
+        if codebook_usage >= args.min_codebook_usage:
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
                 checkpoint = {
@@ -274,22 +278,21 @@ def main():
                 print(f"  -> Best model saved (val_loss: {best_val_loss:.4f}, CB usage: {codebook_usage*100:.1f}%)")
         else:
             if val_metrics['loss'] < best_val_loss:
-                print(f"  -> Skip saving: codebook usage ({codebook_usage*100:.1f}%) < {MIN_CODEBOOK_USAGE*100:.0f}%")
+                print(f"  -> Skip saving: codebook usage ({codebook_usage*100:.1f}%) < {args.min_codebook_usage*100:.0f}%")
     
-    print('=' * 80)
+    print('=' * 100)
     print(f'预训练完成！')
     
-    # 只有当模型被保存过时才保存历史和配置
+    # 保存训练历史
+    history_df = pd.DataFrame({
+        'epoch': range(1, args.n_epochs + 1),
+        'train_loss': train_losses,
+        'valid_loss': valid_losses,
+        'codebook_usage': codebook_usages,
+    })
+    history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
+    
     if model_saved:
-        # 保存训练历史
-        history_df = pd.DataFrame({
-            'epoch': range(1, args.n_epochs + 1),
-            'train_loss': train_losses,
-            'valid_loss': valid_losses,
-            'codebook_usage': codebook_usages,
-        })
-        history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
-        
         # 保存配置
         config['n_channels'] = dls.vars
         with open(save_dir / f'{model_name}_config.json', 'w') as f:
@@ -298,7 +301,7 @@ def main():
         print(f'最佳验证损失: {best_val_loss:.4f}')
         print(f'模型保存至: {save_dir / model_name}.pth')
     else:
-        print(f'警告: 码本使用率始终低于 {MIN_CODEBOOK_USAGE*100:.0f}%，未保存模型！')
+        print(f'警告: 码本使用率始终低于 {args.min_codebook_usage*100:.0f}%，未保存模型！')
         print(f'最大码本使用率: {max(codebook_usages)*100:.1f}%')
         print(f'建议: 增大 codebook_size 或调整训练参数')
 

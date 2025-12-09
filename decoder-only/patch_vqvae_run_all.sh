@@ -23,6 +23,7 @@ STRIDE=16         # stride < patch_size 有重叠
 D_MODEL=128           # 每个 patch 编码后的维度
 CODEBOOK_SIZE=16
 COMMITMENT_COST=0.25
+USE_EMA=1             # 使用 EMA 更新码本 (更稳定)
 
 # ========== Transformer 配置 ==========
 N_LAYERS=3
@@ -39,6 +40,9 @@ LR=1e-4
 # ========== 损失权重 ==========
 VQ_WEIGHT=0.3
 RECON_WEIGHT=0.1
+
+# ========== 保存条件 ==========
+MIN_CODEBOOK_USAGE=0.75   # 保存模型的最低码本使用率
 
 # ========== 路径配置 ==========
 PRETRAIN_SAVE_PATH="saved_models/patch_vqvae/"
@@ -65,6 +69,7 @@ echo ""
 echo "模型配置:"
 echo "  - d_model: $D_MODEL"
 echo "  - codebook_size: $CODEBOOK_SIZE"
+echo "  - use_ema: $USE_EMA"
 echo ""
 echo "Transformer:"
 echo "  - n_layers: $N_LAYERS"
@@ -85,6 +90,7 @@ python patch_vqvae_pretrain.py \
     --d_model $D_MODEL \
     --codebook_size $CODEBOOK_SIZE \
     --commitment_cost $COMMITMENT_COST \
+    --use_ema $USE_EMA \
     --n_layers $N_LAYERS \
     --n_heads $N_HEADS \
     --d_ff $D_FF \
@@ -95,6 +101,7 @@ python patch_vqvae_pretrain.py \
     --revin 1 \
     --vq_weight $VQ_WEIGHT \
     --recon_weight $RECON_WEIGHT \
+    --min_codebook_usage $MIN_CODEBOOK_USAGE \
     --save_path $PRETRAIN_SAVE_PATH \
     --model_id $MODEL_ID
 
