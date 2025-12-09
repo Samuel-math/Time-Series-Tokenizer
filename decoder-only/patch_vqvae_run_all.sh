@@ -11,8 +11,11 @@
 # - Decoder-only Transformer (NTP 预训练)
 
 DSET="ettm1"
-CONTEXT_POINTS=512
 MODEL_ID=1
+
+# ========== 窗口大小配置 ==========
+PRETRAIN_CONTEXT_POINTS=1024    # 预训练使用较大窗口
+FINETUNE_CONTEXT_POINTS=512     # 微调使用较小窗口
 
 # ========== Patch 配置 ==========
 PATCH_SIZE=16
@@ -20,14 +23,14 @@ STRIDE=8              # stride < patch_size 有重叠
 
 # ========== 模型配置 ==========
 D_MODEL=128           # 每个 patch 编码后的维度
-CODEBOOK_SIZE=256
+CODEBOOK_SIZE=18
 COMMITMENT_COST=0.25
 
 # ========== Transformer 配置 ==========
-N_LAYERS=4
+N_LAYERS=3
 N_HEADS=8
-D_FF=512
-DROPOUT=0.1
+D_FF=256
+DROPOUT=0.3
 
 # ========== Intra-Patch Attention 配置 ==========
 INTRA_N_HEADS=2
@@ -42,7 +45,7 @@ BATCH_SIZE=64
 LR=1e-4
 
 # ========== 损失权重 ==========
-VQ_WEIGHT=1.0
+VQ_WEIGHT=0.3
 RECON_WEIGHT=0.1
 
 # ========== 路径配置 ==========
@@ -51,26 +54,25 @@ FINETUNE_SAVE_PATH="saved_models/patch_vqvae_v2_finetune/"
 
 # 计算一些值
 OVERLAP=$((PATCH_SIZE - STRIDE))
-NUM_PATCHES=$(( (CONTEXT_POINTS - PATCH_SIZE) / STRIDE + 1 ))
+PRETRAIN_NUM_PATCHES=$(( (PRETRAIN_CONTEXT_POINTS - PATCH_SIZE) / STRIDE + 1 ))
+FINETUNE_NUM_PATCHES=$(( (FINETUNE_CONTEXT_POINTS - PATCH_SIZE) / STRIDE + 1 ))
 
 echo "=========================================="
 echo "Patch VQVAE + Transformer (v2)"
 echo "=========================================="
 echo ""
+echo "窗口配置:"
+echo "  - 预训练窗口: $PRETRAIN_CONTEXT_POINTS (num_patches: $PRETRAIN_NUM_PATCHES)"
+echo "  - 微调窗口: $FINETUNE_CONTEXT_POINTS (num_patches: $FINETUNE_NUM_PATCHES)"
+echo ""
 echo "Patch配置:"
 echo "  - patch_size: $PATCH_SIZE"
 echo "  - stride: $STRIDE"
 echo "  - overlap: $OVERLAP"
-echo "  - num_patches: $NUM_PATCHES"
 echo ""
 echo "模型配置:"
 echo "  - d_model: $D_MODEL"
 echo "  - codebook_size: $CODEBOOK_SIZE"
-echo ""
-echo "Intra-Patch Attention:"
-echo "  - 输入: [B, $NUM_PATCHES, $PATCH_SIZE, C]"
-echo "  - 输出: [B, $NUM_PATCHES, $D_MODEL]"
-echo "  - n_heads: $INTRA_N_HEADS"
 echo ""
 echo "Transformer:"
 echo "  - n_layers: $N_LAYERS"
@@ -84,7 +86,7 @@ echo "=========================================="
 
 python patch_vqvae_pretrain.py \
     --dset $DSET \
-    --context_points $CONTEXT_POINTS \
+    --context_points $PRETRAIN_CONTEXT_POINTS \
     --batch_size $BATCH_SIZE \
     --patch_size $PATCH_SIZE \
     --stride $STRIDE \
@@ -106,11 +108,11 @@ python patch_vqvae_pretrain.py \
     --save_path $PRETRAIN_SAVE_PATH \
     --model_id $MODEL_ID
 
-# 预训练模型路径
-PRETRAIN_MODEL="${PRETRAIN_SAVE_PATH}${DSET}/patch_vqvae_v2_ps${PATCH_SIZE}_st${STRIDE}_d${D_MODEL}_cb${CODEBOOK_SIZE}_model${MODEL_ID}.pth"
+# 预训练模型路径 (包含窗口大小)
+PRETRAIN_MODEL="${PRETRAIN_SAVE_PATH}${DSET}/patch_vqvae_v2_cw${PRETRAIN_CONTEXT_POINTS}_ps${PATCH_SIZE}_st${STRIDE}_d${D_MODEL}_cb${CODEBOOK_SIZE}_model${MODEL_ID}.pth"
 
 # 多个预测长度
-TARGET_POINTS_LIST=(96 192 336 512)
+TARGET_POINTS_LIST=(96 192 336 720)
 
 echo ""
 echo "=========================================="
@@ -126,7 +128,7 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
     
     python patch_vqvae_finetune.py \
         --dset $DSET \
-        --context_points $CONTEXT_POINTS \
+        --context_points $FINETUNE_CONTEXT_POINTS \
         --target_points $TARGET_POINTS \
         --batch_size $BATCH_SIZE \
         --pretrained_model $PRETRAIN_MODEL \

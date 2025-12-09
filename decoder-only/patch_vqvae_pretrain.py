@@ -196,8 +196,8 @@ def main():
     print(f'  Model: d_model={args.d_model}, codebook_size={args.codebook_size}')
     print(f'  Intra-Patch Attention: heads={args.intra_n_heads}')
     
-    # 模型文件名
-    model_name = f'patch_vqvae_v2_ps{args.patch_size}_st{args.stride}_d{args.d_model}_cb{args.codebook_size}_model{args.model_id}'
+    # 模型文件名 (包含窗口大小)
+    model_name = f'patch_vqvae_v2_cw{args.context_points}_ps{args.patch_size}_st{args.stride}_d{args.d_model}_cb{args.codebook_size}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -228,8 +228,12 @@ def main():
     # 训练
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
+    codebook_usages = []
+    model_saved = False  # 跟踪是否保存过模型
+    MIN_CODEBOOK_USAGE = 0.75  # 最低码本使用率要求
     
     print(f'\n开始预训练，共 {args.n_epochs} 个 epoch')
+    print(f'注意: 只有当码本使用率 >= {MIN_CODEBOOK_USAGE*100:.0f}% 时才会保存模型')
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
@@ -239,55 +243,70 @@ def main():
         # 验证
         val_metrics = validate_epoch(model, dls.valid, revin, args, device)
         
+        # 检查码本使用率
+        with torch.no_grad():
+            sample_batch = next(iter(dls.train))[0].to(device)
+            if revin:
+                sample_batch = revin(sample_batch, 'norm')
+            codebook_usage, _ = model.get_codebook_usage(sample_batch)
+        
         train_losses.append(train_metrics['loss'])
         valid_losses.append(val_metrics['loss'])
+        codebook_usages.append(codebook_usage)
         
         # 打印进度
+        usage_status = "✓" if codebook_usage >= MIN_CODEBOOK_USAGE else "✗"
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train Loss: {train_metrics['loss']:.4f} (NTP: {train_metrics['ntp_loss']:.4f}, "
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
-              f"Valid Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']*100:.1f}%")
+              f"Valid Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']*100:.1f}% | "
+              f"CB Usage: {codebook_usage*100:.1f}% {usage_status}")
         
-        # 保存最佳模型
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            checkpoint = {
-                'model_state_dict': model.state_dict(),
-                'config': config,
-                'args': vars(args),
-                'epoch': epoch,
-                'val_loss': best_val_loss,
-                'n_channels': dls.vars,
-            }
-            torch.save(checkpoint, save_dir / f'{model_name}.pth')
-            print(f"  -> Best model saved (val_loss: {best_val_loss:.4f})")
-        
-        # 每10个epoch检查码本使用率
-        if (epoch + 1) % 10 == 0:
-            with torch.no_grad():
-                sample_batch = next(iter(dls.train))[0].to(device)
-                if revin:
-                    sample_batch = revin(sample_batch, 'norm')
-                usage, _ = model.get_codebook_usage(sample_batch)
-                print(f"  -> Codebook usage: {usage*100:.1f}%")
-    
-    # 保存训练历史
-    history_df = pd.DataFrame({
-        'epoch': range(1, args.n_epochs + 1),
-        'train_loss': train_losses,
-        'valid_loss': valid_losses,
-    })
-    history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
-    
-    # 保存配置
-    config['n_channels'] = dls.vars
-    with open(save_dir / f'{model_name}_config.json', 'w') as f:
-        json.dump(config, f, indent=4)
+        # 只有当码本使用率超过阈值时才保存最佳模型
+        if codebook_usage >= MIN_CODEBOOK_USAGE:
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'config': config,
+                    'args': vars(args),
+                    'epoch': epoch,
+                    'val_loss': best_val_loss,
+                    'n_channels': dls.vars,
+                    'codebook_usage': codebook_usage,
+                }
+                torch.save(checkpoint, save_dir / f'{model_name}.pth')
+                model_saved = True
+                print(f"  -> Best model saved (val_loss: {best_val_loss:.4f}, CB usage: {codebook_usage*100:.1f}%)")
+        else:
+            if val_metrics['loss'] < best_val_loss:
+                print(f"  -> Skip saving: codebook usage ({codebook_usage*100:.1f}%) < {MIN_CODEBOOK_USAGE*100:.0f}%")
     
     print('=' * 80)
     print(f'预训练完成！')
-    print(f'最佳验证损失: {best_val_loss:.4f}')
-    print(f'模型保存至: {save_dir / model_name}.pth')
+    
+    # 只有当模型被保存过时才保存历史和配置
+    if model_saved:
+        # 保存训练历史
+        history_df = pd.DataFrame({
+            'epoch': range(1, args.n_epochs + 1),
+            'train_loss': train_losses,
+            'valid_loss': valid_losses,
+            'codebook_usage': codebook_usages,
+        })
+        history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
+        
+        # 保存配置
+        config['n_channels'] = dls.vars
+        with open(save_dir / f'{model_name}_config.json', 'w') as f:
+            json.dump(config, f, indent=4)
+        
+        print(f'最佳验证损失: {best_val_loss:.4f}')
+        print(f'模型保存至: {save_dir / model_name}.pth')
+    else:
+        print(f'警告: 码本使用率始终低于 {MIN_CODEBOOK_USAGE*100:.0f}%，未保存模型！')
+        print(f'最大码本使用率: {max(codebook_usages)*100:.1f}%')
+        print(f'建议: 增大 codebook_size 或调整训练参数')
 
 
 if __name__ == '__main__':
