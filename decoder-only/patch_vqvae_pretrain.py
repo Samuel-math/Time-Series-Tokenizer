@@ -205,8 +205,11 @@ def main():
     # 训练
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
+    no_improve_count = 0  # 早停计数器
+    early_stop_patience = 10  # 连续10个epoch不下降就停止
+    model_saved = False  # 是否已保存过模型
     
-    print(f'\n开始预训练，共 {args.n_epochs} 个 epoch')
+    print(f'\n开始预训练，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
@@ -226,18 +229,27 @@ def main():
               f"Valid Loss: {val_metrics['loss']:.4f}")
         
         # 保存最佳模型 (前20个epoch不保存也不记录)
-        if epoch >= 20 and val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            checkpoint = {
-                'model_state_dict': model.state_dict(),
-                'config': config,
-                'args': vars(args),
-                'epoch': epoch,
-                'train_loss': train_metrics['loss'],
-                'val_loss': val_metrics['loss'],
-            }
-            torch.save(checkpoint, save_dir / f'{model_name}.pth')
-            print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
+        if epoch >= 20:
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                no_improve_count = 0  # 重置计数器
+                model_saved = True
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'config': config,
+                    'args': vars(args),
+                    'epoch': epoch,
+                    'train_loss': train_metrics['loss'],
+                    'val_loss': val_metrics['loss'],
+                }
+                torch.save(checkpoint, save_dir / f'{model_name}.pth')
+                print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
+            elif model_saved:
+                # 只有在保存过模型之后才开始计数早停
+                no_improve_count += 1
+                if no_improve_count >= early_stop_patience:
+                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
+                    break
         
         # 每10个epoch检查码本使用率
         if (epoch + 1) % 10 == 0:
