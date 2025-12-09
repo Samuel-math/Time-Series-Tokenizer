@@ -1,15 +1,13 @@
 """
-Patch-based VQVAE + Transformer 模型架构
+Patch-based VQVAE + Transformer 模型架构 (优化版)
 
 架构说明：
 1. 输入: [B, T, C] 时间序列
-2. Overlapping Patch划分 (stride 控制重叠) -> [B, num_patches, patch_size, C]
-3. Patch Encoder: 线性投影 [B, num_patches, patch_size * C] -> [B, num_patches, d_model]
-4. VQ 量化到码本 -> [B, num_patches] indices
-5. Decoder-only Transformer: 预测下一个码本索引
-6. Patch Decoder: [B, num_patches, d_model] -> [B, num_patches, patch_size, C]
-7. 预训练: NTP loss + Reconstruction loss
-8. 微调: 预测未来 patch -> MSE loss
+2. Patch划分 + VQVAE Encoder -> 展平为 [B, num_patches, C, code_dim]
+3. VQ 量化后的表示直接作为 Transformer 输入 (无需 token embedding)
+4. Transformer (Decoder-only): 预测下一个码本向量
+5. 预训练: NTP loss (预测码本索引)
+6. 微调: 预测未来patch -> 解码 -> MSE loss
 """
 
 import torch
@@ -17,234 +15,73 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
-class PatchEncoder(nn.Module):
-    """
-    Patch Encoder - 线性投影
-    
-    将 patch 展平后通过 MLP 编码为 d_model 维向量
-    
-    输入: [B, num_patches, patch_size, C]
-    输出: [B, num_patches, d_model]
-    """
-    def __init__(self, patch_size, n_channels, d_model, dropout=0.1):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_channels = n_channels
-        self.d_model = d_model
-        self.input_dim = patch_size * n_channels
-        
-        # MLP encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(self.input_dim, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model)
-        )
-    
-    def forward(self, x):
-        """
-        Args:
-            x: [B, num_patches, patch_size, C]
-        Returns:
-            out: [B, num_patches, d_model]
-        """
-        B, num_patches, patch_size, C = x.shape
-        
-        # 展平 patch: [B, num_patches, patch_size * C]
-        x = x.reshape(B, num_patches, -1)
-        
-        # 编码: [B, num_patches, d_model]
-        out = self.encoder(x)
-        
-        return out
+from .vqvae import Encoder, Decoder
 
 
-class PatchDecoder(nn.Module):
+class FlattenedVectorQuantizer(nn.Module):
     """
-    Patch Decoder - 线性投影
-    
-    将 d_model 维向量解码回 patch
-    
-    输入: [B, num_patches, d_model]
-    输出: [B, num_patches, patch_size, C]
+    展平的 Vector Quantizer
+    码本维度 = embedding_dim * compressed_len
     """
-    def __init__(self, patch_size, n_channels, d_model, dropout=0.1):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_channels = n_channels
-        self.d_model = d_model
-        self.output_dim = patch_size * n_channels
-        
-        # MLP decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, self.output_dim)
-        )
-    
-    def forward(self, z):
-        """
-        Args:
-            z: [B, num_patches, d_model]
-        Returns:
-            out: [B, num_patches, patch_size, C]
-        """
-        B, num_patches, _ = z.shape
-        
-        # 解码: [B, num_patches, patch_size * C]
-        out = self.decoder(z)
-        
-        # reshape: [B, num_patches, patch_size, C]
-        out = out.reshape(B, num_patches, self.patch_size, self.n_channels)
-        
-        return out
-
-
-class VectorQuantizer(nn.Module):
-    """
-    Vector Quantizer with Straight-Through Estimator
-    支持 EMA 更新码本 (更稳定的训练)
-    """
-    def __init__(self, codebook_size, d_model, commitment_cost=0.25, use_ema=True, ema_decay=0.99):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25):
         super().__init__()
         self.codebook_size = codebook_size
-        self.d_model = d_model
+        self.code_dim = code_dim
         self.commitment_cost = commitment_cost
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
         
-        # 码本: [codebook_size, d_model]
-        self.embedding = nn.Embedding(codebook_size, d_model)
+        # 码本: [codebook_size, code_dim]
+        self.embedding = nn.Embedding(codebook_size, code_dim)
         self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
-        
-        if use_ema:
-            # EMA 相关的 buffer
-            self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))
-            self.register_buffer('ema_embedding_avg', self.embedding.weight.data.clone())
     
-    def forward(self, z):
+    def forward(self, z_flat):
         """
         Args:
-            z: [B, num_patches, d_model]
+            z_flat: [N, code_dim]
         Returns:
             loss, quantized, indices
         """
-        input_shape = z.shape
-        flat = z.reshape(-1, self.d_model)  # [N, d_model]
-        
-        # 计算距离
         distances = (
-            torch.sum(flat ** 2, dim=1, keepdim=True) +
+            torch.sum(z_flat ** 2, dim=1, keepdim=True) +
             torch.sum(self.embedding.weight ** 2, dim=1) -
-            2 * torch.matmul(flat, self.embedding.weight.t())
+            2 * torch.matmul(z_flat, self.embedding.weight.t())
         )
         
-        # 找最近的码本向量
         indices = torch.argmin(distances, dim=1)
-        
-        # One-hot encoding
-        encodings = F.one_hot(indices, self.codebook_size).float()
-        
-        # 量化
         quantized = self.embedding(indices)
         
-        if self.use_ema and self.training:
-            # EMA 更新
-            with torch.no_grad():
-                # 更新聚类大小
-                cluster_size = encodings.sum(0)
-                self.ema_cluster_size.data.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
-                
-                # 更新嵌入平均值
-                dw = encodings.t() @ flat
-                self.ema_embedding_avg.data.mul_(self.ema_decay).add_(dw, alpha=1 - self.ema_decay)
-                
-                # 归一化得到新的码本向量
-                n = self.ema_cluster_size.sum()
-                cluster_size = (self.ema_cluster_size + 1e-5) / (n + self.codebook_size * 1e-5) * n
-                self.embedding.weight.data.copy_(self.ema_embedding_avg / cluster_size.unsqueeze(1))
-            
-            # EMA 模式下只需要 commitment loss
-            loss = self.commitment_cost * F.mse_loss(quantized.detach(), flat)
-        else:
-            # 原始 VQ Loss
-            e_latent_loss = F.mse_loss(quantized.detach(), flat)
-            q_latent_loss = F.mse_loss(quantized, flat.detach())
-            loss = q_latent_loss + self.commitment_cost * e_latent_loss
+        e_latent_loss = F.mse_loss(quantized.detach(), z_flat)
+        q_latent_loss = F.mse_loss(quantized, z_flat.detach())
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
-        # Straight-through estimator
-        quantized = flat + (quantized - flat).detach()
-        
-        # Reshape back
-        quantized = quantized.view(input_shape)
-        indices = indices.view(input_shape[:-1])  # [B, num_patches]
+        quantized = z_flat + (quantized - z_flat).detach()
         
         return loss, quantized, indices
     
     def get_embedding(self, indices):
         return self.embedding(indices)
-    
-    def reset_unused_codes(self, z, threshold=1.0):
-        """
-        重置未使用的码本向量
-        将使用频率低于 threshold 的码本向量重置为随机的 encoder 输出
-        """
-        with torch.no_grad():
-            flat = z.reshape(-1, self.d_model)
-            
-            # 找到使用频率低的码本
-            if self.use_ema:
-                usage = self.ema_cluster_size
-            else:
-                # 计算当前 batch 的使用情况
-                distances = (
-                    torch.sum(flat ** 2, dim=1, keepdim=True) +
-                    torch.sum(self.embedding.weight ** 2, dim=1) -
-                    2 * torch.matmul(flat, self.embedding.weight.t())
-                )
-                indices = torch.argmin(distances, dim=1)
-                usage = torch.bincount(indices, minlength=self.codebook_size).float()
-            
-            # 重置使用率低的码本
-            unused_mask = usage < threshold
-            n_unused = unused_mask.sum().item()
-            
-            if n_unused > 0:
-                # 随机选择 encoder 输出来重置
-                random_indices = torch.randperm(flat.size(0))[:int(n_unused)]
-                self.embedding.weight.data[unused_mask] = flat[random_indices]
-                
-                if self.use_ema:
-                    self.ema_cluster_size.data[unused_mask] = 1.0
-                    self.ema_embedding_avg.data[unused_mask] = flat[random_indices]
-            
-            return n_unused
 
 
 class CausalTransformer(nn.Module):
-    """Decoder-only Causal Transformer"""
-    def __init__(self, d_model, n_heads, n_layers, d_ff, dropout=0.1, max_len=512):
+    """轻量级 Causal Transformer，输入维度为 code_dim"""
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512):
         super().__init__()
-        self.d_model = d_model
+        self.code_dim = code_dim
         
-        # 位置编码
-        self.pos_embedding = nn.Embedding(max_len, d_model)
+        # 位置编码，维度与 code_dim 一致
+        self.pos_embedding = nn.Embedding(max_len, code_dim)
         self.drop = nn.Dropout(dropout)
         
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            d_model=code_dim, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(code_dim)
     
     def forward(self, x):
         """
         Args:
-            x: [B, T, d_model]
+            x: [B, T, code_dim] 直接是量化后的码本向量
         """
         B, T, _ = x.shape
         
@@ -257,260 +94,192 @@ class CausalTransformer(nn.Module):
         return self.norm(x)
 
 
-class PatchVQTransformer(nn.Module):
+class PatchVQVAETransformer(nn.Module):
     """
     Patch-based VQVAE + Transformer
-    
-    架构:
-    - PatchEncoder: [B, num_patches, patch_size, C] -> [B, num_patches, d_model]
-    - VQ: [B, num_patches, d_model] -> indices + z_q
-    - Transformer: NTP 预训练
-    - PatchDecoder: [B, num_patches, d_model] -> [B, num_patches, patch_size, C]
+    直接使用展平的码本向量作为 Transformer 输入
     """
     def __init__(self, config):
         super().__init__()
         
-        # ========== Patch 配置 ==========
+        # 配置
         self.patch_size = config.get('patch_size', 16)
-        self.stride = config.get('stride', 16)
-        self.n_channels = config.get('n_channels', 7)
-        
-        # ========== 模型配置 ==========
-        self.d_model = config.get('d_model', 128)
+        self.embedding_dim = config.get('embedding_dim', 32)
+        self.compression_factor = config.get('compression_factor', 4)
         self.codebook_size = config.get('codebook_size', 256)
-        self.commitment_cost = config.get('commitment_cost', 0.25)
-        self.use_ema = config.get('use_ema', True)  # 默认使用 EMA
-        
-        # ========== Transformer 配置 ==========
         self.n_layers = config.get('n_layers', 4)
-        self.n_heads = config.get('n_heads', 8)
-        self.d_ff = config.get('d_ff', 512)
+        self.n_heads = config.get('n_heads', 4)
+        self.d_ff = config.get('d_ff', 256)
         self.dropout = config.get('dropout', 0.1)
+        self.commitment_cost = config.get('commitment_cost', 0.25)
         
-        # ========== 模块 ==========
+        # VQVAE 配置
+        self.num_hiddens = config.get('num_hiddens', 64)
+        self.num_residual_layers = config.get('num_residual_layers', 2)
+        self.num_residual_hiddens = config.get('num_residual_hiddens', 32)
         
-        # 1. Patch Encoder (线性投影)
-        self.encoder = PatchEncoder(
-            patch_size=self.patch_size,
-            n_channels=self.n_channels,
-            d_model=self.d_model,
-            dropout=self.dropout
+        self.compressed_len = self.patch_size // self.compression_factor
+        self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
+        
+        # VQVAE Encoder/Decoder
+        self.encoder = Encoder(
+            in_channels=1,
+            num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            embedding_dim=self.embedding_dim,
+            compression_factor=self.compression_factor
         )
         
-        # 2. Vector Quantizer (支持 EMA)
-        self.vq = VectorQuantizer(
-            codebook_size=self.codebook_size,
-            d_model=self.d_model,
-            commitment_cost=self.commitment_cost,
-            use_ema=self.use_ema
+        self.decoder = Decoder(
+            in_channels=self.embedding_dim,
+            num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            compression_factor=self.compression_factor
         )
         
-        # 3. Causal Transformer
+        # VQ (码本维度 = code_dim)
+        self.vq = FlattenedVectorQuantizer(
+            self.codebook_size, self.code_dim, self.commitment_cost
+        )
+        
+        # Transformer (输入维度 = code_dim，无需 token embedding)
         self.transformer = CausalTransformer(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            n_layers=self.n_layers,
-            d_ff=self.d_ff,
-            dropout=self.dropout
+            self.code_dim, self.n_heads, self.n_layers, 
+            self.d_ff, self.dropout
         )
         
-        # 4. Output Head: 预测码本索引 (预训练用)
-        self.output_head = nn.Linear(self.d_model, self.codebook_size)
-        
-        # 5. Patch Decoder (线性投影)
-        self.decoder = PatchDecoder(
-            patch_size=self.patch_size,
-            n_channels=self.n_channels,
-            d_model=self.d_model,
-            dropout=self.dropout
-        )
+        # 输出头: code_dim -> codebook_size (预测码本索引)
+        self.output_head = nn.Linear(self.code_dim, self.codebook_size)
     
-    def _update_n_channels(self, n_channels):
-        """动态更新通道数"""
-        if n_channels != self.n_channels:
-            self.n_channels = n_channels
-            device = next(self.parameters()).device
-            
-            # 重新创建 encoder
-            self.encoder = PatchEncoder(
-                patch_size=self.patch_size,
-                n_channels=n_channels,
-                d_model=self.d_model,
-                dropout=self.dropout
-            ).to(device)
-            
-            # 重新创建 decoder
-            self.decoder = PatchDecoder(
-                patch_size=self.patch_size,
-                n_channels=n_channels,
-                d_model=self.d_model,
-                dropout=self.dropout
-            ).to(device)
-    
-    def create_patches(self, x):
+    def encode_to_indices(self, x):
         """
-        创建 overlapping patches
+        编码为码本索引和量化向量
         
         Args:
             x: [B, T, C]
         Returns:
-            patches: [B, num_patches, patch_size, C]
-        """
-        B, T, C = x.shape
-        num_patches = (T - self.patch_size) // self.stride + 1
-        
-        x = x.permute(0, 2, 1)  # [B, C, T]
-        patches = x.unfold(dimension=2, size=self.patch_size, step=self.stride)
-        patches = patches.permute(0, 2, 3, 1)  # [B, num_patches, patch_size, C]
-        
-        return patches
-    
-    def encode(self, x):
-        """
-        编码输入序列
-        
-        Args:
-            x: [B, T, C]
-        Returns:
-            indices: [B, num_patches]
+            indices: [B, num_patches, C]
             vq_loss: scalar
-            z_q: [B, num_patches, d_model]
+            z_q: [B, num_patches, C, code_dim]
         """
         B, T, C = x.shape
-        self._update_n_channels(C)
+        num_patches = T // self.patch_size
         
-        # 1. 创建 patches
-        patches = self.create_patches(x)  # [B, num_patches, patch_size, C]
+        # 重组为 patches 并批量编码
+        x = x[:, :num_patches * self.patch_size, :]
+        x = x.reshape(B, num_patches, self.patch_size, C)
+        x = x.permute(0, 1, 3, 2).reshape(-1, self.patch_size)  # [B*num_patches*C, patch_size]
         
-        # 2. Patch Encoder
-        z = self.encoder(patches)  # [B, num_patches, d_model]
+        # VQVAE Encoder
+        z = self.encoder(x, self.compression_factor)  # [B*num_patches*C, embedding_dim, compressed_len]
+        z_flat = z.reshape(z.shape[0], -1)  # [B*num_patches*C, code_dim]
         
-        # 3. VQ 量化
-        vq_loss, z_q, indices = self.vq(z)
+        # VQ
+        vq_loss, z_q_flat, indices = self.vq(z_flat)
+        
+        # Reshape
+        indices = indices.reshape(B, num_patches, C)
+        z_q = z_q_flat.reshape(B, num_patches, C, self.code_dim)
         
         return indices, vq_loss, z_q
     
-    def decode(self, z_q):
+    def decode_from_codes(self, z_q):
         """
-        从量化向量解码为 patches
+        从量化向量解码
         
         Args:
-            z_q: [B, num_patches, d_model]
+            z_q: [B, num_patches, C, code_dim]
         Returns:
-            patches: [B, num_patches, patch_size, C]
+            x_recon: [B, num_patches * patch_size, C]
         """
-        return self.decoder(z_q)
-    
-    def patches_to_sequence(self, patches, target_len=None):
-        """
-        将 patches 合并为序列 (处理重叠区域用平均)
+        B, num_patches, C, _ = z_q.shape
         
-        Args:
-            patches: [B, num_patches, patch_size, C]
-            target_len: 目标序列长度
-        Returns:
-            x: [B, T, C]
-        """
-        B, num_patches, patch_size, C = patches.shape
+        # Reshape for decoder
+        z_q = z_q.reshape(-1, self.embedding_dim, self.compressed_len)
         
-        if self.stride == self.patch_size:
-            # 无重叠，直接拼接
-            x = patches.reshape(B, -1, C)
-        else:
-            # 有重叠，使用加权平均
-            T = (num_patches - 1) * self.stride + patch_size
-            x = torch.zeros(B, T, C, device=patches.device, dtype=patches.dtype)
-            count = torch.zeros(B, T, C, device=patches.device, dtype=patches.dtype)
-            
-            for i in range(num_patches):
-                start = i * self.stride
-                x[:, start:start+patch_size, :] += patches[:, i, :, :]
-                count[:, start:start+patch_size, :] += 1
-            
-            x = x / count.clamp(min=1)
+        # VQVAE Decoder
+        x_recon = self.decoder(z_q, self.compression_factor)
         
-        if target_len is not None:
-            x = x[:, :target_len, :]
+        # Reshape back
+        x_recon = x_recon.reshape(B, num_patches, C, self.patch_size)
+        x_recon = x_recon.permute(0, 1, 3, 2).reshape(B, -1, C)
         
-        return x
+        return x_recon
     
     def forward_pretrain(self, x):
         """
-        预训练: Next Token Prediction + Reconstruction
-        
-        Args:
-            x: [B, T, C]
-        Returns:
-            logits: [B, num_patches-1, codebook_size]
-            targets: [B, num_patches-1]
-            vq_loss: scalar
-            recon_loss: scalar
+        预训练: NTP
+        直接用量化后的码本向量 z_q 作为 Transformer 输入
         """
         B, T, C = x.shape
         
         # 编码
-        indices, vq_loss, z_q = self.encode(x)
+        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
         num_patches = indices.shape[1]
         
         # 重构损失
-        decoded_patches = self.decode(z_q)  # [B, num_patches, patch_size, C]
-        x_recon = self.patches_to_sequence(decoded_patches, target_len=T)
+        x_recon = self.decode_from_codes(z_q)
         recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
-        # Transformer for NTP
-        h = self.transformer(z_q)  # [B, num_patches, d_model]
-        logits = self.output_head(h)  # [B, num_patches, codebook_size]
+        # Channel-independent Transformer
+        # 直接使用 z_q 作为输入，不需要 token embedding
+        all_logits = []
+        for c in range(C):
+            z_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
+            h = self.transformer(z_c)  # [B, num_patches, code_dim]
+            logits = self.output_head(h)  # [B, num_patches, codebook_size]
+            all_logits.append(logits)
         
-        # NTP: 用位置 i 预测位置 i+1
+        logits = torch.stack(all_logits, dim=2)  # [B, num_patches, C, codebook_size]
+        
+        # NTP: 用位置i预测位置i+1
         return logits[:, :-1], indices[:, 1:], vq_loss, recon_loss
     
     def forward_finetune(self, x, target_len):
         """
-        微调: 使用 NTP 结构预测未来序列 (Soft Attention 替代 argmax)
+        微调: 预测未来序列
         
-        只训练 Transformer 和 Decoder，冻结 Encoder 和 VQ
-        使用 soft attention 代替 argmax，保持梯度流通
-        
-        Args:
-            x: [B, T, C]
-            target_len: 预测长度
-        Returns:
-            pred: [B, target_len, C]
-            vq_loss: scalar
+        1. 编码输入为量化向量
+        2. Transformer 自回归预测未来 patch 的码本索引
+        3. 从码本获取向量并解码
         """
         B, T, C = x.shape
-        num_pred_patches = (target_len + self.stride - 1) // self.stride
+        num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
         
-        # 编码输入 (Encoder 和 VQ 应该被冻结)
-        indices, vq_loss, z_q = self.encode(x)
+        # 编码输入
+        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
         
-        # 自回归预测 (使用 soft attention 替代 argmax)
-        current_z = z_q
-        pred_codes = []
+        # 自回归预测
+        current_z = z_q  # [B, num_patches, C, code_dim]
+        pred_codes_list = []
         
         for _ in range(num_pred_patches):
-            # Transformer 预测
-            h = self.transformer(current_z)
-            logits = self.output_head(h[:, -1, :])  # [B, codebook_size]
+            next_codes = []
+            for c in range(C):
+                z_c = current_z[:, :, c, :]  # [B, seq_len, code_dim]
+                h = self.transformer(z_c)  # [B, seq_len, code_dim]
+                logits = self.output_head(h[:, -1, :])  # [B, codebook_size]
+                
+                # 使用 softmax + 加权求和 替代 argmax，保持可微分
+                weights = F.softmax(logits, dim=-1)  # [B, codebook_size]
+                codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
+                pred_code = torch.matmul(weights, codebook)  # [B, code_dim]
+                next_codes.append(pred_code)
             
-            # Soft attention: 使用 softmax 加权求和 (可微分！)
-            # 使用温度参数控制软硬程度
-            temperature = 0.5  # 较低温度使分布更尖锐
-            probs = F.softmax(logits / temperature, dim=-1)  # [B, codebook_size]
+            next_codes = torch.stack(next_codes, dim=1)  # [B, C, code_dim]
+            pred_codes_list.append(next_codes)
             
-            # 加权求和得到 soft code
-            pred_code = torch.matmul(probs, self.vq.embedding.weight)  # [B, d_model]
-            pred_codes.append(pred_code)
-            
-            # 拼接继续预测
-            current_z = torch.cat([current_z, pred_code.unsqueeze(1)], dim=1)
+            # 更新序列
+            current_z = torch.cat([current_z, next_codes.unsqueeze(1)], dim=1)
         
-        # Stack 预测的 codes: [B, num_pred_patches, d_model]
-        pred_z = torch.stack(pred_codes, dim=1)
+        # 获取预测的码本向量
+        pred_codes = torch.stack(pred_codes_list, dim=1)  # [B, num_pred_patches, C, code_dim]
         
-        # Decoder 解码
-        pred_patches = self.decode(pred_z)  # [B, num_pred_patches, patch_size, C]
-        pred = self.patches_to_sequence(pred_patches, target_len=target_len)
+        # 解码
+        pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
+        pred = pred[:, :target_len, :]
         
         return pred, vq_loss
     
@@ -522,35 +291,50 @@ class PatchVQTransformer(nn.Module):
     
     @torch.no_grad()
     def get_codebook_usage(self, x):
-        """获取码本使用率"""
-        indices, _, _ = self.encode(x)
+        indices, _, _ = self.encode_to_indices(x)
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
-
-
-# 为了向后兼容
-PatchVQVAETransformer = PatchVQTransformer
+    
+    def load_vqvae_weights(self, checkpoint_path, device='cpu'):
+        import os
+        if not os.path.exists(checkpoint_path):
+            print(f"警告: checkpoint不存在: {checkpoint_path}")
+            return False
+        
+        try:
+            vqvae_model = torch.load(checkpoint_path, map_location=device)
+            if hasattr(vqvae_model, 'encoder'):
+                self.encoder.load_state_dict(vqvae_model.encoder.state_dict())
+                print("加载 Encoder 权重成功")
+            if hasattr(vqvae_model, 'decoder'):
+                self.decoder.load_state_dict(vqvae_model.decoder.state_dict())
+                print("加载 Decoder 权重成功")
+            return True
+        except Exception as e:
+            print(f"加载权重失败: {e}")
+            return False
 
 
 # ============ 工具函数 ============
 
 def get_model_config(args):
-    """从命令行参数构建模型配置"""
+    """构建模型配置"""
+    # code_dim = embedding_dim * (patch_size / compression_factor)
+    code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
+    print(f"Transformer 输入维度 (code_dim) = {code_dim}")
+    
     return {
-        # Patch
         'patch_size': args.patch_size,
-        'stride': getattr(args, 'stride', args.patch_size),
-        'n_channels': getattr(args, 'n_channels', 7),
-        
-        # Model
-        'd_model': args.d_model,
+        'embedding_dim': args.embedding_dim,
+        'compression_factor': args.compression_factor,
         'codebook_size': args.codebook_size,
-        'commitment_cost': getattr(args, 'commitment_cost', 0.25),
-        'use_ema': getattr(args, 'use_ema', True),  # 默认使用 EMA
-        
-        # Transformer
         'n_layers': args.n_layers,
         'n_heads': args.n_heads,
         'd_ff': args.d_ff,
         'dropout': args.dropout,
+        'commitment_cost': args.commitment_cost,
+        # VQVAE Encoder/Decoder 配置
+        'num_hiddens': args.num_hiddens,
+        'num_residual_layers': args.num_residual_layers,
+        'num_residual_hiddens': args.num_residual_hiddens,
     }

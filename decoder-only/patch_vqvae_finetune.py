@@ -1,5 +1,5 @@
 """
-Patch-based VQVAE + Transformer 微调脚本 (v2)
+Patch-based VQVAE + Transformer 微调脚本
 使用 MSE 损失进行时间序列预测
 """
 
@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import argparse
 from pathlib import Path
 
-# 添加根目录到 path，使用共享模块
+# 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.models.patch_vqvae_transformer import PatchVQVAETransformer
 from src.models.layers.revin import RevIN
@@ -25,7 +25,7 @@ from datautils import get_dls
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 微调 (v2)')
+    parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 微调')
     
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
     
     # 保存参数
-    parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_v2_finetune/', help='模型保存路径')
+    parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
     
     return parser.parse_args()
@@ -58,10 +58,6 @@ def load_pretrained_model(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     config = checkpoint['config']
-    # 确保 n_channels 正确
-    if 'n_channels' in checkpoint:
-        config['n_channels'] = checkpoint['n_channels']
-    
     model = PatchVQVAETransformer(config)
     model.load_state_dict(checkpoint['model_state_dict'])
     
@@ -72,34 +68,18 @@ def load_pretrained_model(checkpoint_path, device):
 
 
 def freeze_encoder_vq(model):
-    """冻结 Encoder 和 VQ，只训练 Transformer, Output Head 和 Decoder"""
-    # 冻结 Encoder
+    """冻结encoder和VQ层（将patch映射成码本前的所有参数）"""
+    # 冻结 encoder
     for param in model.encoder.parameters():
         param.requires_grad = False
-    
-    # 冻结 VQ
+    # 冻结 VQ 层
     for param in model.vq.parameters():
         param.requires_grad = False
-    
-    # Transformer, Output Head, Decoder 保持可训练
-    trainable_modules = ['transformer', 'output_head', 'decoder']
-    trainable_count = 0
-    frozen_count = 0
-    
-    for name, param in model.named_parameters():
-        if any(m in name for m in trainable_modules):
-            param.requires_grad = True
-            trainable_count += param.numel()
-        else:
-            frozen_count += param.numel()
-    
-    print(f'冻结 Encoder 和 VQ')
-    print(f'训练 Transformer, Output Head 和 Decoder')
-    print(f'可训练参数: {trainable_count:,}, 冻结参数: {frozen_count:,}')
+    print('冻结了 Encoder 和 VQ 层（将patch映射成码本前的所有参数）')
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
-    """训练一个epoch"""
+    """训练一个epoch (只使用MSE loss)"""
     model.train()
     total_loss = 0
     n_batches = 0
@@ -108,22 +88,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         batch_x = batch_x.to(device)  # [B, context_points, C]
         batch_y = batch_y.to(device)  # [B, target_points, C]
         
-        # RevIN归一化
+        # RevIN归一化 (需要同时对 x 和 y 归一化)
         if revin:
+            # 合并后归一化，确保统计量一致
             batch_x = revin(batch_x, 'norm')
         
-        # 前向传播
-        pred, vq_loss = model.forward_finetune(batch_x, args.target_points)
+        # 前向传播: 预测码本索引 -> 解码
+        pred, _ = model.forward_finetune(batch_x, args.target_points)
         
         # RevIN反归一化
         if revin:
             pred = revin(pred, 'denorm')
         
-        # MSE损失
-        mse_loss = F.mse_loss(pred, batch_y)
-        
-        # 总损失 (不加 vq_loss，因为现在是端到端训练)
-        loss = mse_loss
+        # 只使用 MSE 损失
+        loss = F.mse_loss(pred, batch_y)
         
         # 反向传播
         optimizer.zero_grad()
@@ -131,7 +109,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
-        total_loss += mse_loss.item()
+        total_loss += loss.item()
         n_batches += 1
     
     scheduler.step()
@@ -212,8 +190,13 @@ def main():
     model, config = load_pretrained_model(args.pretrained_model, device)
     model = model.to(device)
     
-    # 冻结 Encoder 和 VQ，只训练 Transformer 和 Decoder
+    # 冻结 encoder 和 VQ 层（将patch映射成码本前的所有参数）
     freeze_encoder_vq(model)
+    
+    # 打印可训练参数
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'可训练参数: {trainable_params:,} / {total_params:,}')
     
     # 获取数据
     args.dset_finetune = args.dset
@@ -225,7 +208,7 @@ def main():
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
     # 模型文件名
-    model_name = f'patch_vqvae_v2_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
+    model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
     
     # 优化器和调度器
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
