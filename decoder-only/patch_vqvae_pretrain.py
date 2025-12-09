@@ -119,7 +119,13 @@ def freeze_encoder_vq_decoder(model):
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, frozen=False):
     """训练一个epoch"""
-    model.train()
+    if frozen:
+        # 冻结后: encoder/vq/decoder 保持 eval 模式，只有 transformer 训练
+        model.eval()  # 先全部设为 eval
+        model.transformer.train()  # 只有 transformer 训练
+        model.output_head.train()
+    else:
+        model.train()
     total_loss = 0
     total_ntp_loss = 0
     total_vq_loss = 0
