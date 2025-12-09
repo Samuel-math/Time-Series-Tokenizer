@@ -1,12 +1,10 @@
 #!/bin/bash
 
-# Patch VQVAE + Transformer (v2) 完整训练流程
+# Patch VQVAE + Transformer 完整训练流程
 # 
 # 特性:
 # - Overlapping Patches (stride 控制重叠)
-# - Intra-Patch Attention (learnable query cross-attention)
-#   - 输入: [B, num_patches, patch_size, C]
-#   - 输出: [B, num_patches, d_model]
+# - Patch Encoder: 线性投影 [patch_size * C] -> [d_model]
 # - VQ Codebook (对每个 patch 的 d_model 表示进行量化)
 # - Decoder-only Transformer (NTP 预训练)
 
@@ -15,7 +13,7 @@ MODEL_ID=1
 
 # ========== 窗口大小配置 ==========
 PRETRAIN_CONTEXT_POINTS=1024    # 预训练使用较大窗口
-FINETUNE_CONTEXT_POINTS=512     # 微调使用较小窗口
+FINETUNE_CONTEXT_POINTS=336     # 微调使用较小窗口
 
 # ========== Patch 配置 ==========
 PATCH_SIZE=32
@@ -23,7 +21,7 @@ STRIDE=16         # stride < patch_size 有重叠
 
 # ========== 模型配置 ==========
 D_MODEL=128           # 每个 patch 编码后的维度
-CODEBOOK_SIZE=18
+CODEBOOK_SIZE=64
 COMMITMENT_COST=0.25
 
 # ========== Transformer 配置 ==========
@@ -31,12 +29,6 @@ N_LAYERS=3
 N_HEADS=8
 D_FF=256
 DROPOUT=0.3
-
-# ========== Intra-Patch Attention 配置 ==========
-INTRA_N_HEADS=2
-
-# ========== Decoder 配置 ==========
-DECODER_HIDDEN=256
 
 # ========== 训练配置 ==========
 PRETRAIN_EPOCHS=100
@@ -49,8 +41,8 @@ VQ_WEIGHT=0.3
 RECON_WEIGHT=0.1
 
 # ========== 路径配置 ==========
-PRETRAIN_SAVE_PATH="saved_models/patch_vqvae_v2/"
-FINETUNE_SAVE_PATH="saved_models/patch_vqvae_v2_finetune/"
+PRETRAIN_SAVE_PATH="saved_models/patch_vqvae/"
+FINETUNE_SAVE_PATH="saved_models/patch_vqvae_finetune/"
 
 # 计算一些值
 OVERLAP=$((PATCH_SIZE - STRIDE))
@@ -58,7 +50,7 @@ PRETRAIN_NUM_PATCHES=$(( (PRETRAIN_CONTEXT_POINTS - PATCH_SIZE) / STRIDE + 1 ))
 FINETUNE_NUM_PATCHES=$(( (FINETUNE_CONTEXT_POINTS - PATCH_SIZE) / STRIDE + 1 ))
 
 echo "=========================================="
-echo "Patch VQVAE + Transformer (v2)"
+echo "Patch VQVAE + Transformer"
 echo "=========================================="
 echo ""
 echo "窗口配置:"
@@ -97,8 +89,6 @@ python patch_vqvae_pretrain.py \
     --n_heads $N_HEADS \
     --d_ff $D_FF \
     --dropout $DROPOUT \
-    --intra_n_heads $INTRA_N_HEADS \
-    --decoder_hidden $DECODER_HIDDEN \
     --n_epochs $PRETRAIN_EPOCHS \
     --lr $LR \
     --weight_decay 1e-4 \

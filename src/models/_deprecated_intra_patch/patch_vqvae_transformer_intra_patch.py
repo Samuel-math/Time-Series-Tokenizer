@@ -1,15 +1,17 @@
 """
-Patch-based VQVAE + Transformer 模型架构
+Patch-based VQ + Transformer 模型架构 (v2)
 
 架构说明：
 1. 输入: [B, T, C] 时间序列
 2. Overlapping Patch划分 (stride 控制重叠) -> [B, num_patches, patch_size, C]
-3. Patch Encoder: 线性投影 [B, num_patches, patch_size * C] -> [B, num_patches, d_model]
+3. Intra-Patch Attention (Encoder): learnable query cross-attention -> [B, num_patches, d_model]
 4. VQ 量化到码本 -> [B, num_patches] indices
 5. Decoder-only Transformer: 预测下一个码本索引
-6. Patch Decoder: [B, num_patches, d_model] -> [B, num_patches, patch_size, C]
+6. Intra-Patch Attention (Decoder): d_model -> [B, num_patches, patch_size, C]
 7. 预训练: NTP loss + Reconstruction loss
 8. 微调: 预测未来 patch -> MSE loss
+
+参考: https://arxiv.org/pdf/2402.05956 (Intra-Patch Attention)
 """
 
 import torch
@@ -18,30 +20,45 @@ import torch.nn.functional as F
 import math
 
 
-class PatchEncoder(nn.Module):
+class IntraPatchEncoder(nn.Module):
     """
-    Patch Encoder - 线性投影
+    Intra-Patch Attention Encoder
     
-    将 patch 展平后通过 MLP 编码为 d_model 维向量
+    使用可学习的 query 与 patch 元素做 cross-attention，将 patch 编码为 d_model 维向量
     
     输入: [B, num_patches, patch_size, C]
     输出: [B, num_patches, d_model]
     """
-    def __init__(self, patch_size, n_channels, d_model, dropout=0.1):
+    def __init__(self, patch_size, n_channels, d_model, n_heads=2, dropout=0.1):
         super().__init__()
         self.patch_size = patch_size
         self.n_channels = n_channels
         self.d_model = d_model
-        self.input_dim = patch_size * n_channels
+        self.n_heads = n_heads
+        self.head_size = d_model // n_heads
         
-        # MLP encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(self.input_dim, d_model * 2),
+        # 可学习的 Query: [1, d_model]
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        
+        # K, V 投影: 将 patch 中每个时间步投影到 d_model
+        self.k_proj = nn.Linear(n_channels, d_model)
+        self.v_proj = nn.Linear(n_channels, d_model)
+        
+        # 输出投影
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model)
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
         )
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         """
@@ -51,39 +68,90 @@ class PatchEncoder(nn.Module):
             out: [B, num_patches, d_model]
         """
         B, num_patches, patch_size, C = x.shape
+        N = B * num_patches
         
-        # 展平 patch: [B, num_patches, patch_size * C]
-        x = x.reshape(B, num_patches, -1)
+        # 重组为 [B * num_patches, patch_size, C]
+        x = x.reshape(N, patch_size, C)
         
-        # 编码: [B, num_patches, d_model]
-        out = self.encoder(x)
+        # Query: [N, 1, d_model]
+        q = self.query.expand(N, -1, -1)
+        
+        # Key, Value: [N, patch_size, d_model]
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Multi-Head Cross-Attention
+        q = q.view(N, 1, self.n_heads, self.head_size).transpose(1, 2)
+        k = k.view(N, patch_size, self.n_heads, self.head_size).transpose(1, 2)
+        v = v.view(N, patch_size, self.n_heads, self.head_size).transpose(1, 2)
+        
+        # Attention: [N, n_heads, 1, patch_size]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_size)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Output: [N, n_heads, 1, head_size] -> [N, 1, d_model]
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(N, 1, self.d_model)
+        out = self.out_proj(out)
+        
+        # Residual + LayerNorm
+        out = self.norm1(self.query.expand(N, -1, -1) + self.dropout(out))
+        
+        # FFN
+        residual = out
+        out = self.ffn(out)
+        out = self.norm2(residual + out)
+        
+        # [N, 1, d_model] -> [B, num_patches, d_model]
+        out = out.squeeze(1).view(B, num_patches, self.d_model)
         
         return out
 
 
-class PatchDecoder(nn.Module):
+class IntraPatchDecoder(nn.Module):
     """
-    Patch Decoder - 线性投影
+    Intra-Patch Attention Decoder
     
-    将 d_model 维向量解码回 patch
+    使用可学习的 queries (patch_size 个) 与编码向量做 cross-attention，解码为 patch
     
     输入: [B, num_patches, d_model]
     输出: [B, num_patches, patch_size, C]
     """
-    def __init__(self, patch_size, n_channels, d_model, dropout=0.1):
+    def __init__(self, patch_size, n_channels, d_model, n_heads=2, dropout=0.1):
         super().__init__()
         self.patch_size = patch_size
         self.n_channels = n_channels
         self.d_model = d_model
-        self.output_dim = patch_size * n_channels
+        self.n_heads = n_heads
+        self.head_size = d_model // n_heads
         
-        # MLP decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
+        # 可学习的 Queries: [patch_size, d_model]
+        # 每个 query 负责生成一个时间步的输出
+        self.queries = nn.Parameter(torch.randn(1, patch_size, d_model) * 0.02)
+        
+        # K, V 投影: 对编码向量做投影
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        
+        # 输出投影
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 2, self.output_dim)
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
         )
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        # 最终输出层: d_model -> n_channels
+        self.output_layer = nn.Linear(d_model, n_channels)
     
     def forward(self, z):
         """
@@ -93,12 +161,46 @@ class PatchDecoder(nn.Module):
             out: [B, num_patches, patch_size, C]
         """
         B, num_patches, _ = z.shape
+        N = B * num_patches
         
-        # 解码: [B, num_patches, patch_size * C]
-        out = self.decoder(z)
+        # 重组为 [N, 1, d_model] (每个 patch 的编码)
+        z = z.reshape(N, 1, self.d_model)
         
-        # reshape: [B, num_patches, patch_size, C]
-        out = out.reshape(B, num_patches, self.patch_size, self.n_channels)
+        # Queries: [N, patch_size, d_model]
+        q = self.queries.expand(N, -1, -1)
+        
+        # Key, Value from encoded vector: [N, 1, d_model]
+        k = self.k_proj(z)
+        v = self.v_proj(z)
+        
+        # Multi-Head Cross-Attention
+        q = q.view(N, self.patch_size, self.n_heads, self.head_size).transpose(1, 2)
+        k = k.view(N, 1, self.n_heads, self.head_size).transpose(1, 2)
+        v = v.view(N, 1, self.n_heads, self.head_size).transpose(1, 2)
+        
+        # Attention: [N, n_heads, patch_size, 1]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_size)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Output: [N, n_heads, patch_size, head_size] -> [N, patch_size, d_model]
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(N, self.patch_size, self.d_model)
+        out = self.out_proj(out)
+        
+        # Residual + LayerNorm
+        out = self.norm1(self.queries.expand(N, -1, -1) + self.dropout(out))
+        
+        # FFN
+        residual = out
+        out = self.ffn(out)
+        out = self.norm2(residual + out)
+        
+        # 输出层: [N, patch_size, d_model] -> [N, patch_size, C]
+        out = self.output_layer(out)
+        
+        # [N, patch_size, C] -> [B, num_patches, patch_size, C]
+        out = out.view(B, num_patches, self.patch_size, self.n_channels)
         
         return out
 
@@ -191,13 +293,13 @@ class CausalTransformer(nn.Module):
 
 class PatchVQTransformer(nn.Module):
     """
-    Patch-based VQVAE + Transformer
+    Patch-based VQ + Transformer (v2)
     
     架构:
-    - PatchEncoder: [B, num_patches, patch_size, C] -> [B, num_patches, d_model]
+    - IntraPatchEncoder: [B, num_patches, patch_size, C] -> [B, num_patches, d_model]
     - VQ: [B, num_patches, d_model] -> indices + z_q
     - Transformer: NTP 预训练
-    - PatchDecoder: [B, num_patches, d_model] -> [B, num_patches, patch_size, C]
+    - IntraPatchDecoder: [B, num_patches, d_model] -> [B, num_patches, patch_size, C]
     """
     def __init__(self, config):
         super().__init__()
@@ -218,13 +320,17 @@ class PatchVQTransformer(nn.Module):
         self.d_ff = config.get('d_ff', 512)
         self.dropout = config.get('dropout', 0.1)
         
+        # ========== Intra-Patch Attention 配置 ==========
+        self.intra_n_heads = config.get('intra_n_heads', 2)
+        
         # ========== 模块 ==========
         
-        # 1. Patch Encoder (线性投影)
-        self.encoder = PatchEncoder(
+        # 1. Intra-Patch Encoder
+        self.encoder = IntraPatchEncoder(
             patch_size=self.patch_size,
             n_channels=self.n_channels,
             d_model=self.d_model,
+            n_heads=self.intra_n_heads,
             dropout=self.dropout
         )
         
@@ -247,11 +353,12 @@ class PatchVQTransformer(nn.Module):
         # 4. Output Head: 预测码本索引
         self.output_head = nn.Linear(self.d_model, self.codebook_size)
         
-        # 5. Patch Decoder (线性投影)
-        self.decoder = PatchDecoder(
+        # 5. Intra-Patch Decoder
+        self.decoder = IntraPatchDecoder(
             patch_size=self.patch_size,
             n_channels=self.n_channels,
             d_model=self.d_model,
+            n_heads=self.intra_n_heads,
             dropout=self.dropout
         )
     
@@ -262,18 +369,20 @@ class PatchVQTransformer(nn.Module):
             device = next(self.parameters()).device
             
             # 重新创建 encoder
-            self.encoder = PatchEncoder(
+            self.encoder = IntraPatchEncoder(
                 patch_size=self.patch_size,
                 n_channels=n_channels,
                 d_model=self.d_model,
+                n_heads=self.intra_n_heads,
                 dropout=self.dropout
             ).to(device)
             
             # 重新创建 decoder
-            self.decoder = PatchDecoder(
+            self.decoder = IntraPatchDecoder(
                 patch_size=self.patch_size,
                 n_channels=n_channels,
                 d_model=self.d_model,
+                n_heads=self.intra_n_heads,
                 dropout=self.dropout
             ).to(device)
     
@@ -312,7 +421,7 @@ class PatchVQTransformer(nn.Module):
         # 1. 创建 patches
         patches = self.create_patches(x)  # [B, num_patches, patch_size, C]
         
-        # 2. Patch Encoder
+        # 2. Intra-Patch Encoder
         z = self.encoder(patches)  # [B, num_patches, d_model]
         
         # 3. VQ 量化
@@ -471,4 +580,7 @@ def get_model_config(args):
         'n_heads': args.n_heads,
         'd_ff': args.d_ff,
         'dropout': args.dropout,
+        
+        # Intra-Patch Attention
+        'intra_n_heads': getattr(args, 'intra_n_heads', 2),
     }

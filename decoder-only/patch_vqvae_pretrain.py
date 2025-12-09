@@ -53,11 +53,6 @@ def parse_args():
     parser.add_argument('--d_ff', type=int, default=512, help='FFN维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     
-    # Intra-Patch Attention 参数
-    parser.add_argument('--intra_n_heads', type=int, default=2, help='Intra-Patch Attention头数')
-    
-    # Decoder 参数
-    parser.add_argument('--decoder_hidden', type=int, default=256, help='Patch Decoder隐藏层维度')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')
@@ -194,7 +189,6 @@ def main():
     print(f'\n配置信息:')
     print(f'  Patch: size={args.patch_size}, stride={args.stride}, overlap={overlap}, num_patches={num_patches}')
     print(f'  Model: d_model={args.d_model}, codebook_size={args.codebook_size}')
-    print(f'  Intra-Patch Attention: heads={args.intra_n_heads}')
     
     # 模型文件名 (包含窗口大小)
     model_name = f'patch_vqvae_v2_cw{args.context_points}_ps{args.patch_size}_st{args.stride}_d{args.d_model}_cb{args.codebook_size}_model{args.model_id}'
