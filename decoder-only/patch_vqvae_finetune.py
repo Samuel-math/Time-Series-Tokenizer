@@ -13,6 +13,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda import amp
 import argparse
 from pathlib import Path
 
@@ -44,6 +45,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
+    parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
@@ -78,7 +80,7 @@ def freeze_encoder_vq(model):
     print('冻结了 Encoder 和 VQ 层（将patch映射成码本前的所有参数）')
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
+def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, scaler):
     """训练一个epoch (只使用MSE loss)"""
     model.train()
     total_loss = 0
@@ -93,21 +95,24 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
             # 合并后归一化，确保统计量一致
             batch_x = revin(batch_x, 'norm')
         
-        # 前向传播: 预测码本索引 -> 解码
-        pred, _ = model.forward_finetune(batch_x, args.target_points)
-        
-        # RevIN反归一化
-        if revin:
-            pred = revin(pred, 'denorm')
-        
-        # 只使用 MSE 损失
-        loss = F.mse_loss(pred, batch_y)
+        with amp.autocast(enabled=scaler.is_enabled()):
+            # 前向传播: 预测码本索引 -> 解码
+            pred, _ = model.forward_finetune(batch_x, args.target_points)
+            
+            # RevIN反归一化
+            if revin:
+                pred = revin(pred, 'denorm')
+            
+            # 只使用 MSE 损失
+            loss = F.mse_loss(pred, batch_y)
         
         # 反向传播
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         
         total_loss += loss.item()
         n_batches += 1
@@ -117,7 +122,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
     return total_loss / n_batches
 
 
-def validate_epoch(model, dataloader, revin, args, device):
+def validate_epoch(model, dataloader, revin, args, device, use_amp):
     """验证一个epoch"""
     model.eval()
     total_loss = 0
@@ -131,7 +136,8 @@ def validate_epoch(model, dataloader, revin, args, device):
             if revin:
                 batch_x = revin(batch_x, 'norm')
             
-            pred, _ = model.forward_finetune(batch_x, args.target_points)
+            with amp.autocast(enabled=use_amp):
+                pred, _ = model.forward_finetune(batch_x, args.target_points)
             
             if revin:
                 pred = revin(pred, 'denorm')
@@ -143,7 +149,7 @@ def validate_epoch(model, dataloader, revin, args, device):
     return total_loss / n_batches
 
 
-def test_model(model, dataloader, revin, args, device):
+def test_model(model, dataloader, revin, args, device, use_amp):
     """测试模型"""
     model.eval()
     all_preds = []
@@ -157,7 +163,8 @@ def test_model(model, dataloader, revin, args, device):
             if revin:
                 batch_x = revin(batch_x, 'norm')
             
-            pred, _ = model.forward_finetune(batch_x, args.target_points)
+            with amp.autocast(enabled=use_amp):
+                pred, _ = model.forward_finetune(batch_x, args.target_points)
             
             if revin:
                 pred = revin(pred, 'denorm')
@@ -181,6 +188,8 @@ def main():
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('medium')
     
     # 创建保存目录
     save_dir = Path(args.save_path) / args.dset
@@ -197,6 +206,11 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f'可训练参数: {trainable_params:,} / {total_params:,}')
+    
+    # AMP
+    use_amp = bool(args.amp) and device.type == 'cuda'
+    scaler = amp.GradScaler(enabled=use_amp)
+    print(f'AMP enabled: {use_amp}')
     
     # 获取数据
     args.dset_finetune = args.dset
@@ -218,16 +232,18 @@ def main():
     # 训练
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
+    no_improve_count = 0  # 早停计数器
+    early_stop_patience = 5  # 连续10个epoch不下降就停止
     
-    print(f'\n开始微调，共 {args.n_epochs} 个 epoch')
+    print(f'\n开始微调，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
         # 训练
-        train_loss = train_epoch(model, dls.train, optimizer, scheduler, revin, args, device)
+        train_loss = train_epoch(model, dls.train, optimizer, scheduler, revin, args, device, scaler)
         
         # 验证
-        val_loss = validate_epoch(model, dls.valid, revin, args, device)
+        val_loss = validate_epoch(model, dls.valid, revin, args, device, use_amp)
         
         train_losses.append(train_loss)
         valid_losses.append(val_loss)
@@ -235,6 +251,7 @@ def main():
         # 打印进度
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            no_improve_count = 0  # 重置计数器
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'config': config,
@@ -246,8 +263,12 @@ def main():
             print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
                   f"Train Loss: {train_loss:.6f} | Valid Loss: {val_loss:.6f} | *Best*")
         else:
+            no_improve_count += 1
             print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
                   f"Train Loss: {train_loss:.6f} | Valid Loss: {val_loss:.6f}")
+            if no_improve_count >= early_stop_patience:
+                print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
+                break
     
     # 测试
     print('\n' + '=' * 80)
@@ -257,7 +278,7 @@ def main():
     best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device)
     model.load_state_dict(best_checkpoint['model_state_dict'])
     
-    mse, mae, preds, targets = test_model(model, dls.test, revin, args, device)
+    mse, mae, preds, targets = test_model(model, dls.test, revin, args, device, use_amp)
     print(f'测试结果: MSE = {mse:.6f}, MAE = {mae:.6f}')
     
     # 保存结果
@@ -267,9 +288,10 @@ def main():
     })
     results_df.to_csv(save_dir / f'{model_name}_results.csv', index=False)
     
-    # 保存训练历史
+    # 保存训练历史 (使用实际训练的epoch数)
+    actual_epochs = len(train_losses)
     history_df = pd.DataFrame({
-        'epoch': range(1, args.n_epochs + 1),
+        'epoch': range(1, actual_epochs + 1),
         'train_loss': train_losses,
         'valid_loss': valid_losses,
     })

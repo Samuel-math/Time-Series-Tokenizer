@@ -46,6 +46,9 @@ def parse_args():
     parser.add_argument('--d_ff', type=int, default=256, help='FFN维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
+    parser.add_argument('--codebook_ema', type=int, default=1, help='码本使用EMA更新(1启用)')
+    parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减系数')
+    parser.add_argument('--ema_eps', type=float, default=1e-5, help='EMA平滑项')
     
     # VQVAE Encoder/Decoder 参数 (轻量化)
     parser.add_argument('--num_hiddens', type=int, default=64, help='VQVAE隐藏层维度')
@@ -260,9 +263,10 @@ def main():
                 usage, _ = model.get_codebook_usage(sample_batch)
                 print(f"  -> Codebook usage: {usage*100:.1f}%")
     
-    # 保存训练历史
+    # 保存训练历史 (使用实际训练的epoch数)
+    actual_epochs = len(train_losses)
     history_df = pd.DataFrame({
-        'epoch': range(1, args.n_epochs + 1),
+        'epoch': range(1, actual_epochs + 1),
         'train_loss': train_losses,
         'valid_loss': valid_losses,
     })

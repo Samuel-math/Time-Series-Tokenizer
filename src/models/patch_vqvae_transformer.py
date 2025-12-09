@@ -61,6 +61,71 @@ class FlattenedVectorQuantizer(nn.Module):
         return self.embedding(indices)
 
 
+class FlattenedVectorQuantizerEMA(nn.Module):
+    """
+    使用 EMA 更新码本的 Vector Quantizer
+    码本维度 = embedding_dim * compressed_len
+    """
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.code_dim = code_dim
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.eps = eps
+        
+        # 码本权重与EMA状态
+        embed = torch.randn(codebook_size, code_dim)
+        embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        self.embedding = nn.Embedding(codebook_size, code_dim)
+        self.embedding.weight.data.copy_(embed)
+        self.embedding.weight.requires_grad = False
+        
+        self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))
+        self.register_buffer('ema_w', embed.clone())
+    
+    def forward(self, z_flat):
+        """
+        Args:
+            z_flat: [N, code_dim]
+        Returns:
+            loss, quantized, indices
+        """
+        distances = (
+            torch.sum(z_flat ** 2, dim=1, keepdim=True) +
+            torch.sum(self.embedding.weight ** 2, dim=1) -
+            2 * torch.matmul(z_flat, self.embedding.weight.t())
+        )
+        
+        indices = torch.argmin(distances, dim=1)
+        quantized = self.embedding(indices)
+        
+        if self.training:
+            with torch.no_grad():
+                one_hot = F.one_hot(indices, self.codebook_size).type(z_flat.dtype)
+                
+                # EMA 累积
+                self.ema_cluster_size.mul_(self.decay).add_(one_hot.sum(0), alpha=1 - self.decay)
+                dw = torch.matmul(one_hot.t(), z_flat)
+                self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+                
+                # 归一化避免小簇消失
+                n = self.ema_cluster_size.sum()
+                cluster_size = (self.ema_cluster_size + self.eps) / (n + self.codebook_size * self.eps) * n
+                embed_normalized = self.ema_w / cluster_size.unsqueeze(1)
+                self.embedding.weight.data.copy_(embed_normalized)
+        
+        # 只有commitment项
+        e_latent_loss = F.mse_loss(z_flat, quantized.detach())
+        loss = self.commitment_cost * e_latent_loss
+        
+        quantized = z_flat + (quantized - z_flat).detach()
+        return loss, quantized, indices
+    
+    def get_embedding(self, indices):
+        return self.embedding(indices)
+
+
 class CausalTransformer(nn.Module):
     """轻量级 Causal Transformer，输入维度为 code_dim"""
     def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512):
@@ -112,6 +177,9 @@ class PatchVQVAETransformer(nn.Module):
         self.d_ff = config.get('d_ff', 256)
         self.dropout = config.get('dropout', 0.1)
         self.commitment_cost = config.get('commitment_cost', 0.25)
+        self.use_codebook_ema = config.get('codebook_ema', False)
+        self.ema_decay = config.get('ema_decay', 0.99)
+        self.ema_eps = config.get('ema_eps', 1e-5)
         
         # VQVAE 配置
         self.num_hiddens = config.get('num_hiddens', 64)
@@ -140,9 +208,15 @@ class PatchVQVAETransformer(nn.Module):
         )
         
         # VQ (码本维度 = code_dim)
-        self.vq = FlattenedVectorQuantizer(
-            self.codebook_size, self.code_dim, self.commitment_cost
-        )
+        if self.use_codebook_ema:
+            self.vq = FlattenedVectorQuantizerEMA(
+                self.codebook_size, self.code_dim, self.commitment_cost,
+                decay=self.ema_decay, eps=self.ema_eps
+            )
+        else:
+            self.vq = FlattenedVectorQuantizer(
+                self.codebook_size, self.code_dim, self.commitment_cost
+            )
         
         # Transformer (输入维度 = code_dim，无需 token embedding)
         self.transformer = CausalTransformer(
@@ -333,6 +407,9 @@ def get_model_config(args):
         'd_ff': args.d_ff,
         'dropout': args.dropout,
         'commitment_cost': args.commitment_cost,
+        'codebook_ema': bool(args.codebook_ema),
+        'ema_decay': args.ema_decay,
+        'ema_eps': args.ema_eps,
         # VQVAE Encoder/Decoder 配置
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,

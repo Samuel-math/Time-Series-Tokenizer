@@ -6,8 +6,8 @@
 
 python patch_vqvae_pretrain.py \
     --dset ettm1 \
-    --context_points 512 \
-    --batch_size 128 \
+    --context_points 1024 \
+    --batch_size 64 \
     --patch_size 16 \
     --embedding_dim 64 \
     --compression_factor 4 \
