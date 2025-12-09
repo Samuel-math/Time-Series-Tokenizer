@@ -76,11 +76,13 @@ def load_pretrained_model(checkpoint_path, device):
 def freeze_parameters(model, freeze_encoder=False, freeze_transformer=False):
     """冻结模型参数"""
     if freeze_encoder:
-        for param in model.intra_patch_attn.parameters():
+        for param in model.encoder.parameters():
             param.requires_grad = False
         for param in model.vq.parameters():
             param.requires_grad = False
-        print('冻结了 Intra-Patch Attention 和 VQ 层')
+        for param in model.decoder.parameters():
+            param.requires_grad = False
+        print('冻结了 Encoder, VQ 和 Decoder 层')
     
     if freeze_transformer:
         for param in model.transformer.parameters():
