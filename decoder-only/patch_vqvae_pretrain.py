@@ -304,7 +304,7 @@ def main():
     print(f'\n开始预训练，共 {args.n_epochs} 个 epoch')
     print(f'注意: 只有当码本使用率 >= {args.min_codebook_usage*100:.0f}% 时才会保存模型')
     if args.auto_freeze:
-        print(f'自动冻结: 当 VQ/Recon loss 连续 {args.freeze_patience} 个 epoch 上升时冻结 Encoder/VQ/Decoder')
+        print(f'自动冻结: 当 val_loss 连续 {args.freeze_patience} 个 epoch 上升时冻结 Encoder/VQ/Decoder')
     if args.early_stop:
         print(f'早停机制: 冻结后 val_loss 连续 {args.early_stop_patience} 个 epoch 上升时停止训练')
     print('=' * 110)
@@ -341,18 +341,12 @@ def main():
               f"Val: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']*100:.1f}% | "
               f"CB: {codebook_usage*100:.1f}% {usage_status}")
         
-        # 自动冻结逻辑
+        # 自动冻结逻辑: 当 val_loss 连续上升时冻结
         if args.auto_freeze and not encoder_frozen:
-            recon_increasing = detect_increasing_trend(recon_losses, window=args.freeze_patience)
+            val_increasing = detect_increasing_trend(valid_losses, window=args.freeze_patience)
             
-            if recon_increasing:
-                trend_info = []
-                if vq_increasing:
-                    trend_info.append("VQ")
-                if recon_increasing:
-                    trend_info.append("Recon")
-                
-                print(f"\n>>> 检测到 {' 和 '.join(trend_info)} loss 连续 {args.freeze_patience} 个 epoch 上升")
+            if val_increasing:
+                print(f"\n>>> 检测到 val_loss 连续 {args.freeze_patience} 个 epoch 上升")
                 freeze_encoder_vq_decoder(model)
                 encoder_frozen = True
                 freeze_epoch = epoch + 1
