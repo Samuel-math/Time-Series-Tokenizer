@@ -225,8 +225,8 @@ def main():
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f}")
         
-        # 保存最佳模型
-        if val_metrics['loss'] < best_val_loss:
+        # 保存最佳模型 (前20个epoch不保存也不记录)
+        if epoch >= 20 and val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             checkpoint = {
                 'model_state_dict': model.state_dict(),
