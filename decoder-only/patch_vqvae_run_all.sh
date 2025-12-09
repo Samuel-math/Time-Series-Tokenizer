@@ -21,7 +21,7 @@ STRIDE=16         # stride < patch_size 有重叠
 
 # ========== 模型配置 ==========
 D_MODEL=128           # 每个 patch 编码后的维度
-CODEBOOK_SIZE=64
+CODEBOOK_SIZE=16
 COMMITMENT_COST=0.25
 
 # ========== Transformer 配置 ==========
