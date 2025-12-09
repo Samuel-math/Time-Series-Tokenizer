@@ -18,8 +18,8 @@ PRETRAIN_CONTEXT_POINTS=1024    # 预训练使用较大窗口
 FINETUNE_CONTEXT_POINTS=512     # 微调使用较小窗口
 
 # ========== Patch 配置 ==========
-PATCH_SIZE=16
-STRIDE=8              # stride < patch_size 有重叠
+PATCH_SIZE=32
+STRIDE=16         # stride < patch_size 有重叠
 
 # ========== 模型配置 ==========
 D_MODEL=128           # 每个 patch 编码后的维度
