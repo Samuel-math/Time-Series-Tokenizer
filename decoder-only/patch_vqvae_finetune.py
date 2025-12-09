@@ -38,8 +38,6 @@ def parse_args():
     
     # 预训练模型参数
     parser.add_argument('--pretrained_model', type=str, required=True, help='预训练模型路径')
-    parser.add_argument('--freeze_encoder', type=int, default=0, help='是否冻结Intra-Patch Attention')
-    parser.add_argument('--freeze_transformer', type=int, default=0, help='是否冻结Transformer')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -73,23 +71,31 @@ def load_pretrained_model(checkpoint_path, device):
     return model, config
 
 
-def freeze_parameters(model, freeze_encoder=False, freeze_transformer=False):
-    """冻结模型参数"""
-    if freeze_encoder:
-        for param in model.encoder.parameters():
-            param.requires_grad = False
-        for param in model.vq.parameters():
-            param.requires_grad = False
-        for param in model.decoder.parameters():
-            param.requires_grad = False
-        print('冻结了 Encoder, VQ 和 Decoder 层')
+def freeze_encoder_vq(model):
+    """冻结 Encoder 和 VQ，只训练 Transformer, Output Head 和 Decoder"""
+    # 冻结 Encoder
+    for param in model.encoder.parameters():
+        param.requires_grad = False
     
-    if freeze_transformer:
-        for param in model.transformer.parameters():
-            param.requires_grad = False
-        for param in model.output_head.parameters():
-            param.requires_grad = False
-        print('冻结了 Transformer 和 Output Head 层')
+    # 冻结 VQ
+    for param in model.vq.parameters():
+        param.requires_grad = False
+    
+    # Transformer, Output Head, Decoder 保持可训练
+    trainable_modules = ['transformer', 'output_head', 'decoder']
+    trainable_count = 0
+    frozen_count = 0
+    
+    for name, param in model.named_parameters():
+        if any(m in name for m in trainable_modules):
+            param.requires_grad = True
+            trainable_count += param.numel()
+        else:
+            frozen_count += param.numel()
+    
+    print(f'冻结 Encoder 和 VQ')
+    print(f'训练 Transformer, Output Head 和 Decoder')
+    print(f'可训练参数: {trainable_count:,}, 冻结参数: {frozen_count:,}')
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
@@ -116,8 +122,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         # MSE损失
         mse_loss = F.mse_loss(pred, batch_y)
         
-        # 总损失
-        loss = mse_loss + 0.1 * vq_loss
+        # 总损失 (不加 vq_loss，因为现在是端到端训练)
+        loss = mse_loss
         
         # 反向传播
         optimizer.zero_grad()
@@ -206,13 +212,8 @@ def main():
     model, config = load_pretrained_model(args.pretrained_model, device)
     model = model.to(device)
     
-    # 冻结参数（如果需要）
-    freeze_parameters(model, args.freeze_encoder, args.freeze_transformer)
-    
-    # 打印可训练参数
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f'可训练参数: {trainable_params:,} / {total_params:,}')
+    # 冻结 Encoder 和 VQ，只训练 Transformer 和 Decoder
+    freeze_encoder_vq(model)
     
     # 获取数据
     args.dset_finetune = args.dset

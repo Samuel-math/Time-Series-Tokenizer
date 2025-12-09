@@ -149,8 +149,6 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
         --target_points $TARGET_POINTS \
         --batch_size $BATCH_SIZE \
         --pretrained_model $PRETRAIN_MODEL \
-        --freeze_encoder 0 \
-        --freeze_transformer 0 \
         --n_epochs $FINETUNE_EPOCHS \
         --lr $LR \
         --weight_decay 1e-4 \

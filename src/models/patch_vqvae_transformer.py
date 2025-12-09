@@ -314,7 +314,7 @@ class PatchVQTransformer(nn.Module):
             dropout=self.dropout
         )
         
-        # 4. Output Head: 预测码本索引
+        # 4. Output Head: 预测码本索引 (预训练用)
         self.output_head = nn.Linear(self.d_model, self.codebook_size)
         
         # 5. Patch Decoder (线性投影)
@@ -466,7 +466,10 @@ class PatchVQTransformer(nn.Module):
     
     def forward_finetune(self, x, target_len):
         """
-        微调: 预测未来序列
+        微调: 使用 NTP 结构预测未来序列 (Soft Attention 替代 argmax)
+        
+        只训练 Transformer 和 Decoder，冻结 Encoder 和 VQ
+        使用 soft attention 代替 argmax，保持梯度流通
         
         Args:
             x: [B, T, C]
@@ -478,27 +481,35 @@ class PatchVQTransformer(nn.Module):
         B, T, C = x.shape
         num_pred_patches = (target_len + self.stride - 1) // self.stride
         
-        # 编码输入
+        # 编码输入 (Encoder 和 VQ 应该被冻结)
         indices, vq_loss, z_q = self.encode(x)
         
-        # 自回归预测
+        # 自回归预测 (使用 soft attention 替代 argmax)
         current_z = z_q
+        pred_codes = []
         
         for _ in range(num_pred_patches):
+            # Transformer 预测
             h = self.transformer(current_z)
             logits = self.output_head(h[:, -1, :])  # [B, codebook_size]
             
-            # 预测下一个 token
-            pred_idx = torch.argmax(logits, dim=-1)  # [B]
-            pred_code = self.vq.get_embedding(pred_idx)  # [B, d_model]
+            # Soft attention: 使用 softmax 加权求和 (可微分！)
+            # 使用温度参数控制软硬程度
+            temperature = 0.5  # 较低温度使分布更尖锐
+            probs = F.softmax(logits / temperature, dim=-1)  # [B, codebook_size]
             
+            # 加权求和得到 soft code
+            pred_code = torch.matmul(probs, self.vq.embedding.weight)  # [B, d_model]
+            pred_codes.append(pred_code)
+            
+            # 拼接继续预测
             current_z = torch.cat([current_z, pred_code.unsqueeze(1)], dim=1)
         
-        # 获取预测的码本向量
-        pred_z = current_z[:, -num_pred_patches:, :]
+        # Stack 预测的 codes: [B, num_pred_patches, d_model]
+        pred_z = torch.stack(pred_codes, dim=1)
         
-        # 解码
-        pred_patches = self.decode(pred_z)
+        # Decoder 解码
+        pred_patches = self.decode(pred_z)  # [B, num_pred_patches, patch_size, C]
         pred = self.patches_to_sequence(pred_patches, target_len=target_len)
         
         return pred, vq_loss
