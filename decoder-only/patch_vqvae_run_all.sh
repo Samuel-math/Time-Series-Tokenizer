@@ -21,7 +21,7 @@ STRIDE=16         # stride < patch_size 有重叠
 
 # ========== 模型配置 ==========
 D_MODEL=128           # 每个 patch 编码后的维度
-CODEBOOK_SIZE=64
+CODEBOOK_SIZE=256
 COMMITMENT_COST=0.25
 USE_EMA=1             # 使用 EMA 更新码本 (更稳定)
 
@@ -44,6 +44,10 @@ RECON_WEIGHT=0.1
 # ========== 自动冻结 ==========
 AUTO_FREEZE=1             # 启用自动冻结
 FREEZE_PATIENCE=5         # 连续多少个 epoch loss 上升后冻结
+
+# ========== 早停 ==========
+EARLY_STOP=1              # 冻结后启用早停
+EARLY_STOP_PATIENCE=10    # 冻结后 val_loss 连续上升多少个 epoch 后早停
 
 # ========== 保存条件 ==========
 MIN_CODEBOOK_USAGE=0.75   # 保存模型的最低码本使用率
@@ -82,6 +86,10 @@ echo ""
 echo "自动冻结:"
 echo "  - auto_freeze: $AUTO_FREEZE"
 echo "  - freeze_patience: $FREEZE_PATIENCE"
+echo ""
+echo "早停:"
+echo "  - early_stop: $EARLY_STOP"
+echo "  - early_stop_patience: $EARLY_STOP_PATIENCE"
 echo "=========================================="
 
 echo ""
@@ -111,6 +119,8 @@ python patch_vqvae_pretrain.py \
     --recon_weight $RECON_WEIGHT \
     --auto_freeze $AUTO_FREEZE \
     --freeze_patience $FREEZE_PATIENCE \
+    --early_stop $EARLY_STOP \
+    --early_stop_patience $EARLY_STOP_PATIENCE \
     --min_codebook_usage $MIN_CODEBOOK_USAGE \
     --save_path $PRETRAIN_SAVE_PATH \
     --model_id $MODEL_ID

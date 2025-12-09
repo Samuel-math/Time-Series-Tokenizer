@@ -69,6 +69,10 @@ def parse_args():
     parser.add_argument('--auto_freeze', type=int, default=1, help='是否启用自动冻结')
     parser.add_argument('--freeze_patience', type=int, default=5, help='连续多少个 epoch loss 上升后冻结')
     
+    # 早停参数
+    parser.add_argument('--early_stop', type=int, default=1, help='冻结后是否启用早停')
+    parser.add_argument('--early_stop_patience', type=int, default=10, help='冻结后 val_loss 连续上升多少个 epoch 后早停')
+    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -292,10 +296,17 @@ def main():
     encoder_frozen = False
     freeze_epoch = None
     
+    # 早停状态
+    frozen_val_losses = []  # 冻结后的 val_loss 历史
+    early_stopped = False
+    early_stop_epoch = None
+    
     print(f'\n开始预训练，共 {args.n_epochs} 个 epoch')
     print(f'注意: 只有当码本使用率 >= {args.min_codebook_usage*100:.0f}% 时才会保存模型')
     if args.auto_freeze:
         print(f'自动冻结: 当 VQ/Recon loss 连续 {args.freeze_patience} 个 epoch 上升时冻结 Encoder/VQ/Decoder')
+    if args.early_stop:
+        print(f'早停机制: 冻结后 val_loss 连续 {args.early_stop_patience} 个 epoch 上升时停止训练')
     print('=' * 110)
     
     for epoch in range(args.n_epochs):
@@ -332,10 +343,9 @@ def main():
         
         # 自动冻结逻辑
         if args.auto_freeze and not encoder_frozen:
-            vq_increasing = detect_increasing_trend(vq_losses, window=args.freeze_patience)
             recon_increasing = detect_increasing_trend(recon_losses, window=args.freeze_patience)
             
-            if vq_increasing or recon_increasing:
+            if recon_increasing:
                 trend_info = []
                 if vq_increasing:
                     trend_info.append("VQ")
@@ -376,13 +386,33 @@ def main():
         else:
             if val_metrics['loss'] < best_val_loss:
                 print(f"  -> Skip saving: codebook usage ({codebook_usage*100:.1f}%) < {args.min_codebook_usage*100:.0f}%")
+        
+        # 早停逻辑 (仅在冻结后生效)
+        if encoder_frozen and args.early_stop:
+            frozen_val_losses.append(val_metrics['loss'])
+            
+            # 检查是否连续上升
+            if len(frozen_val_losses) > args.early_stop_patience:
+                recent = frozen_val_losses[-(args.early_stop_patience + 1):]
+                increasing_count = sum(1 for i in range(len(recent) - 1) if recent[i + 1] > recent[i])
+                
+                if increasing_count >= args.early_stop_patience:
+                    early_stopped = True
+                    early_stop_epoch = epoch + 1
+                    print(f"\n>>> 早停触发: val_loss 连续 {args.early_stop_patience} 个 epoch 上升")
+                    print(f">>> 在 epoch {early_stop_epoch} 停止训练\n")
+                    break
     
     print('=' * 110)
-    print(f'预训练完成！')
+    if early_stopped:
+        print(f'预训练早停于 epoch {early_stop_epoch}！')
+    else:
+        print(f'预训练完成！')
     
-    # 保存训练历史
+    # 保存训练历史 (处理早停情况)
+    actual_epochs = len(train_losses)
     history_df = pd.DataFrame({
-        'epoch': range(1, args.n_epochs + 1),
+        'epoch': range(1, actual_epochs + 1),
         'train_loss': train_losses,
         'valid_loss': valid_losses,
         'vq_loss': vq_losses,
@@ -401,9 +431,12 @@ def main():
         print(f'模型保存至: {save_dir / model_name}.pth')
         if freeze_epoch:
             print(f'Encoder/VQ/Decoder 冻结于 epoch {freeze_epoch}')
+        if early_stopped:
+            print(f'早停于 epoch {early_stop_epoch}')
     else:
         print(f'警告: 码本使用率始终低于 {args.min_codebook_usage*100:.0f}%，未保存模型！')
-        print(f'最大码本使用率: {max(codebook_usages)*100:.1f}%')
+        if codebook_usages:
+            print(f'最大码本使用率: {max(codebook_usages)*100:.1f}%')
         print(f'建议: 增大 codebook_size 或调整训练参数')
 
 
