@@ -126,47 +126,52 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         return self.embedding(indices)
 
 
-class PatchSelfAttention(nn.Module):
+class PatchTCN(nn.Module):
     """
-    处理patch内时间信息的Self-Attention层（通道独立，矩阵运算优化）
-    对每个通道独立地在patch_size个时间步之间应用self-attention
+    使用TCN（Temporal Convolutional Network）处理patch内时间信息
     输入: [B*num_patches, patch_size, C]
     输出: [B*num_patches, patch_size, C]
-    每个通道独立做attention，捕捉通道内的时序信息
-    使用矩阵运算并行处理所有通道，提高效率
+    使用因果卷积和膨胀卷积捕捉时序依赖
     """
-    def __init__(self, patch_size, n_channels, dropout=0.1):
+    def __init__(self, patch_size, n_channels, dropout=0.1, num_layers=2, kernel_size=3, hidden_dim=None):
         super().__init__()
         self.patch_size = patch_size
         self.n_channels = n_channels
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+        self.hidden_dim = hidden_dim or n_channels
         
-        # 位置编码（patch内的时间位置）
-        self.pos_embedding = nn.Embedding(patch_size, 1)
+        # TCN层：多层因果卷积，每层dilation递增
+        self.tcn_layers = nn.ModuleList()
+        for i in range(num_layers):
+            dilation = 2 ** i  # dilation: 1, 2, 4, 8, ...
+            in_channels = n_channels if i == 0 else self.hidden_dim
+            out_channels = self.hidden_dim
+            
+            # 因果卷积：padding = (kernel_size - 1) * dilation
+            # 这样确保输出长度 = 输入长度（不考虑padding）
+            padding = (kernel_size - 1) * dilation
+            
+            tcn_block = nn.Sequential(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    padding=padding,
+                    bias=False
+                ),
+                nn.BatchNorm1d(out_channels),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            )
+            self.tcn_layers.append(tcn_block)
         
-        # 使用nn.MultiheadAttention实现单头注意力（embed_dim=1）
-        # 共享的attention模块，通过reshape并行处理所有通道
-        self.attention = nn.MultiheadAttention(
-            embed_dim=1,
-            num_heads=1,  # 单头注意力
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-        
-        # Layer norm（共享，通过reshape处理所有通道）
-        self.norm1 = nn.LayerNorm(1)
-        self.norm2 = nn.LayerNorm(1)
-        
-        # FFN（共享，通过reshape处理所有通道）
-        self.ffn = nn.Sequential(
-            nn.Linear(1, 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(2, 1),
-            nn.Dropout(dropout)
-        )
+        # 输出投影层：hidden_dim -> n_channels
+        if self.hidden_dim != n_channels:
+            self.output_proj = nn.Conv1d(self.hidden_dim, n_channels, kernel_size=1)
+        else:
+            self.output_proj = None
     
     def forward(self, x):
         """
@@ -180,34 +185,32 @@ class PatchSelfAttention(nn.Module):
         # 保存原始输入用于残差连接
         residual = x
         
-        # Reshape: [B, patch_size, C] -> [B*C, patch_size, 1]
-        # 将所有通道展开为batch维度，实现并行处理
-        x_reshaped = x.permute(0, 2, 1).contiguous()  # [B, C, patch_size]
-        x_reshaped = x_reshaped.reshape(B * C, T, 1)  # [B*C, patch_size, 1]
+        # Conv1d需要 [B, C, T] 格式
+        x = x.permute(0, 2, 1)  # [B, C, patch_size]
         
-        # 位置编码（对所有通道共享）
-        positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(B * C, -1)
-        pos_emb = self.pos_embedding(positions)  # [B*C, patch_size, 1]
+        # 通过TCN层
+        for i, tcn_layer in enumerate(self.tcn_layers):
+            x_out = tcn_layer(x)  # [B, hidden_dim, patch_size + padding]
+            
+            # 裁剪padding，保持输出长度与输入相同
+            # 由于使用了因果padding，输出长度可能略大于输入，需要裁剪
+            x_out = x_out[:, :, :T]  # [B, hidden_dim, patch_size]
+            
+            # 残差连接（如果维度匹配）
+            if x.shape[1] == x_out.shape[1] and x.shape[2] == x_out.shape[2]:
+                x = x + x_out
+            else:
+                x = x_out
         
-        # 添加位置编码
-        x_pos = x_reshaped + pos_emb
+        # 输出投影
+        if self.output_proj is not None:
+            x = self.output_proj(x)  # [B, C, patch_size]
         
-        # Self-attention（并行处理所有通道）
-        attn_out, _ = self.attention(x_pos, x_pos, x_pos)  # [B*C, patch_size, 1]
+        # 转回 [B, patch_size, C]
+        x = x.permute(0, 2, 1)  # [B, patch_size, C]
         
-        # 残差连接和Layer Norm
-        x_normed = self.norm1(x_reshaped + self.dropout(attn_out))  # [B*C, patch_size, 1]
-        
-        # FFN（带残差连接）
-        ffn_out = self.ffn(x_normed)  # [B*C, patch_size, 1]
-        x_out = self.norm2(x_normed + ffn_out)  # [B*C, patch_size, 1]
-        
-        # Reshape回原始形状: [B*C, patch_size, 1] -> [B, patch_size, C]
-        x_out = x_out.reshape(B, C, T)  # [B, C, patch_size]
-        x_out = x_out.permute(0, 2, 1).contiguous()  # [B, patch_size, C]
-        
-        # 整体残差连接：输入 + 处理后的输出
-        out = residual + x_out
+        # 整体残差连接
+        out = residual + x
         
         return out
 
@@ -275,14 +278,21 @@ class PatchVQVAETransformer(nn.Module):
         self.compressed_len = self.patch_size // self.compression_factor
         self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
         
-        # Patch内Self-Attention配置
+        # Patch内时序建模配置（使用TCN）
         self.use_patch_attention = config.get('use_patch_attention', False)
         n_channels = config.get('n_channels', None)  # 如果提供了通道数，立即初始化
+        
         if self.use_patch_attention and n_channels is not None:
-            self.patch_attention = PatchSelfAttention(
+            tcn_num_layers = config.get('tcn_num_layers', 2)
+            tcn_kernel_size = config.get('tcn_kernel_size', 3)
+            tcn_hidden_dim = config.get('tcn_hidden_dim', None)
+            self.patch_attention = PatchTCN(
                 patch_size=self.patch_size,
                 n_channels=n_channels,
-                dropout=self.dropout
+                dropout=self.dropout,
+                num_layers=tcn_num_layers,
+                kernel_size=tcn_kernel_size,
+                hidden_dim=tcn_hidden_dim
             )
         else:
             self.patch_attention = None
@@ -331,7 +341,7 @@ class PatchVQVAETransformer(nn.Module):
         
         Args:
             x: [B, T, C]
-            return_processed_patches: 是否返回经过self-attention处理后的patches
+            return_processed_patches: 是否返回经过TCN处理后的patches
         Returns:
             indices: [B, num_patches, C]
             vq_loss: scalar
@@ -345,7 +355,7 @@ class PatchVQVAETransformer(nn.Module):
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
         
-        # 应用Patch内Self-Attention（如果启用）
+        # 应用Patch内TCN（如果启用）
         if self.use_patch_attention:
             if self.patch_attention is None:
                 raise RuntimeError(
@@ -353,11 +363,11 @@ class PatchVQVAETransformer(nn.Module):
                     "或使用 load_vqvae_weights 方法时提供 n_channels 参数。"
                 )
             
-            # 对每个patch，在patch_size × C上做attention
+            # 对每个patch，在patch_size × C上应用TCN
             # [B, num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
             x_patches_flat = x_patches.reshape(B * num_patches, self.patch_size, C)
             
-            # 应用self-attention: [B*num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
+            # 应用TCN: [B*num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
             x_out = self.patch_attention(x_patches_flat)
             
             # 恢复形状: [B*num_patches, patch_size, C] -> [B, num_patches, patch_size, C]
@@ -425,7 +435,7 @@ class PatchVQVAETransformer(nn.Module):
         # 重构损失
         x_recon = self.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
         
-        # 如果使用了patch attention，计算处理后的patches与重构结果的损失
+        # 如果使用了patch TCN，计算处理后的patches与重构结果的损失
         if self.use_patch_attention and x_patches_processed is not None:
             # 将处理后的patches reshape为 [B, num_patches * patch_size, C]
             x_processed = x_patches_processed.reshape(B, num_patches * self.patch_size, C)
@@ -516,7 +526,7 @@ class PatchVQVAETransformer(nn.Module):
     
     def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True, n_channels=None):
         """
-        加载预训练的VQVAE权重（包括encoder、decoder、VQ和patch_attention）
+        加载预训练的VQVAE权重（包括encoder、decoder、VQ和patch_attention/TCN）
         
         Args:
             checkpoint_path: checkpoint路径
@@ -582,7 +592,7 @@ class PatchVQVAETransformer(nn.Module):
                         self.vq.embedding.weight.data.copy_(vq._embedding.weight.data)
                         loaded_components.append('VQ')
             
-            # 加载Patch Attention权重
+            # 加载Patch TCN权重
             patch_attention_dict = None
             if state_dict is not None:
                 patch_attention_dict = {k: v for k, v in state_dict.items() if 'patch_attention' in k}
@@ -593,14 +603,18 @@ class PatchVQVAETransformer(nn.Module):
                 # 如果patch_attention未初始化，尝试初始化
                 if self.patch_attention is None:
                     if n_channels is not None and self.use_patch_attention:
-                        self.patch_attention = PatchSelfAttention(
+                        # 尝试从权重推断TCN参数
+                        tcn_num_layers = len([k for k in patch_attention_dict.keys() if 'tcn_layers' in k and 'weight' in k]) // 2
+                        tcn_num_layers = max(1, tcn_num_layers) if tcn_num_layers > 0 else 2
+                        self.patch_attention = PatchTCN(
                             patch_size=self.patch_size,
                             n_channels=n_channels,
-                            dropout=self.dropout
+                            dropout=self.dropout,
+                            num_layers=tcn_num_layers
                         ).to(device)
                     else:
                         raise RuntimeError(
-                            "无法加载 Patch Attention 权重：patch_attention 未初始化且未提供 n_channels。"
+                            "无法加载 Patch TCN 权重：patch_attention 未初始化且未提供 n_channels。"
                             "请通过 config['n_channels'] 或 load_vqvae_weights 的 n_channels 参数提供通道数。"
                         )
                 
@@ -609,9 +623,9 @@ class PatchVQVAETransformer(nn.Module):
                     clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
                                  for k, v in patch_attention_dict.items()}
                     self.patch_attention.load_state_dict(clean_dict, strict=False)
-                    loaded_components.append('Patch Attention')
+                    loaded_components.append('Patch TCN')
                 except Exception as e:
-                    print(f"加载 Patch Attention 权重时出错: {e}")
+                    print(f"加载 Patch TCN 权重时出错: {e}")
             
             # 打印加载结果
             if loaded_components:
@@ -658,10 +672,12 @@ def get_model_config(args):
         'num_residual_hiddens': args.num_residual_hiddens,
     }
     
-    # Patch内Self-Attention配置
+    # Patch内时序建模配置（使用TCN）
     if hasattr(args, 'use_patch_attention'):
         config['use_patch_attention'] = bool(args.use_patch_attention)
-        config['patch_attention_heads'] = getattr(args, 'patch_attention_heads', 4)
+        config['tcn_num_layers'] = getattr(args, 'tcn_num_layers', 2)
+        config['tcn_kernel_size'] = getattr(args, 'tcn_kernel_size', 3)
+        config['tcn_hidden_dim'] = getattr(args, 'tcn_hidden_dim', None)
     
     # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:
     # config['n_channels'] = dls.vars

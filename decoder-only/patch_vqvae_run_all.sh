@@ -107,6 +107,8 @@ python patch_vqvae_pretrain.py \
     --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
     --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
     --use_patch_attention ${USE_PATCH_ATTENTION} \
+    --tcn_num_layers 2 \
+    --tcn_kernel_size 3 \
     --n_epochs ${PRETRAIN_EPOCHS} \
     --lr ${PRETRAIN_LR} \
     --weight_decay ${WEIGHT_DECAY} \
