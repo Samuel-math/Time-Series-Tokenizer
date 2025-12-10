@@ -133,6 +133,7 @@ class PatchSelfAttention(nn.Module):
     输入: [B*num_patches, patch_size, C]
     输出: [B*num_patches, patch_size, C]
     attention在patch_size个时间步之间进行，每个时间步有C个特征
+    使用nn.MultiheadAttention以获得更好的性能优化
     """
     def __init__(self, patch_size, n_channels, n_heads=4, dropout=0.1):
         super().__init__()
@@ -142,15 +143,17 @@ class PatchSelfAttention(nn.Module):
         # 位置编码（patch内的时间位置），维度为C
         self.pos_embedding = nn.Embedding(patch_size, n_channels)
         
-        # 单头注意力：Q, K, V投影层
-        self.q_proj = nn.Linear(n_channels, n_channels)
-        self.k_proj = nn.Linear(n_channels, n_channels)
-        self.v_proj = nn.Linear(n_channels, n_channels)
-        self.out_proj = nn.Linear(n_channels, n_channels)
+        # 使用nn.MultiheadAttention实现单头注意力（num_heads=1）
+        # PyTorch的优化实现通常比手动实现更快
+        self.attention = nn.MultiheadAttention(
+            embed_dim=n_channels,
+            num_heads=1,  # 单头注意力
+            dropout=dropout,
+            batch_first=True
+        )
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
-        self.attn_dropout = nn.Dropout(dropout)
         
         # Layer norm
         self.norm1 = nn.LayerNorm(n_channels)
@@ -176,20 +179,9 @@ class PatchSelfAttention(nn.Module):
         positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
         x_pos = x + self.pos_embedding(positions)
         
-        # 单头Self-attention
-        # Q, K, V: [B*num_patches, patch_size, C]
-        Q = self.q_proj(x_pos)
-        K = self.k_proj(x_pos)
-        V = self.v_proj(x_pos)
-        
-        # Attention scores: [B*num_patches, patch_size, patch_size]
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.n_channels ** 0.5)
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-        
-        # Attention output: [B*num_patches, patch_size, C]
-        attn_out = torch.matmul(attn_weights, V)
-        attn_out = self.out_proj(attn_out)
+        # 使用nn.MultiheadAttention（单头）
+        # 注意：nn.MultiheadAttention内部已经包含了Q、K、V投影和输出投影
+        attn_out, _ = self.attention(x_pos, x_pos, x_pos)
         
         # 残差连接和Layer Norm
         x = self.norm1(x + self.dropout(attn_out))
