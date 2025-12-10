@@ -61,7 +61,18 @@ def load_pretrained_model(checkpoint_path, device):
     
     config = checkpoint['config']
     model = PatchVQVAETransformer(config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # 检查checkpoint中是否有patch_attention权重
+    state_dict = checkpoint['model_state_dict']
+    has_patch_attention_in_checkpoint = any('patch_attention' in k for k in state_dict.keys())
+    
+    # 如果checkpoint中有patch_attention权重，但config中use_patch_attention=False，需要启用它
+    if has_patch_attention_in_checkpoint and not config.get('use_patch_attention', False):
+        print('检测到checkpoint中有patch_attention权重，启用use_patch_attention')
+        config['use_patch_attention'] = True
+        model.use_patch_attention = True
+    
+    model.load_state_dict(state_dict)
     
     print(f'预训练模型配置: {config}')
     print(f'预训练验证损失: {checkpoint.get("val_loss", "N/A")}')
@@ -220,6 +231,17 @@ def main():
             dummy_input = torch.zeros(1, model.patch_size * 2, dls.vars, device=device)
             with torch.no_grad():
                 _ = model.encode_to_indices(dummy_input)
+            
+            # 如果之前保存了patch_attention的权重（在load_vqvae_weights中），现在加载它
+            if hasattr(model, '_patch_attention_state_dict') and model._patch_attention_state_dict is not None:
+                try:
+                    clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
+                                 for k, v in model._patch_attention_state_dict.items()}
+                    model.patch_attention.load_state_dict(clean_dict, strict=False)
+                    print('延迟加载 Patch Attention 权重成功')
+                    delattr(model, '_patch_attention_state_dict')
+                except Exception as e:
+                    print(f'延迟加载 Patch Attention 权重时出错: {e}')
     
     # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
     freeze_encoder_vq(model)
