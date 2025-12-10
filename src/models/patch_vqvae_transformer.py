@@ -128,7 +128,7 @@ class FlattenedVectorQuantizerEMA(nn.Module):
 
 class PatchSelfAttention(nn.Module):
     """
-    处理patch内时间信息的Self-Attention层
+    处理patch内时间信息的Self-Attention层（单头注意力）
     对每个patch内的patch_size个时间步应用self-attention
     输入: [B*num_patches, patch_size, C]
     输出: [B*num_patches, patch_size, C]
@@ -138,23 +138,23 @@ class PatchSelfAttention(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.n_channels = n_channels
-        self.n_heads = n_heads
         
         # 位置编码（patch内的时间位置），维度为C
         self.pos_embedding = nn.Embedding(patch_size, n_channels)
         
-        # Self-attention层，embed_dim = C
-        self.attention = nn.MultiheadAttention(
-            embed_dim=n_channels,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        # 单头注意力：Q, K, V投影层
+        self.q_proj = nn.Linear(n_channels, n_channels)
+        self.k_proj = nn.Linear(n_channels, n_channels)
+        self.v_proj = nn.Linear(n_channels, n_channels)
+        self.out_proj = nn.Linear(n_channels, n_channels)
         
-        # Layer norm和dropout
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        
+        # Layer norm
         self.norm1 = nn.LayerNorm(n_channels)
         self.norm2 = nn.LayerNorm(n_channels)
-        self.dropout = nn.Dropout(dropout)
         
         # FFN
         self.ffn = nn.Sequential(
@@ -176,8 +176,22 @@ class PatchSelfAttention(nn.Module):
         positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
         x_pos = x + self.pos_embedding(positions)
         
-        # Self-attention (bidirectional, 因为patch内的时间信息应该可以互相看到)
-        attn_out, _ = self.attention(x_pos, x_pos, x_pos)
+        # 单头Self-attention
+        # Q, K, V: [B*num_patches, patch_size, C]
+        Q = self.q_proj(x_pos)
+        K = self.k_proj(x_pos)
+        V = self.v_proj(x_pos)
+        
+        # Attention scores: [B*num_patches, patch_size, patch_size]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.n_channels ** 0.5)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # Attention output: [B*num_patches, patch_size, C]
+        attn_out = torch.matmul(attn_weights, V)
+        attn_out = self.out_proj(attn_out)
+        
+        # 残差连接和Layer Norm
         x = self.norm1(x + self.dropout(attn_out))
         
         # FFN

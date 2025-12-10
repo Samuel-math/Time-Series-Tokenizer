@@ -46,7 +46,6 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
-    parser.add_argument('--compile', type=int, default=0, help='是否使用torch.compile加速(1启用，需要PyTorch 2.0+)')
     
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
@@ -234,17 +233,6 @@ def main():
     use_amp = bool(args.amp) and device.type == 'cuda'
     scaler = amp.GradScaler(enabled=use_amp)
     print(f'AMP enabled: {use_amp}')
-    
-    # torch.compile加速（如果启用且PyTorch版本支持）
-    use_compile = bool(args.compile) and device.type == 'cuda'
-    if use_compile:
-        try:
-            import torch._dynamo
-            model = torch.compile(model, mode='reduce-overhead')
-            print('✓ torch.compile enabled (mode=reduce-overhead)')
-        except Exception as e:
-            print(f'⚠ torch.compile不可用: {e}')
-            use_compile = False
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
