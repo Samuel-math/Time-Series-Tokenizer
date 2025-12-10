@@ -55,24 +55,34 @@ def parse_args():
 
 
 def load_pretrained_model(checkpoint_path, device):
-    """加载预训练模型"""
+    """加载预训练模型（兼容旧的patch_attention权重）"""
     print(f'加载预训练模型: {checkpoint_path}')
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     config = checkpoint['config']
     model = PatchVQVAETransformer(config)
     
-    # 检查checkpoint中是否有patch_attention权重
     state_dict = checkpoint['model_state_dict']
-    has_patch_attention_in_checkpoint = any('patch_attention' in k for k in state_dict.keys())
+    # 提取 patch_attention 权重（如果有）
+    patch_attention_dict = {k: v for k, v in state_dict.items() if 'patch_attention' in k}
+    has_patch_attention_in_ckpt = len(patch_attention_dict) > 0
     
-    # 如果checkpoint中有patch_attention权重，但config中use_patch_attention=False，需要启用它
-    if has_patch_attention_in_checkpoint and not config.get('use_patch_attention', False):
-        print('检测到checkpoint中有patch_attention权重，启用use_patch_attention')
+    # 如果checkpoint有patch_attention权重，但config未开启，则强制开启
+    if has_patch_attention_in_ckpt and not config.get('use_patch_attention', False):
+        print('检测到checkpoint中有patch_attention权重，强制启用use_patch_attention')
         config['use_patch_attention'] = True
         model.use_patch_attention = True
     
-    model.load_state_dict(state_dict)
+    # 先加载非patch_attention部分
+    non_patch_dict = {k: v for k, v in state_dict.items() if 'patch_attention' not in k}
+    missing, unexpected = model.load_state_dict(non_patch_dict, strict=False)
+    if missing:
+        print(f'加载非patch_attention权重时缺失键: {missing[:5]}... (共{len(missing)}个)')
+    if unexpected:
+        print(f'加载非patch_attention权重时意外键: {unexpected[:5]}... (共{len(unexpected)}个)')
+    
+    # 保存patch_attention权重以便初始化后再加载
+    model._patch_attention_state_dict = patch_attention_dict if patch_attention_dict else None
     
     print(f'预训练模型配置: {config}')
     print(f'预训练验证损失: {checkpoint.get("val_loss", "N/A")}')
@@ -80,7 +90,7 @@ def load_pretrained_model(checkpoint_path, device):
     return model, config
 
 
-def freeze_encoder_vq(model):
+def freeze_encoder_vq(model, freeze_patch_attention=True):
     """冻结encoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
     # 冻结 encoder
     for param in model.encoder.parameters():
@@ -89,7 +99,7 @@ def freeze_encoder_vq(model):
     for param in model.vq.parameters():
         param.requires_grad = False
     # 冻结 patch attention（如果存在）
-    if hasattr(model, 'patch_attention') and model.patch_attention is not None:
+    if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:
         for param in model.patch_attention.parameters():
             param.requires_grad = False
         print('冻结了 Encoder、VQ 层和 Patch Attention（将patch映射成码本前的所有参数）')
@@ -225,6 +235,7 @@ def main():
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
     # 如果模型使用了patch_attention但还未初始化，先初始化它（通过一个dummy forward）
+    patch_attention_loaded = False
     if hasattr(model, 'use_patch_attention') and model.use_patch_attention:
         if model.patch_attention is None:
             # 创建一个dummy输入来触发patch_attention的初始化
@@ -232,7 +243,7 @@ def main():
             with torch.no_grad():
                 _ = model.encode_to_indices(dummy_input)
             
-            # 如果之前保存了patch_attention的权重（在load_vqvae_weights中），现在加载它
+            # 如果之前保存了patch_attention的权重（在load_pretrained_model中），现在加载它
             if hasattr(model, '_patch_attention_state_dict') and model._patch_attention_state_dict is not None:
                 try:
                     clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
@@ -240,11 +251,14 @@ def main():
                     model.patch_attention.load_state_dict(clean_dict, strict=False)
                     print('延迟加载 Patch Attention 权重成功')
                     delattr(model, '_patch_attention_state_dict')
+                    patch_attention_loaded = True
                 except Exception as e:
                     print(f'延迟加载 Patch Attention 权重时出错: {e}')
-    
+                    patch_attention_loaded = False
+        else:
+            patch_attention_loaded = True
     # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
-    freeze_encoder_vq(model)
+    freeze_encoder_vq(model, freeze_patch_attention=patch_attention_loaded)
     
     # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -31,6 +31,7 @@ FINETUNE_LR=1e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 REVIN=1
 WEIGHT_DECAY=1e-4
+USE_PATCH_ATTENTION=1  # 启用patch内attention
 
 # =====================================================
 # 网格搜索参数范围
@@ -166,6 +167,7 @@ for PATCH_SIZE in ${PATCH_SIZES[@]}; do
                                 --num_hiddens ${NUM_HIDDENS} \
                                 --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
                                 --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
+                                --use_patch_attention ${USE_PATCH_ATTENTION} \
                                 --n_epochs ${PRETRAIN_EPOCHS} \
                                 --lr ${PRETRAIN_LR} \
                                 --weight_decay ${WEIGHT_DECAY} \
