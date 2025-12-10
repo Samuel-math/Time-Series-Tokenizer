@@ -347,6 +347,21 @@ class PatchVQVAETransformer(nn.Module):
                     n_heads=self.patch_attention_heads,
                     dropout=self.dropout
                 ).to(x_patches.device)
+                
+                # 如果之前保存了patch_attention的权重，现在加载
+                if hasattr(self, '_patch_attention_state_dict') and self._patch_attention_state_dict is not None:
+                    try:
+                        # 移除键名前缀
+                        clean_dict = {}
+                        for k, v in self._patch_attention_state_dict.items():
+                            new_key = k.replace('model.patch_attention.', '').replace('patch_attention.', '')
+                            clean_dict[new_key] = v
+                        self.patch_attention.load_state_dict(clean_dict, strict=False)
+                        print("延迟加载 Patch Attention 权重成功")
+                        # 清理临时保存的权重
+                        delattr(self, '_patch_attention_state_dict')
+                    except Exception as e:
+                        print(f"延迟加载 Patch Attention 权重时出错: {e}")
             
             # 应用self-attention: [B*num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
             x_out = self.patch_attention(x_patches_flat)
@@ -507,7 +522,7 @@ class PatchVQVAETransformer(nn.Module):
     
     def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True):
         """
-        加载预训练的VQVAE权重
+        加载预训练的VQVAE权重（包括encoder、decoder、VQ和patch_attention）
         
         Args:
             checkpoint_path: checkpoint路径
@@ -522,83 +537,84 @@ class PatchVQVAETransformer(nn.Module):
         try:
             checkpoint = torch.load(checkpoint_path, map_location=device)
             
-            # 处理checkpoint格式：可能是模型对象或字典
+            # 提取state_dict
             if isinstance(checkpoint, dict):
-                # 字典格式：尝试从model_state_dict加载
-                if 'model_state_dict' in checkpoint:
-                    state_dict = checkpoint['model_state_dict']
-                else:
-                    state_dict = checkpoint
+                state_dict = checkpoint.get('model_state_dict', checkpoint)
+            elif hasattr(checkpoint, 'state_dict'):
+                state_dict = checkpoint.state_dict()
             else:
-                # 模型对象格式
-                if hasattr(checkpoint, 'state_dict'):
-                    state_dict = checkpoint.state_dict()
-                else:
-                    state_dict = None
+                state_dict = None
             
-            # 加载encoder
-            encoder_loaded = False
-            if state_dict is not None:
-                encoder_dict = {k.replace('encoder.', ''): v for k, v in state_dict.items() 
-                               if k.startswith('encoder.')}
-                if encoder_dict:
-                    self.encoder.load_state_dict(encoder_dict, strict=False)
-                    encoder_loaded = True
-                    print("✓ 加载 Encoder 权重成功")
-            elif hasattr(checkpoint, 'encoder'):
-                self.encoder.load_state_dict(checkpoint.encoder.state_dict(), strict=False)
-                encoder_loaded = True
-                print("✓ 加载 Encoder 权重成功")
+            loaded_components = []
             
-            # 加载decoder
-            decoder_loaded = False
-            if state_dict is not None:
-                decoder_dict = {k.replace('decoder.', ''): v for k, v in state_dict.items() 
-                               if k.startswith('decoder.')}
-                if decoder_dict:
-                    self.decoder.load_state_dict(decoder_dict, strict=False)
-                    decoder_loaded = True
-                    print("✓ 加载 Decoder 权重成功")
-            elif hasattr(checkpoint, 'decoder'):
-                self.decoder.load_state_dict(checkpoint.decoder.state_dict(), strict=False)
-                decoder_loaded = True
-                print("✓ 加载 Decoder 权重成功")
+            # 辅助函数：加载模块权重
+            def load_module_weights(module, prefix, module_name):
+                if state_dict is not None:
+                    module_dict = {k.replace(f'{prefix}.', ''): v for k, v in state_dict.items() 
+                                  if k.startswith(f'{prefix}.')}
+                    if module_dict:
+                        module.load_state_dict(module_dict, strict=False)
+                        return True
+                elif hasattr(checkpoint, prefix):
+                    module.load_state_dict(getattr(checkpoint, prefix).state_dict(), strict=False)
+                    return True
+                return False
+            
+            # 加载encoder和decoder
+            if load_module_weights(self.encoder, 'encoder', 'Encoder'):
+                loaded_components.append('Encoder')
+            if load_module_weights(self.decoder, 'decoder', 'Decoder'):
+                loaded_components.append('Decoder')
             
             # 加载VQ层
             if load_vq:
-                vq_loaded = False
                 if state_dict is not None:
-                    # 尝试加载vq.embedding或vq._embedding
                     vq_keys = [k for k in state_dict.keys() if 'vq' in k.lower() and 'embedding' in k.lower()]
-                    if vq_keys:
-                        # 找到embedding权重
-                        for key in vq_keys:
-                            if 'weight' in key or 'embedding' in key:
-                                try:
-                                    vq_weight = state_dict[key]
-                                    if hasattr(self.vq, 'embedding'):
-                                        self.vq.embedding.weight.data.copy_(vq_weight)
-                                        vq_loaded = True
-                                        print("✓ 加载 VQ 码本权重成功")
-                                        break
-                                except Exception as e:
-                                    continue
+                    for key in vq_keys:
+                        if ('weight' in key or 'embedding' in key) and hasattr(self.vq, 'embedding'):
+                            try:
+                                self.vq.embedding.weight.data.copy_(state_dict[key])
+                                loaded_components.append('VQ')
+                                break
+                            except:
+                                continue
                 elif hasattr(checkpoint, 'vq'):
-                    try:
-                        if hasattr(checkpoint.vq, 'embedding'):
-                            self.vq.embedding.weight.data.copy_(checkpoint.vq.embedding.weight.data)
-                            vq_loaded = True
-                            print("✓ 加载 VQ 码本权重成功")
-                        elif hasattr(checkpoint.vq, '_embedding'):
-                            self.vq.embedding.weight.data.copy_(checkpoint.vq._embedding.weight.data)
-                            vq_loaded = True
-                            print("✓ 加载 VQ 码本权重成功")
-                    except Exception as e:
-                        print(f"⚠ 加载 VQ 权重时出错: {e}")
+                    vq = checkpoint.vq
+                    if hasattr(vq, 'embedding'):
+                        self.vq.embedding.weight.data.copy_(vq.embedding.weight.data)
+                        loaded_components.append('VQ')
+                    elif hasattr(vq, '_embedding'):
+                        self.vq.embedding.weight.data.copy_(vq._embedding.weight.data)
+                        loaded_components.append('VQ')
             
-            return encoder_loaded or decoder_loaded
+            # 加载Patch Attention权重
+            patch_attention_dict = None
+            if state_dict is not None:
+                patch_attention_dict = {k: v for k, v in state_dict.items() if 'patch_attention' in k}
+            elif hasattr(checkpoint, 'patch_attention'):
+                patch_attention_dict = checkpoint.patch_attention.state_dict()
+            
+            if patch_attention_dict:
+                if self.patch_attention is not None:
+                    try:
+                        clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
+                                     for k, v in patch_attention_dict.items()}
+                        self.patch_attention.load_state_dict(clean_dict, strict=False)
+                        loaded_components.append('Patch Attention')
+                    except Exception as e:
+                        print(f"加载 Patch Attention 权重时出错: {e}")
+                else:
+                    self._patch_attention_state_dict = patch_attention_dict
+                    print("Patch Attention 尚未初始化，权重已保存，将在首次forward时加载")
+            
+            # 打印加载结果
+            if loaded_components:
+                print(f"成功加载: {', '.join(loaded_components)}")
+            
+            return len(loaded_components) > 0
+            
         except Exception as e:
-            print(f"✗ 加载权重失败: {e}")
+            print(f"加载权重失败: {e}")
             import traceback
             traceback.print_exc()
             return False
