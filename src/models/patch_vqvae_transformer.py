@@ -294,16 +294,18 @@ class PatchVQVAETransformer(nn.Module):
         # 输出头: code_dim -> codebook_size (预测码本索引)
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
     
-    def encode_to_indices(self, x):
+    def encode_to_indices(self, x, return_processed_patches=False):
         """
         编码为码本索引和量化向量
         
         Args:
             x: [B, T, C]
+            return_processed_patches: 是否返回经过self-attention处理后的patches
         Returns:
             indices: [B, num_patches, C]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
+            x_patches_processed: [B, num_patches, patch_size, C] (如果return_processed_patches=True)
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
@@ -334,6 +336,9 @@ class PatchVQVAETransformer(nn.Module):
             # 恢复形状: [B*num_patches, patch_size, C] -> [B, num_patches, patch_size, C]
             x_patches = x_out.reshape(B, num_patches, self.patch_size, C)
         
+        # 保存处理后的patches（用于重构损失）
+        x_patches_processed = x_patches if return_processed_patches else None
+        
         # 重组为 [B*num_patches*C, patch_size] 用于编码
         x = x_patches.permute(0, 1, 3, 2).reshape(-1, self.patch_size)  # [B*num_patches*C, patch_size]
         
@@ -348,6 +353,8 @@ class PatchVQVAETransformer(nn.Module):
         indices = indices.reshape(B, num_patches, C)
         z_q = z_q_flat.reshape(B, num_patches, C, self.code_dim)
         
+        if return_processed_patches:
+            return indices, vq_loss, z_q, x_patches_processed
         return indices, vq_loss, z_q
     
     def decode_from_codes(self, z_q):
@@ -380,13 +387,25 @@ class PatchVQVAETransformer(nn.Module):
         """
         B, T, C = x.shape
         
-        # 编码
-        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
+        # 编码（返回处理后的patches用于重构损失）
+        if self.use_patch_attention:
+            indices, vq_loss, z_q, x_patches_processed = self.encode_to_indices(x, return_processed_patches=True)
+        else:
+            indices, vq_loss, z_q = self.encode_to_indices(x, return_processed_patches=False)
+            x_patches_processed = None
         num_patches = indices.shape[1]
         
         # 重构损失
-        x_recon = self.decode_from_codes(z_q)
-        recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
+        x_recon = self.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
+        
+        # 如果使用了patch attention，计算处理后的patches与重构结果的损失
+        if self.use_patch_attention and x_patches_processed is not None:
+            # 将处理后的patches reshape为 [B, num_patches * patch_size, C]
+            x_processed = x_patches_processed.reshape(B, num_patches * self.patch_size, C)
+            recon_loss = F.mse_loss(x_recon, x_processed[:, :x_recon.shape[1], :])
+        else:
+            # 否则使用原始输入
+            recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
         # Channel-independent Transformer
         # 直接使用 z_q 作为输入，不需要 token embedding
@@ -456,7 +475,11 @@ class PatchVQVAETransformer(nn.Module):
     
     @torch.no_grad()
     def get_codebook_usage(self, x):
-        indices, _, _ = self.encode_to_indices(x)
+        result = self.encode_to_indices(x, return_processed_patches=False)
+        if isinstance(result, tuple) and len(result) == 4:
+            indices, _, _, _ = result
+        else:
+            indices, _, _ = result
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
