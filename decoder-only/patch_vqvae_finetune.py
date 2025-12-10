@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
+    parser.add_argument('--compile', type=int, default=0, help='是否使用torch.compile加速(1启用，需要PyTorch 2.0+)')
     
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
@@ -70,14 +71,20 @@ def load_pretrained_model(checkpoint_path, device):
 
 
 def freeze_encoder_vq(model):
-    """冻结encoder和VQ层（将patch映射成码本前的所有参数）"""
+    """冻结encoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
     # 冻结 encoder
     for param in model.encoder.parameters():
         param.requires_grad = False
     # 冻结 VQ 层
     for param in model.vq.parameters():
         param.requires_grad = False
-    print('冻结了 Encoder 和 VQ 层（将patch映射成码本前的所有参数）')
+    # 冻结 patch attention（如果存在）
+    if hasattr(model, 'patch_attention') and model.patch_attention is not None:
+        for param in model.patch_attention.parameters():
+            param.requires_grad = False
+        print('冻结了 Encoder、VQ 层和 Patch Attention（将patch映射成码本前的所有参数）')
+    else:
+        print('冻结了 Encoder 和 VQ 层（将patch映射成码本前的所有参数）')
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, scaler):
@@ -106,11 +113,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, sc
             # 只使用 MSE 损失
             loss = F.mse_loss(pred, batch_y)
         
-        # 反向传播
+        # 反向传播（只对可训练参数）
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # 只对可训练参数进行梯度裁剪
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         
@@ -199,7 +208,21 @@ def main():
     model, config = load_pretrained_model(args.pretrained_model, device)
     model = model.to(device)
     
-    # 冻结 encoder 和 VQ 层（将patch映射成码本前的所有参数）
+    # 获取数据（需要先获取数据以知道通道数，用于初始化patch_attention）
+    args.dset_finetune = args.dset
+    dls = get_dls(args)
+    print(f'Number of channels: {dls.vars}')
+    print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
+    
+    # 如果模型使用了patch_attention但还未初始化，先初始化它（通过一个dummy forward）
+    if hasattr(model, 'use_patch_attention') and model.use_patch_attention:
+        if model.patch_attention is None:
+            # 创建一个dummy输入来触发patch_attention的初始化
+            dummy_input = torch.zeros(1, model.patch_size * 2, dls.vars, device=device)
+            with torch.no_grad():
+                _ = model.encode_to_indices(dummy_input)
+    
+    # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
     freeze_encoder_vq(model)
     
     # 打印可训练参数
@@ -212,11 +235,16 @@ def main():
     scaler = amp.GradScaler(enabled=use_amp)
     print(f'AMP enabled: {use_amp}')
     
-    # 获取数据
-    args.dset_finetune = args.dset
-    dls = get_dls(args)
-    print(f'Number of channels: {dls.vars}')
-    print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
+    # torch.compile加速（如果启用且PyTorch版本支持）
+    use_compile = bool(args.compile) and device.type == 'cuda'
+    if use_compile:
+        try:
+            import torch._dynamo
+            model = torch.compile(model, mode='reduce-overhead')
+            print('✓ torch.compile enabled (mode=reduce-overhead)')
+        except Exception as e:
+            print(f'⚠ torch.compile不可用: {e}')
+            use_compile = False
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None

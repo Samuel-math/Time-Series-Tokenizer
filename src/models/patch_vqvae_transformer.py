@@ -423,43 +423,56 @@ class PatchVQVAETransformer(nn.Module):
     
     def forward_finetune(self, x, target_len):
         """
-        微调: 预测未来序列
+        微调: 预测未来序列（优化版）
         
         1. 编码输入为量化向量
         2. Transformer 自回归预测未来 patch 的码本索引
         3. 从码本获取向量并解码
+        
+        优化：
+        - 批量处理所有channels，而不是逐个处理
+        - 只计算最后一个位置的transformer输出
         """
         B, T, C = x.shape
         num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
         
         # 编码输入
         indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
+        num_input_patches = z_q.shape[1]
         
-        # 自回归预测
+        # 自回归预测（优化版：批量处理channels）
         current_z = z_q  # [B, num_patches, C, code_dim]
         pred_codes_list = []
         
         for _ in range(num_pred_patches):
-            next_codes = []
-            for c in range(C):
-                z_c = current_z[:, :, c, :]  # [B, seq_len, code_dim]
-                h = self.transformer(z_c)  # [B, seq_len, code_dim]
-                logits = self.output_head(h[:, -1, :])  # [B, codebook_size]
-                
-                # 使用 softmax + 加权求和 替代 argmax，保持可微分
-                weights = F.softmax(logits, dim=-1)  # [B, codebook_size]
-                codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-                pred_code = torch.matmul(weights, codebook)  # [B, code_dim]
-                next_codes.append(pred_code)
+            # 批量处理所有channels: [B, seq_len, C, code_dim] -> [B*C, seq_len, code_dim]
+            B_p, seq_len, C_p, code_dim = current_z.shape
+            z_flat = current_z.permute(0, 2, 1, 3).reshape(B_p * C_p, seq_len, code_dim)
             
-            next_codes = torch.stack(next_codes, dim=1)  # [B, C, code_dim]
+            # Transformer处理: [B*C, seq_len, code_dim]
+            h = self.transformer(z_flat)  # [B*C, seq_len, code_dim]
+            
+            # 只取最后一个位置: [B*C, code_dim]
+            h_last = h[:, -1, :]  # [B*C, code_dim]
+            
+            # 输出头: [B*C, codebook_size]
+            logits = self.output_head(h_last)  # [B*C, codebook_size]
+            
+            # 使用 softmax + 加权求和 替代 argmax，保持可微分
+            weights = F.softmax(logits, dim=-1)  # [B*C, codebook_size]
+            codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
+            pred_code_flat = torch.matmul(weights, codebook)  # [B*C, code_dim]
+            
+            # 恢复形状: [B*C, code_dim] -> [B, C, code_dim]
+            next_codes = pred_code_flat.reshape(B_p, C_p, code_dim)
+            
             pred_codes_list.append(next_codes)
             
-            # 更新序列
+            # 更新序列: [B, C, code_dim] -> [B, 1, C, code_dim]
             current_z = torch.cat([current_z, next_codes.unsqueeze(1)], dim=1)
         
-        # 获取预测的码本向量
-        pred_codes = torch.stack(pred_codes_list, dim=1)  # [B, num_pred_patches, C, code_dim]
+        # 获取预测的码本向量: [B, num_pred_patches, C, code_dim]
+        pred_codes = torch.stack(pred_codes_list, dim=1)
         
         # 解码
         pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
