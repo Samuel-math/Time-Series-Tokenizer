@@ -135,7 +135,7 @@ class PatchSelfAttention(nn.Module):
     attention在patch_size个时间步之间进行，每个时间步有C个特征
     使用nn.MultiheadAttention以获得更好的性能优化
     """
-    def __init__(self, patch_size, n_channels, n_heads=4, dropout=0.1):
+    def __init__(self, patch_size, n_channels, dropout=0.1):
         super().__init__()
         self.patch_size = patch_size
         self.n_channels = n_channels
@@ -270,7 +270,6 @@ class PatchVQVAETransformer(nn.Module):
         
         # Patch内Self-Attention配置
         self.use_patch_attention = config.get('use_patch_attention', False)
-        self.patch_attention_heads = config.get('patch_attention_heads', 4)
         self.patch_attention_n_channels = None  # 延迟初始化，在第一次forward时确定
         self.patch_attention = None
         
@@ -344,7 +343,6 @@ class PatchVQVAETransformer(nn.Module):
                 self.patch_attention = PatchSelfAttention(
                     patch_size=self.patch_size,
                     n_channels=C,
-                    n_heads=self.patch_attention_heads,
                     dropout=self.dropout
                 ).to(x_patches.device)
                 
