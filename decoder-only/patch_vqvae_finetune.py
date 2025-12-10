@@ -264,7 +264,7 @@ def main():
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
     no_improve_count = 0  # 早停计数器
-    early_stop_patience = 5  # 连续10个epoch不下降就停止
+    early_stop_patience = 10  # 连续10个epoch不下降就停止
     
     print(f'\n开始微调，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
     print('=' * 80)

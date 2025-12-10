@@ -128,25 +128,25 @@ class FlattenedVectorQuantizerEMA(nn.Module):
 
 class PatchSelfAttention(nn.Module):
     """
-    处理patch内时间信息的Self-Attention层（单头注意力）
-    对每个patch内的patch_size个时间步应用self-attention
+    处理patch内时间信息的Self-Attention层（通道独立，矩阵运算优化）
+    对每个通道独立地在patch_size个时间步之间应用self-attention
     输入: [B*num_patches, patch_size, C]
     输出: [B*num_patches, patch_size, C]
-    attention在patch_size个时间步之间进行，每个时间步有C个特征
-    使用nn.MultiheadAttention以获得更好的性能优化
+    每个通道独立做attention，捕捉通道内的时序信息
+    使用矩阵运算并行处理所有通道，提高效率
     """
     def __init__(self, patch_size, n_channels, dropout=0.1):
         super().__init__()
         self.patch_size = patch_size
         self.n_channels = n_channels
         
-        # 位置编码（patch内的时间位置），维度为C
-        self.pos_embedding = nn.Embedding(patch_size, n_channels)
+        # 位置编码（patch内的时间位置）
+        self.pos_embedding = nn.Embedding(patch_size, 1)
         
-        # 使用nn.MultiheadAttention实现单头注意力（num_heads=1）
-        # PyTorch的优化实现通常比手动实现更快
+        # 使用nn.MultiheadAttention实现单头注意力（embed_dim=1）
+        # 共享的attention模块，通过reshape并行处理所有通道
         self.attention = nn.MultiheadAttention(
-            embed_dim=n_channels,
+            embed_dim=1,
             num_heads=1,  # 单头注意力
             dropout=dropout,
             batch_first=True
@@ -155,16 +155,16 @@ class PatchSelfAttention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        # Layer norm
-        self.norm1 = nn.LayerNorm(n_channels)
-        self.norm2 = nn.LayerNorm(n_channels)
+        # Layer norm（共享，通过reshape处理所有通道）
+        self.norm1 = nn.LayerNorm(1)
+        self.norm2 = nn.LayerNorm(1)
         
-        # FFN
+        # FFN（共享，通过reshape处理所有通道）
         self.ffn = nn.Sequential(
-            nn.Linear(n_channels, n_channels * 2),
+            nn.Linear(1, 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(n_channels * 2, n_channels),
+            nn.Linear(2, 1),
             nn.Dropout(dropout)
         )
     
@@ -177,25 +177,39 @@ class PatchSelfAttention(nn.Module):
         """
         B, T, C = x.shape  # B = B*num_patches, T = patch_size
         
-        # 位置编码
-        positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(B, -1)
-        x_pos = x + self.pos_embedding(positions)
-    
+        # 保存原始输入用于残差连接
+        residual = x
         
-        # 使用nn.MultiheadAttention（单头）
-        # query: 可学习的query
-        # key, value: 来自输入x_pos
-        # 注意：nn.MultiheadAttention内部已经包含了Q、K、V投影和输出投影
-        attn_out, _ = self.attention(x_pos, x_pos, x_pos)
+        # Reshape: [B, patch_size, C] -> [B*C, patch_size, 1]
+        # 将所有通道展开为batch维度，实现并行处理
+        x_reshaped = x.permute(0, 2, 1).contiguous()  # [B, C, patch_size]
+        x_reshaped = x_reshaped.reshape(B * C, T, 1)  # [B*C, patch_size, 1]
+        
+        # 位置编码（对所有通道共享）
+        positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(B * C, -1)
+        pos_emb = self.pos_embedding(positions)  # [B*C, patch_size, 1]
+        
+        # 添加位置编码
+        x_pos = x_reshaped + pos_emb
+        
+        # Self-attention（并行处理所有通道）
+        attn_out, _ = self.attention(x_pos, x_pos, x_pos)  # [B*C, patch_size, 1]
         
         # 残差连接和Layer Norm
-        x = self.norm1(x + self.dropout(attn_out))
+        x_normed = self.norm1(x_reshaped + self.dropout(attn_out))  # [B*C, patch_size, 1]
         
-        # FFN
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
+        # FFN（带残差连接）
+        ffn_out = self.ffn(x_normed)  # [B*C, patch_size, 1]
+        x_out = self.norm2(x_normed + ffn_out)  # [B*C, patch_size, 1]
         
-        return x
+        # Reshape回原始形状: [B*C, patch_size, 1] -> [B, patch_size, C]
+        x_out = x_out.reshape(B, C, T)  # [B, C, patch_size]
+        x_out = x_out.permute(0, 2, 1).contiguous()  # [B, patch_size, C]
+        
+        # 整体残差连接：输入 + 处理后的输出
+        out = residual + x_out
+        
+        return out
 
 
 class CausalTransformer(nn.Module):
