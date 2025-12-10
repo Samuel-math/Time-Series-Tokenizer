@@ -55,6 +55,12 @@ def parse_args():
     parser.add_argument('--num_residual_layers', type=int, default=2, help='残差层数')
     parser.add_argument('--num_residual_hiddens', type=int, default=32, help='残差隐藏层维度')
     parser.add_argument('--vqvae_checkpoint', type=str, default=None, help='预训练VQVAE模型路径(可选)')
+    parser.add_argument('--freeze_encoder_vq', type=int, default=0, help='是否冻结encoder和VQ层(1冻结)')
+    parser.add_argument('--load_vq_weights', type=int, default=1, help='是否加载VQ层权重(1加载)')
+    
+    # Patch内Self-Attention参数
+    parser.add_argument('--use_patch_attention', type=int, default=0, help='是否使用patch内self-attention(1启用)')
+    parser.add_argument('--patch_attention_heads', type=int, default=4, help='Patch attention头数')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')
@@ -71,7 +77,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
+def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, trainable_params=None):
     """训练一个epoch"""
     model.train()
     total_loss = 0
@@ -79,6 +85,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
     total_vq_loss = 0
     total_recon_loss = 0
     n_batches = 0
+    
+    # 如果没有提供trainable_params，使用所有可训练参数
+    if trainable_params is None:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
     
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
@@ -101,10 +111,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device):
         # 总损失
         loss = ntp_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
         
-        # 反向传播
+        # 反向传播（只对可训练参数）
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
         
         total_loss += loss.item()
@@ -190,19 +200,32 @@ def main():
     
     # 可选：加载预训练的 VQVAE 权重
     if args.vqvae_checkpoint:
-        model.load_vqvae_weights(args.vqvae_checkpoint, device)
+        print(f'\n加载预训练VQVAE: {args.vqvae_checkpoint}')
+        model.load_vqvae_weights(args.vqvae_checkpoint, device, load_vq=bool(args.load_vq_weights))
+    
+    # 冻结encoder和VQ层
+    if args.freeze_encoder_vq:
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        for param in model.vq.parameters():
+            param.requires_grad = False
+        print('✓ 已冻结 Encoder 和 VQ 层')
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Total parameters: {total_params:,}')
-    print(f'Trainable parameters: {trainable_params:,}')
+    frozen_params = total_params - trainable_params
+    print(f'\n模型参数统计:')
+    print(f'  总参数: {total_params:,}')
+    print(f'  可训练参数: {trainable_params:,}')
+    print(f'  冻结参数: {frozen_params:,}')
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
-    # 优化器和调度器
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 优化器和调度器（只优化可训练参数）
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
     # 训练
@@ -217,7 +240,7 @@ def main():
     
     for epoch in range(args.n_epochs):
         # 训练
-        train_metrics = train_epoch(model, dls.train, optimizer, scheduler, revin, args, device)
+        train_metrics = train_epoch(model, dls.train, optimizer, scheduler, revin, args, device, trainable_params)
         
         # 验证
         val_metrics = validate_epoch(model, dls.valid, revin, args, device)
