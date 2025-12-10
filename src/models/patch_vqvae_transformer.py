@@ -622,7 +622,12 @@ class PatchVQVAETransformer(nn.Module):
 # ============ 工具函数 ============
 
 def get_model_config(args):
-    """构建模型配置"""
+    """构建模型配置
+    
+    注意: n_channels 需要从数据加载器获取，应在调用此函数后添加到 config 中:
+        config = get_model_config(args)
+        config['n_channels'] = dls.vars  # 从数据加载器获取通道数
+    """
     # code_dim = embedding_dim * (patch_size / compression_factor)
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
     print(f"Transformer 输入维度 (code_dim) = {code_dim}")
@@ -650,5 +655,8 @@ def get_model_config(args):
     if hasattr(args, 'use_patch_attention'):
         config['use_patch_attention'] = bool(args.use_patch_attention)
         config['patch_attention_heads'] = getattr(args, 'patch_attention_heads', 4)
+    
+    # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:
+    # config['n_channels'] = dls.vars
     
     return config
