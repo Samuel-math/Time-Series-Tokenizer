@@ -270,8 +270,15 @@ class PatchVQVAETransformer(nn.Module):
         
         # Patch内Self-Attention配置
         self.use_patch_attention = config.get('use_patch_attention', False)
-        self.patch_attention_n_channels = None  # 延迟初始化，在第一次forward时确定
-        self.patch_attention = None
+        n_channels = config.get('n_channels', None)  # 如果提供了通道数，立即初始化
+        if self.use_patch_attention and n_channels is not None:
+            self.patch_attention = PatchSelfAttention(
+                patch_size=self.patch_size,
+                n_channels=n_channels,
+                dropout=self.dropout
+            )
+        else:
+            self.patch_attention = None
         
         # VQVAE Encoder/Decoder
         self.encoder = Encoder(
@@ -333,33 +340,15 @@ class PatchVQVAETransformer(nn.Module):
         
         # 应用Patch内Self-Attention（如果启用）
         if self.use_patch_attention:
+            if self.patch_attention is None:
+                raise RuntimeError(
+                    "patch_attention 未初始化。请在创建模型时通过 config['n_channels'] 提供通道数，"
+                    "或使用 load_vqvae_weights 方法时提供 n_channels 参数。"
+                )
+            
             # 对每个patch，在patch_size × C上做attention
             # [B, num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
             x_patches_flat = x_patches.reshape(B * num_patches, self.patch_size, C)
-            
-            # 如果patch_attention还未初始化，现在初始化（因为需要知道C的值）
-            if self.patch_attention is None or self.patch_attention_n_channels != C:
-                self.patch_attention_n_channels = C
-                self.patch_attention = PatchSelfAttention(
-                    patch_size=self.patch_size,
-                    n_channels=C,
-                    dropout=self.dropout
-                ).to(x_patches.device)
-                
-                # 如果之前保存了patch_attention的权重，现在加载
-                if hasattr(self, '_patch_attention_state_dict') and self._patch_attention_state_dict is not None:
-                    try:
-                        # 移除键名前缀
-                        clean_dict = {}
-                        for k, v in self._patch_attention_state_dict.items():
-                            new_key = k.replace('model.patch_attention.', '').replace('patch_attention.', '')
-                            clean_dict[new_key] = v
-                        self.patch_attention.load_state_dict(clean_dict, strict=False)
-                        print("延迟加载 Patch Attention 权重成功")
-                        # 清理临时保存的权重
-                        delattr(self, '_patch_attention_state_dict')
-                    except Exception as e:
-                        print(f"延迟加载 Patch Attention 权重时出错: {e}")
             
             # 应用self-attention: [B*num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
             x_out = self.patch_attention(x_patches_flat)
@@ -518,7 +507,7 @@ class PatchVQVAETransformer(nn.Module):
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
-    def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True):
+    def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True, n_channels=None):
         """
         加载预训练的VQVAE权重（包括encoder、decoder、VQ和patch_attention）
         
@@ -526,6 +515,7 @@ class PatchVQVAETransformer(nn.Module):
             checkpoint_path: checkpoint路径
             device: 设备
             load_vq: 是否加载VQ层权重
+            n_channels: 通道数（如果提供且patch_attention未初始化，会立即初始化）
         """
         import os
         if not os.path.exists(checkpoint_path):
@@ -593,17 +583,28 @@ class PatchVQVAETransformer(nn.Module):
                 patch_attention_dict = checkpoint.patch_attention.state_dict()
             
             if patch_attention_dict:
-                if self.patch_attention is not None:
-                    try:
-                        clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
-                                     for k, v in patch_attention_dict.items()}
-                        self.patch_attention.load_state_dict(clean_dict, strict=False)
-                        loaded_components.append('Patch Attention')
-                    except Exception as e:
-                        print(f"加载 Patch Attention 权重时出错: {e}")
-                else:
-                    self._patch_attention_state_dict = patch_attention_dict
-                    print("Patch Attention 尚未初始化，权重已保存，将在首次forward时加载")
+                # 如果patch_attention未初始化，尝试初始化
+                if self.patch_attention is None:
+                    if n_channels is not None and self.use_patch_attention:
+                        self.patch_attention = PatchSelfAttention(
+                            patch_size=self.patch_size,
+                            n_channels=n_channels,
+                            dropout=self.dropout
+                        ).to(device)
+                    else:
+                        raise RuntimeError(
+                            "无法加载 Patch Attention 权重：patch_attention 未初始化且未提供 n_channels。"
+                            "请通过 config['n_channels'] 或 load_vqvae_weights 的 n_channels 参数提供通道数。"
+                        )
+                
+                # 加载权重
+                try:
+                    clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
+                                 for k, v in patch_attention_dict.items()}
+                    self.patch_attention.load_state_dict(clean_dict, strict=False)
+                    loaded_components.append('Patch Attention')
+                except Exception as e:
+                    print(f"加载 Patch Attention 权重时出错: {e}")
             
             # 打印加载结果
             if loaded_components:

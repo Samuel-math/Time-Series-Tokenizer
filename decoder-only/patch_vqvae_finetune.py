@@ -54,35 +54,37 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_pretrained_model(checkpoint_path, device):
-    """加载预训练模型（兼容旧的patch_attention权重）"""
+def load_pretrained_model(checkpoint_path, device, n_channels=None):
+    """加载预训练模型
+    
+    Args:
+        checkpoint_path: checkpoint路径
+        device: 设备
+        n_channels: 通道数（如果提供且启用patch_attention，会在创建模型时立即初始化）
+    """
     print(f'加载预训练模型: {checkpoint_path}')
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     config = checkpoint['config']
-    model = PatchVQVAETransformer(config)
-    
     state_dict = checkpoint['model_state_dict']
-    # 提取 patch_attention 权重（如果有）
-    patch_attention_dict = {k: v for k, v in state_dict.items() if 'patch_attention' in k}
-    has_patch_attention_in_ckpt = len(patch_attention_dict) > 0
     
-    # 如果checkpoint有patch_attention权重，但config未开启，则强制开启
-    if has_patch_attention_in_ckpt and not config.get('use_patch_attention', False):
+    # 检查checkpoint中是否有patch_attention权重
+    has_patch_attention = any('patch_attention' in k for k in state_dict.keys())
+    
+    # 如果checkpoint有patch_attention权重但config未开启，强制开启
+    if has_patch_attention and not config.get('use_patch_attention', False):
         print('检测到checkpoint中有patch_attention权重，强制启用use_patch_attention')
         config['use_patch_attention'] = True
-        model.use_patch_attention = True
     
-    # 先加载非patch_attention部分
-    non_patch_dict = {k: v for k, v in state_dict.items() if 'patch_attention' not in k}
-    missing, unexpected = model.load_state_dict(non_patch_dict, strict=False)
-    if missing:
-        print(f'加载非patch_attention权重时缺失键: {missing[:5]}... (共{len(missing)}个)')
-    if unexpected:
-        print(f'加载非patch_attention权重时意外键: {unexpected[:5]}... (共{len(unexpected)}个)')
+    # 如果启用patch_attention且提供了通道数，添加到config中以便立即初始化
+    if config.get('use_patch_attention', False) and n_channels is not None:
+        config['n_channels'] = n_channels
     
-    # 保存patch_attention权重以便初始化后再加载
-    model._patch_attention_state_dict = patch_attention_dict if patch_attention_dict else None
+    # 创建模型（如果use_patch_attention=True且n_channels存在，会自动初始化patch_attention）
+    model = PatchVQVAETransformer(config).to(device)
+    
+    # 直接加载所有权重（包括patch_attention），使用strict=False允许架构差异
+    model.load_state_dict(state_dict, strict=False)
     
     print(f'预训练模型配置: {config}')
     print(f'预训练验证损失: {checkpoint.get("val_loss", "N/A")}')
@@ -224,40 +226,17 @@ def main():
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 加载预训练模型
-    model, config = load_pretrained_model(args.pretrained_model, device)
-    model = model.to(device)
-    
-    # 获取数据（需要先获取数据以知道通道数，用于初始化patch_attention）
+    # 先获取数据以知道通道数（用于提前初始化patch_attention）
     args.dset_finetune = args.dset
     dls = get_dls(args)
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
-    # 如果模型使用了patch_attention但还未初始化，先初始化它（通过一个dummy forward）
-    patch_attention_loaded = False
-    if hasattr(model, 'use_patch_attention') and model.use_patch_attention:
-        if model.patch_attention is None:
-            # 创建一个dummy输入来触发patch_attention的初始化
-            dummy_input = torch.zeros(1, model.patch_size * 2, dls.vars, device=device)
-            with torch.no_grad():
-                _ = model.encode_to_indices(dummy_input)
-            
-            # 如果之前保存了patch_attention的权重（在load_pretrained_model中），现在加载它
-            if hasattr(model, '_patch_attention_state_dict') and model._patch_attention_state_dict is not None:
-                try:
-                    clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
-                                 for k, v in model._patch_attention_state_dict.items()}
-                    model.patch_attention.load_state_dict(clean_dict, strict=False)
-                    print('延迟加载 Patch Attention 权重成功')
-                    delattr(model, '_patch_attention_state_dict')
-                    patch_attention_loaded = True
-                except Exception as e:
-                    print(f'延迟加载 Patch Attention 权重时出错: {e}')
-                    patch_attention_loaded = False
-        else:
-            patch_attention_loaded = True
+    # 加载预训练模型（传入通道数以便立即初始化patch_attention）
+    model, config = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars)
+    
     # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
+    patch_attention_loaded = hasattr(model, 'patch_attention') and model.patch_attention is not None
     freeze_encoder_vq(model, freeze_patch_attention=patch_attention_loaded)
     
     # 打印可训练参数

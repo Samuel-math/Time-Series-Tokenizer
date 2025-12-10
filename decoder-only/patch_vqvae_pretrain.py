@@ -194,14 +194,15 @@ def main():
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
     
-    # 创建模型
+    # 创建模型（传入通道数以立即初始化patch_attention）
     config = get_model_config(args)
+    config['n_channels'] = dls.vars  # 添加通道数到config
     model = PatchVQVAETransformer(config).to(device)
     
     # 可选：加载预训练的 VQVAE 权重
     if args.vqvae_checkpoint:
         print(f'\n加载预训练VQVAE: {args.vqvae_checkpoint}')
-        model.load_vqvae_weights(args.vqvae_checkpoint, device, load_vq=bool(args.load_vq_weights))
+        model.load_vqvae_weights(args.vqvae_checkpoint, device, load_vq=bool(args.load_vq_weights), n_channels=dls.vars)
     
     # 冻结encoder和VQ层
     if args.freeze_encoder_vq:
