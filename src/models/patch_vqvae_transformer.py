@@ -143,10 +143,6 @@ class PatchSelfAttention(nn.Module):
         # 位置编码（patch内的时间位置），维度为C
         self.pos_embedding = nn.Embedding(patch_size, n_channels)
         
-        # 可学习的query（Q）
-        # 形状: [patch_size, n_channels]
-        self.learnable_query = nn.Parameter(torch.randn(patch_size, n_channels) * 0.02)
-        
         # 使用nn.MultiheadAttention实现单头注意力（num_heads=1）
         # PyTorch的优化实现通常比手动实现更快
         self.attention = nn.MultiheadAttention(
@@ -184,16 +180,13 @@ class PatchSelfAttention(nn.Module):
         # 位置编码
         positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(B, -1)
         x_pos = x + self.pos_embedding(positions)
-        
-        # 使用可学习的query
-        # 将可学习的query扩展到batch维度: [patch_size, n_channels] -> [B, patch_size, n_channels]
-        learnable_q = self.learnable_query.unsqueeze(0).expand(B, -1, -1)
+    
         
         # 使用nn.MultiheadAttention（单头）
         # query: 可学习的query
         # key, value: 来自输入x_pos
         # 注意：nn.MultiheadAttention内部已经包含了Q、K、V投影和输出投影
-        attn_out, _ = self.attention(learnable_q, x_pos, x_pos)
+        attn_out, _ = self.attention(x_pos, x_pos, x_pos)
         
         # 残差连接和Layer Norm
         x = self.norm1(x + self.dropout(attn_out))
