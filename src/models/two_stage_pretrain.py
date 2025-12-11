@@ -340,10 +340,14 @@ class TwoStagePretrainModel(nn.Module):
     
     def forward_finetune(self, x, target_len):
         """
-        微调: 预测未来序列
-        x: [B, T, C] 输入序列
-        target_len: 预测长度
-        output: pred [B, target_len, C]
+        微调: 预测未来序列（非自回归版本）
+        
+        1. 编码输入为量化向量
+        2. 创建占位符位置（pred_len / patch_size个）
+        3. Transformer 处理整个序列（输入 + 占位符），一次性预测所有未来patches
+        4. 从码本获取向量并解码
+        
+        非自回归：先留出对应数量的位置，然后对应预测，最终解码
         """
         patches = self.create_patch(x)  # [B, num_patches, C, patch_size]
         B, num_patches, C, patch_size = patches.shape
@@ -352,36 +356,44 @@ class TwoStagePretrainModel(nn.Module):
         # Patch embedding
         embedded = self.patch_embedding(patches)  # [B, C, num_patches, d_model]
         
-        # 自回归预测
-        pred_patches_list = []
-        current_embed = embedded  # [B, C, num_patches, d_model]
+        # 量化为码本索引（用于获取量化后的embedding）
+        embedded_flat = embedded.permute(0, 2, 1, 3).reshape(-1, self.d_model)  # [B*num_patches*C, d_model]
+        indices, _ = self.codebook.quantize(embedded_flat)  # [B*num_patches*C]
+        indices = indices.reshape(B, num_patches, C).permute(0, 2, 1)  # [B, C, num_patches]
         
-        for _ in range(num_pred_patches):
-            pred_per_channel = []
-            for c in range(C):
-                z_c = current_embed[:, c, :, :]  # [B, seq_len, d_model]
-                z_c = self.pos_encoding(z_c)
-                # 共享 Transformer (因果, causal=True)
-                h = self.transformer(z_c, causal=True)  # [B, seq_len, d_model]
-                logits = self.ntp_head(h[:, -1, :])  # [B, codebook_size]
-                
-                # Soft attention to codebook (可微分)
-                weights = F.softmax(logits, dim=-1)  # [B, codebook_size]
-                pred_embed = torch.matmul(weights, self.codebook.embedding.weight)  # [B, d_model]
-                pred_per_channel.append(pred_embed)
-            
-            # [B, C, d_model]
-            pred_embed_all = torch.stack(pred_per_channel, dim=1)
-            pred_patches_list.append(pred_embed_all)
-            
-            # 更新序列
-            current_embed = torch.cat([current_embed, pred_embed_all.unsqueeze(2)], dim=2)
+        # 获取量化后的 embedding
+        quantized = self.codebook.get_embedding(indices)  # [B, C, num_patches, d_model]
         
-        # [B, num_pred_patches, C, d_model]
-        pred_embeds = torch.stack(pred_patches_list, dim=1)
+        # Channel-independent 处理: [B, C, num_patches, d_model] -> [B*C, num_patches, d_model]
+        quantized_flat = quantized.reshape(B * C, num_patches, self.d_model)
+        
+        # 创建占位符（零向量）: [B*C, num_pred_patches, d_model]
+        placeholder = torch.zeros(B * C, num_pred_patches, self.d_model, device=quantized_flat.device, dtype=quantized_flat.dtype)
+        
+        # 拼接输入序列和占位符: [B*C, num_patches + num_pred_patches, d_model]
+        full_sequence = torch.cat([quantized_flat, placeholder], dim=1)
+        
+        # 位置编码
+        full_sequence = self.pos_encoding(full_sequence)
+        
+        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
+        h_full = self.transformer(full_sequence, causal=True)  # [B*C, num_patches + num_pred_patches, d_model]
+        
+        # 只取占位符位置的输出: [B*C, num_pred_patches, d_model]
+        h_pred = h_full[:, num_patches:, :]  # [B*C, num_pred_patches, d_model]
+        
+        # NTP Head: [B*C, num_pred_patches, codebook_size]
+        logits = self.ntp_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
+        
+        # 使用 softmax + 加权求和 替代 argmax，保持可微分
+        weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
+        codebook = self.codebook.embedding.weight  # [codebook_size, d_model]
+        pred_embeds_flat = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, d_model]
+        
+        # 恢复形状: [B*C, num_pred_patches, d_model] -> [B, C, num_pred_patches, d_model]
+        pred_embeds = pred_embeds_flat.reshape(B, C, num_pred_patches, self.d_model)
         
         # 解码为 patch
-        pred_embeds = pred_embeds.permute(0, 2, 1, 3)  # [B, C, num_pred_patches, d_model]
         pred_patches = self.pred_head(pred_embeds)  # [B, C, num_pred_patches, patch_size]
         
         # Reshape to sequence
