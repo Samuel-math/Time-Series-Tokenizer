@@ -58,7 +58,10 @@ FINETUNE_LR=1e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
 # ----- Patch Attention 参数 -----
-USE_PATCH_ATTENTION=1  # 启用patch内attention
+USE_PATCH_ATTENTION=1  # 启用patch内时序建模(1启用)
+PATCH_ATTENTION_TYPE="tcn"  # 时序建模类型: 'tcn' 或 'attention'
+TCN_NUM_LAYERS=2  # TCN层数（仅TCN模式使用）
+TCN_KERNEL_SIZE=3  # TCN卷积核大小（仅TCN模式使用）
 
 # ----- 其他参数 -----
 REVIN=1
@@ -109,6 +112,13 @@ echo "模型名称: ${MODEL_NAME}"
 echo "Transformer 输入维度 (code_dim): ${CODE_DIM}"
 echo "冻结VQVAE: 是"
 echo "Patch Attention: ${USE_PATCH_ATTENTION}"
+if [ "${USE_PATCH_ATTENTION}" -eq 1 ]; then
+    echo "Patch Attention 类型: ${PATCH_ATTENTION_TYPE}"
+    if [ "${PATCH_ATTENTION_TYPE}" = "tcn" ]; then
+        echo "  TCN层数: ${TCN_NUM_LAYERS}"
+        echo "  TCN卷积核大小: ${TCN_KERNEL_SIZE}"
+    fi
+fi
 echo "================================================="
 
 # =====================================================
@@ -139,6 +149,9 @@ python patch_vqvae_pretrain.py \
     --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
     --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
     --use_patch_attention ${USE_PATCH_ATTENTION} \
+    --patch_attention_type ${PATCH_ATTENTION_TYPE} \
+    --tcn_num_layers ${TCN_NUM_LAYERS} \
+    --tcn_kernel_size ${TCN_KERNEL_SIZE} \
     --vqvae_checkpoint ${VQVAE_CHECKPOINT} \
     --freeze_encoder_vq ${FREEZE_ENCODER_VQ} \
     --load_vq_weights ${LOAD_VQ_WEIGHTS} \

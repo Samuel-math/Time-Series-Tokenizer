@@ -58,8 +58,9 @@ def parse_args():
     parser.add_argument('--freeze_encoder_vq', type=int, default=0, help='是否冻结encoder和VQ层(1冻结)')
     parser.add_argument('--load_vq_weights', type=int, default=1, help='是否加载VQ层权重(1加载)')
     
-    # Patch内时序建模参数（使用TCN）
-    parser.add_argument('--use_patch_attention', type=int, default=0, help='是否使用patch内TCN时序建模(1启用)')
+    # Patch内时序建模参数（支持TCN、Self-Attention和Cross-Attention）
+    parser.add_argument('--use_patch_attention', type=int, default=0, help='是否使用patch内时序建模(1启用)')
+    parser.add_argument('--patch_attention_type', type=str, default='tcn', choices=['tcn', 'attention', 'cross_attention'], help='时序建模类型: tcn、attention或cross_attention')
     parser.add_argument('--tcn_num_layers', type=int, default=2, help='TCN层数')
     parser.add_argument('--tcn_kernel_size', type=int, default=3, help='TCN卷积核大小')
     parser.add_argument('--tcn_hidden_dim', type=int, default=None, help='TCN隐藏层维度(默认等于n_channels)')
