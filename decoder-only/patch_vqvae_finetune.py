@@ -112,12 +112,13 @@ def freeze_encoder_vq(model, freeze_patch_attention=True):
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, scaler):
     """训练一个epoch (只使用MSE loss)"""
     model.train()
-    total_loss = 0
-    n_batches = 0
+    total_loss_sum = 0  # 累加所有样本的MSE（用于报告）
+    total_samples = 0
     
     for batch_x, batch_y in dataloader:
         batch_x = batch_x.to(device)  # [B, context_points, C]
         batch_y = batch_y.to(device)  # [B, target_points, C]
+        batch_size = batch_x.shape[0]
         
         # RevIN归一化 (需要同时对 x 和 y 归一化)
         if revin:
@@ -132,8 +133,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, sc
             if revin:
                 pred = revin(pred, 'denorm')
             
-            # 只使用 MSE 损失
-            loss = F.mse_loss(pred, batch_y)
+            # 用于反向传播的loss（使用mean保持梯度行为）
+            loss = F.mse_loss(pred, batch_y, reduction='mean')
+            
+            # 用于报告的loss（使用sum以便按样本数加权）
+            loss_sum = F.mse_loss(pred, batch_y, reduction='sum')
         
         # 反向传播（只对可训练参数）
         optimizer.zero_grad()
@@ -145,24 +149,27 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, sc
         scaler.step(optimizer)
         scaler.update()
         
-        total_loss += loss.item()
-        n_batches += 1
+        # 累加loss和样本数（按样本数加权）
+        total_loss_sum += loss_sum.item()
+        total_samples += batch_size
     
     scheduler.step()
     
-    return total_loss / n_batches
+    # 按样本数平均，而不是按batch数平均
+    return total_loss_sum / total_samples if total_samples > 0 else 0.0
 
 
 def validate_epoch(model, dataloader, revin, args, device, use_amp):
     """验证一个epoch"""
     model.eval()
     total_loss = 0
-    n_batches = 0
+    total_samples = 0
     
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
+            batch_size = batch_x.shape[0]
             
             if revin:
                 batch_x = revin(batch_x, 'norm')
@@ -173,11 +180,13 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
             if revin:
                 pred = revin(pred, 'denorm')
             
-            mse_loss = F.mse_loss(pred, batch_y)
+            # 使用sum以便按样本数加权
+            mse_loss = F.mse_loss(pred, batch_y, reduction='sum')
             total_loss += mse_loss.item()
-            n_batches += 1
+            total_samples += batch_size
     
-    return total_loss / n_batches
+    # 按样本数平均，而不是按batch数平均
+    return total_loss / total_samples if total_samples > 0 else 0.0
 
 
 def test_model(model, dataloader, revin, args, device, use_amp):
