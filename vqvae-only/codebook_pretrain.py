@@ -32,6 +32,7 @@ def parse_args():
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
     parser.add_argument('--context_points', type=int, default=512, help='输入序列长度')
+    parser.add_argument('--target_points', type=int, default=0, help='预测长度（码本预训练不使用，但datautils需要此参数）')
     parser.add_argument('--batch_size', type=int, default=64, help='批次大小')
     parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
     parser.add_argument('--scaler', type=str, default='standard', help='数据缩放方式')
