@@ -664,10 +664,11 @@ class PatchVQVAETransformer(nn.Module):
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
     
     def _init_encoder_decoder(self, n_channels):
-        """初始化Encoder和Decoder（使用原有VQVAE，通过reshape处理多通道）"""
+        """初始化Encoder和Decoder（channel-independent版本：单通道）"""
         self._n_channels = n_channels
+        # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.encoder = Encoder(
-            in_channels=self._n_channels,
+            in_channels=1,  # 单通道输入
             num_hiddens=self.num_hiddens,
             num_residual_layers=self.num_residual_layers,
             num_residual_hiddens=self.num_residual_hiddens,
@@ -680,20 +681,20 @@ class PatchVQVAETransformer(nn.Module):
             num_residual_layers=self.num_residual_layers,
             num_residual_hiddens=self.num_residual_hiddens,
             compression_factor=self.compression_factor,
-            out_channels=n_channels  # 输出通道数与Encoder输入通道数相同
+            out_channels=1  # 单通道输出
         )
     
     def encode_to_indices(self, x, return_processed_patches=False):
         """
-        编码为码本索引和量化向量（多通道版本）
+        编码为码本索引和量化向量（channel-independent版本）
         
         Args:
             x: [B, T, C]
             return_processed_patches: 是否返回经过时序建模处理后的patches
         Returns:
-            indices: [B, num_patches]
+            indices: [B, num_patches, C]
             vq_loss: scalar
-            z_q: [B, num_patches, code_dim]
+            z_q: [B, num_patches, C, code_dim]
             x_patches_processed: [B, num_patches, patch_size, C] (如果return_processed_patches=True)
         """
         B, T, C = x.shape
@@ -732,22 +733,36 @@ class PatchVQVAETransformer(nn.Module):
         # 保存处理后的patches（用于重构损失）
         x_patches_processed = x_patches if return_processed_patches else None
         
-        # 将每个patch的 [patch_size, C] 重组为 [B*num_patches, C, patch_size] 用于多通道编码
-        # 这样Encoder会将每个patch的patch_size × C作为整体进行编码
-        x_patches_for_encoder = x_patches.permute(0, 1, 3, 2)  # [B, num_patches, C, patch_size]
-        x_patches_for_encoder = x_patches_for_encoder.reshape(B * num_patches, C, self.patch_size)  # [B*num_patches, C, patch_size]
+        # Channel-independent: 对每个通道独立编码
+        indices_list = []
+        z_q_list = []
+        vq_loss_sum = 0
         
-        # VQVAE Encoder (多通道输入: [B*num_patches, C, patch_size])
-        # 压缩后: [B*num_patches, embedding_dim, patch_size//compression_factor]
-        z = self.encoder(x_patches_for_encoder, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
-        z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+        for c in range(C):
+            # 提取第c个通道的patches: [B, num_patches, patch_size]
+            x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
+            x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
+            x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
+            
+            # VQVAE Encoder (单通道输入)
+            z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
+            z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+            
+            # VQ
+            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_flat)
+            vq_loss_sum += vq_loss_c
+            
+            # Reshape: [B*num_patches] -> [B, num_patches]
+            indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
+            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+            
+            indices_list.append(indices_c)
+            z_q_list.append(z_q_c)
         
-        # VQ
-        vq_loss, z_q_flat, indices = self.vq(z_flat)
-        
-        # Reshape: [B*num_patches] -> [B, num_patches]
-        indices = indices.reshape(B, num_patches)
-        z_q = z_q_flat.reshape(B, num_patches, self.code_dim)
+        # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
+        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
+        z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
+        vq_loss = vq_loss_sum / C  # 平均VQ损失
         
         if return_processed_patches:
             return indices, vq_loss, z_q, x_patches_processed
@@ -755,32 +770,41 @@ class PatchVQVAETransformer(nn.Module):
     
     def decode_from_codes(self, z_q):
         """
-        从量化向量解码（多通道版本）
+        从量化向量解码（channel-independent版本）
         
         Args:
-            z_q: [B, num_patches, code_dim]
+            z_q: [B, num_patches, C, code_dim]
         Returns:
             x_recon: [B, num_patches * patch_size, C]
         """
-        B, num_patches, code_dim = z_q.shape
+        B, num_patches, C, code_dim = z_q.shape
         
-        # Reshape for decoder: [B*num_patches, embedding_dim, compressed_len]
-        z_q = z_q.reshape(B * num_patches, self.embedding_dim, self.compressed_len)
+        # Channel-independent: 对每个通道独立解码
+        x_recon_list = []
         
-        # VQVAE Decoder (输出 [B*num_patches, C, patch_size]，多通道输出)
-        x_recon = self.decoder(z_q, self.compression_factor)  # [B*num_patches, C, patch_size]
+        for c in range(C):
+            # 提取第c个通道的量化向量: [B, num_patches, code_dim]
+            z_q_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
+            
+            # Reshape for decoder: [B*num_patches, embedding_dim, compressed_len]
+            z_q_c_flat = z_q_c.reshape(B * num_patches, self.embedding_dim, self.compressed_len)
+            
+            # VQVAE Decoder (单通道输出)
+            x_recon_c = self.decoder(z_q_c_flat, self.compression_factor)  # [B*num_patches, patch_size]
+            x_recon_c = x_recon_c.reshape(B, num_patches, self.patch_size)  # [B, num_patches, patch_size]
+            
+            x_recon_list.append(x_recon_c)
         
-        # Reshape back: [B*num_patches, C, patch_size] -> [B, num_patches, patch_size, C]
-        x_recon = x_recon.permute(0, 2, 1)  # [B*num_patches, patch_size, C]
-        x_recon = x_recon.reshape(B, num_patches, self.patch_size, self._n_channels)
-        x_recon = x_recon.reshape(B, -1, self._n_channels)  # [B, num_patches * patch_size, C]
+        # 合并所有通道: [B, num_patches, patch_size, C]
+        x_recon = torch.stack(x_recon_list, dim=3)  # [B, num_patches, patch_size, C]
+        x_recon = x_recon.reshape(B, -1, C)  # [B, num_patches * patch_size, C]
         
         return x_recon
     
     def forward_pretrain(self, x):
         """
-        预训练: NTP
-        直接用量化后的码本向量 z_q 作为 Transformer 输入
+        预训练: NTP (channel-independent版本)
+        对每个通道独立处理，直接用量化后的码本向量 z_q 作为 Transformer 输入
         """
         B, T, C = x.shape
         
@@ -804,17 +828,32 @@ class PatchVQVAETransformer(nn.Module):
             # 否则使用原始输入
             recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
-        # Transformer处理（不再channel-independent）
-        # 直接使用 z_q 作为输入: [B, num_patches, code_dim]
-        h = self.transformer(z_q)  # [B, num_patches, code_dim]
-        logits = self.output_head(h)  # [B, num_patches, codebook_size]
+        # Channel-independent Transformer处理: 对每个通道独立处理
+        # z_q: [B, num_patches, C, code_dim]
+        logits_list = []
+        indices_list = []
+        
+        for c in range(C):
+            # 提取第c个通道的量化向量: [B, num_patches, code_dim]
+            z_q_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
+            
+            # Transformer处理
+            h_c = self.transformer(z_q_c)  # [B, num_patches, code_dim]
+            logits_c = self.output_head(h_c)  # [B, num_patches, codebook_size]
+            
+            logits_list.append(logits_c)
+            indices_list.append(indices[:, :, c])
+        
+        # 合并所有通道: [B, num_patches, C, codebook_size] 和 [B, num_patches, C]
+        logits = torch.stack(logits_list, dim=2)  # [B, num_patches, C, codebook_size]
+        indices_all = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
         
         # NTP: 用位置i预测位置i+1
-        return logits[:, :-1], indices[:, 1:], vq_loss, recon_loss
+        return logits[:, :-1, :, :], indices_all[:, 1:, :], vq_loss, recon_loss
     
     def forward_finetune(self, x, target_len):
         """
-        微调: 预测未来序列（非自回归版本）
+        微调: 预测未来序列（非自回归版本，channel-independent）
         
         1. 编码输入为量化向量
         2. 创建占位符位置（pred_len / patch_size个）
@@ -827,32 +866,45 @@ class PatchVQVAETransformer(nn.Module):
         num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
         
         # 编码输入
-        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, code_dim]
+        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
         num_input_patches = z_q.shape[1]
         
-        # 创建占位符（零向量）: [B, num_pred_patches, code_dim]
-        placeholder = torch.zeros(B, num_pred_patches, self.code_dim, device=z_q.device, dtype=z_q.dtype)
+        # Channel-independent: 对每个通道独立处理
+        pred_list = []
         
-        # 拼接输入序列和占位符: [B, num_patches + num_pred_patches, code_dim]
-        full_sequence = torch.cat([z_q, placeholder], dim=1)  # [B, num_patches + num_pred_patches, code_dim]
+        for c in range(C):
+            # 提取第c个通道的量化向量: [B, num_patches, code_dim]
+            z_q_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
+            
+            # 创建占位符（零向量）: [B, num_pred_patches, code_dim]
+            placeholder = torch.zeros(B, num_pred_patches, self.code_dim, device=z_q_c.device, dtype=z_q_c.dtype)
+            
+            # 拼接输入序列和占位符: [B, num_patches + num_pred_patches, code_dim]
+            full_sequence = torch.cat([z_q_c, placeholder], dim=1)  # [B, num_patches + num_pred_patches, code_dim]
+            
+            # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
+            h_full = self.transformer(full_sequence)  # [B, num_patches + num_pred_patches, code_dim]
+            
+            # 只取占位符位置的输出: [B, num_pred_patches, code_dim]
+            h_pred = h_full[:, num_input_patches:, :]  # [B, num_pred_patches, code_dim]
+            
+            # 输出头: [B, num_pred_patches, codebook_size]
+            logits = self.output_head(h_pred)  # [B, num_pred_patches, codebook_size]
+            
+            # 使用 softmax + 加权求和 替代 argmax，保持可微分
+            weights = F.softmax(logits, dim=-1)  # [B, num_pred_patches, codebook_size]
+            codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
+            pred_codes = torch.matmul(weights, codebook)  # [B, num_pred_patches, code_dim]
+            
+            # 解码（需要reshape为 [B, num_pred_patches, 1, code_dim] 以匹配decode_from_codes的输入格式）
+            pred_codes_expanded = pred_codes.unsqueeze(2)  # [B, num_pred_patches, 1, code_dim]
+            pred_c = self.decode_from_codes(pred_codes_expanded)  # [B, num_pred_patches*patch_size, 1]
+            pred_c = pred_c[:, :target_len, 0]  # [B, target_len]
+            
+            pred_list.append(pred_c)
         
-        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
-        h_full = self.transformer(full_sequence)  # [B, num_patches + num_pred_patches, code_dim]
-        
-        # 只取占位符位置的输出: [B, num_pred_patches, code_dim]
-        h_pred = h_full[:, num_input_patches:, :]  # [B, num_pred_patches, code_dim]
-        
-        # 输出头: [B, num_pred_patches, codebook_size]
-        logits = self.output_head(h_pred)  # [B, num_pred_patches, codebook_size]
-        
-        # 使用 softmax + 加权求和 替代 argmax，保持可微分
-        weights = F.softmax(logits, dim=-1)  # [B, num_pred_patches, codebook_size]
-        codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-        pred_codes = torch.matmul(weights, codebook)  # [B, num_pred_patches, code_dim]
-        
-        # 解码
-        pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
-        pred = pred[:, :target_len, :]
+        # 合并所有通道: [B, target_len, C]
+        pred = torch.stack(pred_list, dim=2)  # [B, target_len, C]
         
         return pred, vq_loss
     
@@ -869,6 +921,7 @@ class PatchVQVAETransformer(nn.Module):
             indices, _, _, _ = result
         else:
             indices, _, _ = result
+        # indices: [B, num_patches, C] (channel-independent)
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
