@@ -102,13 +102,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         
         # 前向传播
         logits, targets, vq_loss, recon_loss = model.forward_pretrain(batch_x)
-        # logits: [B, num_patches-1, C, codebook_size]
-        # targets: [B, num_patches-1, C]
+        # logits: [B, num_patches-1, codebook_size] (joint channel-patch encoding)
+        # targets: [B, num_patches-1] (indices for next patch)
         
         # NTP损失 (CrossEntropy)
-        B, num_patches_m1, C, codebook_size = logits.shape
-        logits_flat = logits.reshape(-1, codebook_size)  # [B*(num_patches-1)*C, codebook_size]
-        targets_flat = targets.reshape(-1)  # [B*(num_patches-1)*C]
+        B, num_patches_m1, codebook_size = logits.shape
+        logits_flat = logits.reshape(-1, codebook_size)  # [B*(num_patches-1), codebook_size]
+        targets_flat = targets.reshape(-1)  # [B*(num_patches-1)]
         ntp_loss = F.cross_entropy(logits_flat, targets_flat)
         
         # 总损失
@@ -154,9 +154,11 @@ def validate_epoch(model, dataloader, revin, args, device):
             
             logits, targets, vq_loss, recon_loss = model.forward_pretrain(batch_x)
             
-            B, num_patches_m1, C, codebook_size = logits.shape
-            logits_flat = logits.reshape(-1, codebook_size)
-            targets_flat = targets.reshape(-1)
+            # logits: [B, num_patches-1, codebook_size] (joint channel-patch encoding)
+            # targets: [B, num_patches-1] (indices for next patch)
+            B, num_patches_m1, codebook_size = logits.shape
+            logits_flat = logits.reshape(-1, codebook_size)  # [B*(num_patches-1), codebook_size]
+            targets_flat = targets.reshape(-1)  # [B*(num_patches-1)]
             ntp_loss = F.cross_entropy(logits_flat, targets_flat)
             
             loss = ntp_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
