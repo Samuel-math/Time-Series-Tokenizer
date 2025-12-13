@@ -679,7 +679,8 @@ class PatchVQVAETransformer(nn.Module):
             num_hiddens=self.num_hiddens,
             num_residual_layers=self.num_residual_layers,
             num_residual_hiddens=self.num_residual_hiddens,
-            compression_factor=self.compression_factor
+            compression_factor=self.compression_factor,
+            out_channels=n_channels  # 输出通道数与Encoder输入通道数相同
         )
     
     def encode_to_indices(self, x, return_processed_patches=False):
@@ -766,12 +767,12 @@ class PatchVQVAETransformer(nn.Module):
         # Reshape for decoder: [B*num_patches, embedding_dim, compressed_len]
         z_q = z_q.reshape(B * num_patches, self.embedding_dim, self.compressed_len)
         
-        # VQVAE Decoder (输出 [B*num_patches, C*patch_size]，因为Decoder输出单通道然后squeeze)
-        x_recon_flat = self.decoder(z_q, self.compression_factor)  # [B*num_patches, C*patch_size]
+        # VQVAE Decoder (输出 [B*num_patches, C, patch_size]，多通道输出)
+        x_recon = self.decoder(z_q, self.compression_factor)  # [B*num_patches, C, patch_size]
         
-        # Reshape back: [B*num_patches, C*patch_size] -> [B, num_patches, patch_size, C]
-        x_recon = x_recon_flat.reshape(B, num_patches, self._n_channels, self.patch_size)
-        x_recon = x_recon.permute(0, 1, 3, 2)  # [B, num_patches, patch_size, C]
+        # Reshape back: [B*num_patches, C, patch_size] -> [B, num_patches, patch_size, C]
+        x_recon = x_recon.permute(0, 2, 1)  # [B*num_patches, patch_size, C]
+        x_recon = x_recon.reshape(B, num_patches, self.patch_size, self._n_channels)
         x_recon = x_recon.reshape(B, -1, self._n_channels)  # [B, num_patches * patch_size, C]
         
         return x_recon

@@ -232,8 +232,9 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens, compression_factor):
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens, compression_factor, out_channels=1):
         super(Decoder, self).__init__()
+        self.out_channels = out_channels
         if compression_factor == 4:
             self._conv_1 = nn.Conv1d(in_channels=in_channels,
                                      out_channels=num_hiddens,
@@ -251,7 +252,7 @@ class Decoder(nn.Module):
                                                     stride=2, padding=1)
 
             self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=1,
+                                                    out_channels=out_channels,
                                                     kernel_size=4,
                                                     stride=2, padding=1)
 
@@ -277,7 +278,7 @@ class Decoder(nn.Module):
                                                     stride=2, padding=1)
 
             self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=1,
+                                                    out_channels=out_channels,
                                                     kernel_size=4,
                                                     stride=2, padding=1)
 
@@ -304,7 +305,7 @@ class Decoder(nn.Module):
                                                     stride=2, padding=1)
 
             self._conv_trans_4 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=1,
+                                                    out_channels=out_channels,
                                                     kernel_size=4,
                                                     stride=2, padding=1)
 
@@ -335,7 +336,7 @@ class Decoder(nn.Module):
                                                     stride=2, padding=1)
 
             self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=1,
+                                                    out_channels=out_channels,
                                                     kernel_size=4,
                                                     stride=2, padding=1)
 
@@ -350,7 +351,11 @@ class Decoder(nn.Module):
 
             x = self._conv_trans_2(x)
 
-            return torch.squeeze(x)
+            # 如果out_channels=1，squeeze以保持向后兼容；否则返回多通道
+            if self.out_channels == 1:
+                return torch.squeeze(x)
+            else:
+                return x
 
         elif compression_factor == 8:
             x = self._conv_1(inputs)
@@ -365,7 +370,10 @@ class Decoder(nn.Module):
 
             x = self._conv_trans_2(x)
 
-            return torch.squeeze(x)
+            if self.out_channels == 1:
+                return torch.squeeze(x)
+            else:
+                return x
 
         elif compression_factor == 12:
             x = self._conv_1(inputs)
@@ -379,7 +387,10 @@ class Decoder(nn.Module):
 
             x = self._conv_trans_4(x)
 
-            return torch.squeeze(x)
+            if self.out_channels == 1:
+                return torch.squeeze(x)
+            else:
+                return x
 
         elif compression_factor == 16:
             x = self._conv_1(inputs)
@@ -397,7 +408,10 @@ class Decoder(nn.Module):
 
             x = self._conv_trans_2(x)
 
-            return torch.squeeze(x)
+            if self.out_channels == 1:
+                return torch.squeeze(x)
+            else:
+                return x
 
 
 class VectorQuantizer(nn.Module):
