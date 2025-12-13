@@ -20,6 +20,145 @@ from .vqvae import Encoder, Decoder
 
 class FlattenedVectorQuantizer(nn.Module):
     """
+    多通道Decoder，输出C个通道
+    基于Decoder，但最后一层输出out_channels而不是1
+    """
+    def __init__(self, in_channels, out_channels, num_hiddens, num_residual_layers, num_residual_hiddens, compression_factor):
+        super().__init__()
+        from .vqvae import ResidualStack
+        
+        if compression_factor == 4:
+            self._conv_1 = nn.Conv1d(in_channels=in_channels,
+                                     out_channels=num_hiddens,
+                                     kernel_size=3,
+                                     stride=1, padding=1)
+            self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                                num_hiddens=num_hiddens,
+                                                num_residual_layers=num_residual_layers,
+                                                num_residual_hiddens=num_residual_hiddens)
+            self._conv_trans_1 = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens // 2,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
+                                                    out_channels=out_channels,  # 多通道输出
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+        elif compression_factor == 8:
+            self._conv_1 = nn.Conv1d(in_channels=in_channels,
+                                     out_channels=num_hiddens,
+                                     kernel_size=3,
+                                     stride=1, padding=1)
+            self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                                num_hiddens=num_hiddens,
+                                                num_residual_layers=num_residual_layers,
+                                                num_residual_hiddens=num_residual_hiddens)
+            self._conv_trans_A = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_1 = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens // 2,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
+                                                    out_channels=out_channels,  # 多通道输出
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+        elif compression_factor == 12:
+            self._conv_1 = nn.Conv1d(in_channels=in_channels,
+                                     out_channels=num_hiddens,
+                                     kernel_size=3,
+                                     stride=1, padding=1)
+            self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                                num_hiddens=num_hiddens,
+                                                num_residual_layers=num_residual_layers,
+                                                num_residual_hiddens=num_residual_hiddens)
+            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens,
+                                                    kernel_size=5,
+                                                    stride=3, padding=1)
+            self._conv_trans_3 = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens // 2,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_4 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
+                                                    out_channels=out_channels,  # 多通道输出
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+        elif compression_factor == 16:
+            self._conv_1 = nn.Conv1d(in_channels=in_channels,
+                                     out_channels=num_hiddens,
+                                     kernel_size=3,
+                                     stride=1, padding=1)
+            self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                                num_hiddens=num_hiddens,
+                                                num_residual_layers=num_residual_layers,
+                                                num_residual_hiddens=num_residual_hiddens)
+            self._conv_trans_A = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_B = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_1 = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=num_hiddens // 2,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
+                                                    out_channels=out_channels,  # 多通道输出
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+        else:
+            raise ValueError(f"Unsupported compression_factor: {compression_factor}")
+        
+        self.compression_factor = compression_factor
+    
+    def forward(self, inputs, compression_factor):
+        if compression_factor == 4:
+            x = self._conv_1(inputs)
+            x = self._residual_stack(x)
+            x = self._conv_trans_1(x)
+            x = F.relu(x)
+            x = self._conv_trans_2(x)
+            return x  # [B, out_channels, patch_size]，不squeeze
+        elif compression_factor == 8:
+            x = self._conv_1(inputs)
+            x = self._residual_stack(x)
+            x = self._conv_trans_A(x)
+            x = F.relu(x)
+            x = self._conv_trans_1(x)
+            x = F.relu(x)
+            x = self._conv_trans_2(x)
+            return x  # [B, out_channels, patch_size]
+        elif compression_factor == 12:
+            x = self._conv_1(inputs)
+            x = self._residual_stack(x)
+            x = self._conv_trans_2(x)
+            x = F.relu(x)
+            x = self._conv_trans_3(x)
+            x = F.relu(x)
+            x = self._conv_trans_4(x)
+            return x  # [B, out_channels, patch_size]
+        elif compression_factor == 16:
+            x = self._conv_1(inputs)
+            x = self._residual_stack(x)
+            x = self._conv_trans_A(x)
+            x = F.relu(x)
+            x = self._conv_trans_B(x)
+            x = F.relu(x)
+            x = self._conv_trans_1(x)
+            x = F.relu(x)
+            x = self._conv_trans_2(x)
+            return x  # [B, out_channels, patch_size]
+        else:
+            raise ValueError(f"Unsupported compression_factor: {compression_factor}")
+
+
+class FlattenedVectorQuantizer(nn.Module):
+    """
     展平的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
     """
@@ -449,8 +588,17 @@ class PatchVQVAETransformer(nn.Module):
         self.num_residual_layers = config.get('num_residual_layers', 2)
         self.num_residual_hiddens = config.get('num_residual_hiddens', 32)
         
+        # 注意：code_dim需要根据实际的压缩后长度计算
+        # 当输入是 C*patch_size 时，压缩后长度仍然是 compressed_len = patch_size // compression_factor
+        # 但code_dim = embedding_dim * compressed_len（保持不变）
+        # 注意：当输入是 C*patch_size 时，压缩后长度是 (C*patch_size) // compression_factor
+        # 但code_dim需要根据实际的压缩后长度计算
+        # 为了保持code_dim不变（不依赖于C），我们仍然使用 patch_size 来计算
+        # 实际使用时，code_dim = embedding_dim * compressed_len，其中compressed_len会根据输入长度自动计算
         self.compressed_len = self.patch_size // self.compression_factor
-        self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
+        # 当输入是C*patch_size时，实际压缩后长度是 (C*patch_size) // compression_factor
+        # 但为了保持code_dim的一致性，我们需要在encode_to_indices中动态计算
+        self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度（基于patch_size）
         
         # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
         self.use_patch_attention = config.get('use_patch_attention', False)
@@ -485,23 +633,15 @@ class PatchVQVAETransformer(nn.Module):
         else:
             self.patch_attention = None
         
-        # VQVAE Encoder/Decoder
-        self.encoder = Encoder(
-            in_channels=1,
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            embedding_dim=self.embedding_dim,
-            compression_factor=self.compression_factor
-        )
-        
-        self.decoder = Decoder(
-            in_channels=self.embedding_dim,
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            compression_factor=self.compression_factor
-        )
+        # VQVAE Encoder/Decoder (多通道版本：patch_size * C)
+        # 注意：n_channels需要在创建模型时提供
+        if n_channels is None:
+            # 延迟初始化，等待n_channels
+            self.encoder = None
+            self.decoder = None
+            self._n_channels = None
+        else:
+            self._init_encoder_decoder(n_channels)
         
         # VQ (码本维度 = code_dim)
         if self.use_codebook_ema:
@@ -523,20 +663,47 @@ class PatchVQVAETransformer(nn.Module):
         # 输出头: code_dim -> codebook_size (预测码本索引)
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
     
+    def _init_encoder_decoder(self, n_channels):
+        """初始化Encoder和Decoder（使用原有VQVAE，通过reshape处理多通道）"""
+        self._n_channels = n_channels
+        self.encoder = Encoder(
+            in_channels=self._n_channels,
+            num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            embedding_dim=self.embedding_dim,
+            compression_factor=self.compression_factor
+        )
+        self.decoder = Decoder(
+            in_channels=self.embedding_dim,
+            num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            compression_factor=self.compression_factor
+        )
+    
     def encode_to_indices(self, x, return_processed_patches=False):
         """
-        编码为码本索引和量化向量
+        编码为码本索引和量化向量（多通道版本）
         
         Args:
             x: [B, T, C]
             return_processed_patches: 是否返回经过时序建模处理后的patches
         Returns:
-            indices: [B, num_patches, C]
+            indices: [B, num_patches]
             vq_loss: scalar
-            z_q: [B, num_patches, C, code_dim]
+            z_q: [B, num_patches, code_dim]
             x_patches_processed: [B, num_patches, patch_size, C] (如果return_processed_patches=True)
         """
         B, T, C = x.shape
+        
+        # 确保encoder和decoder已初始化
+        if self.encoder is None or self.decoder is None:
+            if self._n_channels is None:
+                self._init_encoder_decoder(C)
+            else:
+                self._init_encoder_decoder(self._n_channels)
+        
         num_patches = T // self.patch_size
         
         # 重组为 patches: [B, num_patches, patch_size, C]
@@ -564,19 +731,22 @@ class PatchVQVAETransformer(nn.Module):
         # 保存处理后的patches（用于重构损失）
         x_patches_processed = x_patches if return_processed_patches else None
         
-        # 重组为 [B*num_patches*C, patch_size] 用于编码
-        x = x_patches.permute(0, 1, 3, 2).reshape(-1, self.patch_size)  # [B*num_patches*C, patch_size]
+        # 将每个patch的 [patch_size, C] 重组为 [B*num_patches, C, patch_size] 用于多通道编码
+        # 这样Encoder会将每个patch的patch_size × C作为整体进行编码
+        x_patches_for_encoder = x_patches.permute(0, 1, 3, 2)  # [B, num_patches, C, patch_size]
+        x_patches_for_encoder = x_patches_for_encoder.reshape(B * num_patches, C, self.patch_size)  # [B*num_patches, C, patch_size]
         
-        # VQVAE Encoder
-        z = self.encoder(x, self.compression_factor)  # [B*num_patches*C, embedding_dim, compressed_len]
-        z_flat = z.reshape(z.shape[0], -1)  # [B*num_patches*C, code_dim]
+        # VQVAE Encoder (多通道输入: [B*num_patches, C, patch_size])
+        # 压缩后: [B*num_patches, embedding_dim, patch_size//compression_factor]
+        z = self.encoder(x_patches_for_encoder, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
+        z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
         
         # VQ
         vq_loss, z_q_flat, indices = self.vq(z_flat)
         
-        # Reshape
-        indices = indices.reshape(B, num_patches, C)
-        z_q = z_q_flat.reshape(B, num_patches, C, self.code_dim)
+        # Reshape: [B*num_patches] -> [B, num_patches]
+        indices = indices.reshape(B, num_patches)
+        z_q = z_q_flat.reshape(B, num_patches, self.code_dim)
         
         if return_processed_patches:
             return indices, vq_loss, z_q, x_patches_processed
@@ -584,24 +754,25 @@ class PatchVQVAETransformer(nn.Module):
     
     def decode_from_codes(self, z_q):
         """
-        从量化向量解码
+        从量化向量解码（多通道版本）
         
         Args:
-            z_q: [B, num_patches, C, code_dim]
+            z_q: [B, num_patches, code_dim]
         Returns:
             x_recon: [B, num_patches * patch_size, C]
         """
-        B, num_patches, C, _ = z_q.shape
+        B, num_patches, code_dim = z_q.shape
         
-        # Reshape for decoder
-        z_q = z_q.reshape(-1, self.embedding_dim, self.compressed_len)
+        # Reshape for decoder: [B*num_patches, embedding_dim, compressed_len]
+        z_q = z_q.reshape(B * num_patches, self.embedding_dim, self.compressed_len)
         
-        # VQVAE Decoder
-        x_recon = self.decoder(z_q, self.compression_factor)
+        # VQVAE Decoder (输出 [B*num_patches, C*patch_size]，因为Decoder输出单通道然后squeeze)
+        x_recon_flat = self.decoder(z_q, self.compression_factor)  # [B*num_patches, C*patch_size]
         
-        # Reshape back
-        x_recon = x_recon.reshape(B, num_patches, C, self.patch_size)
-        x_recon = x_recon.permute(0, 1, 3, 2).reshape(B, -1, C)
+        # Reshape back: [B*num_patches, C*patch_size] -> [B, num_patches, patch_size, C]
+        x_recon = x_recon_flat.reshape(B, num_patches, self._n_channels, self.patch_size)
+        x_recon = x_recon.permute(0, 1, 3, 2)  # [B, num_patches, patch_size, C]
+        x_recon = x_recon.reshape(B, -1, self._n_channels)  # [B, num_patches * patch_size, C]
         
         return x_recon
     
@@ -632,16 +803,10 @@ class PatchVQVAETransformer(nn.Module):
             # 否则使用原始输入
             recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
-        # Channel-independent Transformer
-        # 直接使用 z_q 作为输入，不需要 token embedding
-        all_logits = []
-        for c in range(C):
-            z_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
-            h = self.transformer(z_c)  # [B, num_patches, code_dim]
-            logits = self.output_head(h)  # [B, num_patches, codebook_size]
-            all_logits.append(logits)
-        
-        logits = torch.stack(all_logits, dim=2)  # [B, num_patches, C, codebook_size]
+        # Transformer处理（不再channel-independent）
+        # 直接使用 z_q 作为输入: [B, num_patches, code_dim]
+        h = self.transformer(z_q)  # [B, num_patches, code_dim]
+        logits = self.output_head(h)  # [B, num_patches, codebook_size]
         
         # NTP: 用位置i预测位置i+1
         return logits[:, :-1], indices[:, 1:], vq_loss, recon_loss
@@ -661,34 +826,28 @@ class PatchVQVAETransformer(nn.Module):
         num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
         
         # 编码输入
-        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
+        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, code_dim]
         num_input_patches = z_q.shape[1]
         
-        # 批量处理所有channels: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
-        z_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_input_patches, self.code_dim)
+        # 创建占位符（零向量）: [B, num_pred_patches, code_dim]
+        placeholder = torch.zeros(B, num_pred_patches, self.code_dim, device=z_q.device, dtype=z_q.dtype)
         
-        # 创建占位符（零向量）: [B*C, num_pred_patches, code_dim]
-        placeholder = torch.zeros(B * C, num_pred_patches, self.code_dim, device=z_flat.device, dtype=z_flat.dtype)
-        
-        # 拼接输入序列和占位符: [B*C, num_patches + num_pred_patches, code_dim]
-        full_sequence = torch.cat([z_flat, placeholder], dim=1)  # [B*C, num_patches + num_pred_patches, code_dim]
+        # 拼接输入序列和占位符: [B, num_patches + num_pred_patches, code_dim]
+        full_sequence = torch.cat([z_q, placeholder], dim=1)  # [B, num_patches + num_pred_patches, code_dim]
         
         # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
-        h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, code_dim]
+        h_full = self.transformer(full_sequence)  # [B, num_patches + num_pred_patches, code_dim]
         
-        # 只取占位符位置的输出: [B*C, num_pred_patches, code_dim]
-        h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
+        # 只取占位符位置的输出: [B, num_pred_patches, code_dim]
+        h_pred = h_full[:, num_input_patches:, :]  # [B, num_pred_patches, code_dim]
         
-        # 输出头: [B*C, num_pred_patches, codebook_size]
-        logits = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
+        # 输出头: [B, num_pred_patches, codebook_size]
+        logits = self.output_head(h_pred)  # [B, num_pred_patches, codebook_size]
         
         # 使用 softmax + 加权求和 替代 argmax，保持可微分
-        weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
+        weights = F.softmax(logits, dim=-1)  # [B, num_pred_patches, codebook_size]
         codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-        pred_codes_flat = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
-        
-        # 恢复形状: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
-        pred_codes = pred_codes_flat.reshape(B, C, num_pred_patches, self.code_dim).permute(0, 2, 1, 3)
+        pred_codes = torch.matmul(weights, codebook)  # [B, num_pred_patches, code_dim]
         
         # 解码
         pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]

@@ -147,8 +147,14 @@ class Encoder(nn.Module):
             self._pre_vq_conv = nn.Conv1d(in_channels=num_hiddens, out_channels=embedding_dim, kernel_size=1, stride=1)
 
     def forward(self, inputs, compression_factor):
-        if compression_factor == 4:
+        # 如果输入是2D [B, L]，reshape为 [B, 1, L]
+        # 如果输入已经是3D [B, C, L]，直接使用
+        if inputs.dim() == 2:
             x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+        else:
+            x = inputs  # [B, C, L]
+        
+        if compression_factor == 4:
 
             x = self._conv_1(x)
             x = F.relu(x)
@@ -162,7 +168,10 @@ class Encoder(nn.Module):
             return x
 
         elif compression_factor == 8:
-            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+            if inputs.dim() == 2:
+                x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+            else:
+                x = inputs
 
             x = self._conv_1(x)
             x = F.relu(x)
@@ -179,7 +188,10 @@ class Encoder(nn.Module):
             return x
 
         elif compression_factor == 12:
-            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+            if inputs.dim() == 2:
+                x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+            else:
+                x = inputs
 
             x = self._conv_1(x)
             x = F.relu(x)
@@ -196,7 +208,10 @@ class Encoder(nn.Module):
             return x
 
         elif compression_factor == 16:
-            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+            if inputs.dim() == 2:
+                x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+            else:
+                x = inputs
 
             x = self._conv_1(x)
             x = F.relu(x)
