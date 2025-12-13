@@ -1,12 +1,12 @@
 """
-Patch-based VQVAE + Transformer 模型架构 (优化版)
+Patch-based VQVAE + Transformer 模型架构 (Channel-Independent版本)
 
 架构说明：
 1. 输入: [B, T, C] 时间序列
-2. Patch划分 + VQVAE Encoder -> 展平为 [B, num_patches, C, code_dim]
+2. Channel-independent处理: 每个通道独立进行 Patch划分 + VQVAE Encoder -> [B, num_patches, C, code_dim]
 3. VQ 量化后的表示直接作为 Transformer 输入 (无需 token embedding)
-4. Transformer (Decoder-only): 预测下一个码本向量
-5. 预训练: NTP loss (预测码本索引)
+4. Transformer (Decoder-only): 对每个通道独立预测下一个码本向量
+5. 预训练: NTP loss (预测码本索引) - logits: [B, num_patches-1, C, codebook_size]
 6. 微调: 预测未来patch -> 解码 -> MSE loss
 """
 
@@ -16,145 +16,6 @@ import torch.nn.functional as F
 import math
 
 from .vqvae import Encoder, Decoder
-
-
-class FlattenedVectorQuantizer(nn.Module):
-    """
-    多通道Decoder，输出C个通道
-    基于Decoder，但最后一层输出out_channels而不是1
-    """
-    def __init__(self, in_channels, out_channels, num_hiddens, num_residual_layers, num_residual_hiddens, compression_factor):
-        super().__init__()
-        from .vqvae import ResidualStack
-        
-        if compression_factor == 4:
-            self._conv_1 = nn.Conv1d(in_channels=in_channels,
-                                     out_channels=num_hiddens,
-                                     kernel_size=3,
-                                     stride=1, padding=1)
-            self._residual_stack = ResidualStack(in_channels=num_hiddens,
-                                                num_hiddens=num_hiddens,
-                                                num_residual_layers=num_residual_layers,
-                                                num_residual_hiddens=num_residual_hiddens)
-            self._conv_trans_1 = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens // 2,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=out_channels,  # 多通道输出
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-        elif compression_factor == 8:
-            self._conv_1 = nn.Conv1d(in_channels=in_channels,
-                                     out_channels=num_hiddens,
-                                     kernel_size=3,
-                                     stride=1, padding=1)
-            self._residual_stack = ResidualStack(in_channels=num_hiddens,
-                                                num_hiddens=num_hiddens,
-                                                num_residual_layers=num_residual_layers,
-                                                num_residual_hiddens=num_residual_hiddens)
-            self._conv_trans_A = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_1 = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens // 2,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=out_channels,  # 多通道输出
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-        elif compression_factor == 12:
-            self._conv_1 = nn.Conv1d(in_channels=in_channels,
-                                     out_channels=num_hiddens,
-                                     kernel_size=3,
-                                     stride=1, padding=1)
-            self._residual_stack = ResidualStack(in_channels=num_hiddens,
-                                                num_hiddens=num_hiddens,
-                                                num_residual_layers=num_residual_layers,
-                                                num_residual_hiddens=num_residual_hiddens)
-            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens,
-                                                    kernel_size=5,
-                                                    stride=3, padding=1)
-            self._conv_trans_3 = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens // 2,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_4 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=out_channels,  # 多通道输出
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-        elif compression_factor == 16:
-            self._conv_1 = nn.Conv1d(in_channels=in_channels,
-                                     out_channels=num_hiddens,
-                                     kernel_size=3,
-                                     stride=1, padding=1)
-            self._residual_stack = ResidualStack(in_channels=num_hiddens,
-                                                num_hiddens=num_hiddens,
-                                                num_residual_layers=num_residual_layers,
-                                                num_residual_hiddens=num_residual_hiddens)
-            self._conv_trans_A = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_B = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_1 = nn.ConvTranspose1d(in_channels=num_hiddens,
-                                                    out_channels=num_hiddens // 2,
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens // 2,
-                                                    out_channels=out_channels,  # 多通道输出
-                                                    kernel_size=4,
-                                                    stride=2, padding=1)
-        else:
-            raise ValueError(f"Unsupported compression_factor: {compression_factor}")
-        
-        self.compression_factor = compression_factor
-    
-    def forward(self, inputs, compression_factor):
-        if compression_factor == 4:
-            x = self._conv_1(inputs)
-            x = self._residual_stack(x)
-            x = self._conv_trans_1(x)
-            x = F.relu(x)
-            x = self._conv_trans_2(x)
-            return x  # [B, out_channels, patch_size]，不squeeze
-        elif compression_factor == 8:
-            x = self._conv_1(inputs)
-            x = self._residual_stack(x)
-            x = self._conv_trans_A(x)
-            x = F.relu(x)
-            x = self._conv_trans_1(x)
-            x = F.relu(x)
-            x = self._conv_trans_2(x)
-            return x  # [B, out_channels, patch_size]
-        elif compression_factor == 12:
-            x = self._conv_1(inputs)
-            x = self._residual_stack(x)
-            x = self._conv_trans_2(x)
-            x = F.relu(x)
-            x = self._conv_trans_3(x)
-            x = F.relu(x)
-            x = self._conv_trans_4(x)
-            return x  # [B, out_channels, patch_size]
-        elif compression_factor == 16:
-            x = self._conv_1(inputs)
-            x = self._residual_stack(x)
-            x = self._conv_trans_A(x)
-            x = F.relu(x)
-            x = self._conv_trans_B(x)
-            x = F.relu(x)
-            x = self._conv_trans_1(x)
-            x = F.relu(x)
-            x = self._conv_trans_2(x)
-            return x  # [B, out_channels, patch_size]
-        else:
-            raise ValueError(f"Unsupported compression_factor: {compression_factor}")
 
 
 class FlattenedVectorQuantizer(nn.Module):
@@ -588,17 +449,10 @@ class PatchVQVAETransformer(nn.Module):
         self.num_residual_layers = config.get('num_residual_layers', 2)
         self.num_residual_hiddens = config.get('num_residual_hiddens', 32)
         
-        # 注意：code_dim需要根据实际的压缩后长度计算
-        # 当输入是 C*patch_size 时，压缩后长度仍然是 compressed_len = patch_size // compression_factor
-        # 但code_dim = embedding_dim * compressed_len（保持不变）
-        # 注意：当输入是 C*patch_size 时，压缩后长度是 (C*patch_size) // compression_factor
-        # 但code_dim需要根据实际的压缩后长度计算
-        # 为了保持code_dim不变（不依赖于C），我们仍然使用 patch_size 来计算
-        # 实际使用时，code_dim = embedding_dim * compressed_len，其中compressed_len会根据输入长度自动计算
+        # code_dim = embedding_dim * compressed_len
+        # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.compressed_len = self.patch_size // self.compression_factor
-        # 当输入是C*patch_size时，实际压缩后长度是 (C*patch_size) // compression_factor
-        # 但为了保持code_dim的一致性，我们需要在encode_to_indices中动态计算
-        self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度（基于patch_size）
+        self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
         
         # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
         self.use_patch_attention = config.get('use_patch_attention', False)
@@ -633,16 +487,6 @@ class PatchVQVAETransformer(nn.Module):
         else:
             self.patch_attention = None
         
-        # VQVAE Encoder/Decoder (多通道版本：patch_size * C)
-        # 注意：n_channels需要在创建模型时提供
-        if n_channels is None:
-            # 延迟初始化，等待n_channels
-            self.encoder = None
-            self.decoder = None
-            self._n_channels = None
-        else:
-            self._init_encoder_decoder(n_channels)
-        
         # VQ (码本维度 = code_dim)
         if self.use_codebook_ema:
             self.vq = FlattenedVectorQuantizerEMA(
@@ -662,9 +506,7 @@ class PatchVQVAETransformer(nn.Module):
         
         # 输出头: code_dim -> codebook_size (预测码本索引)
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
-    
-    def _init_encoder_decoder(self, n_channels):
-        """初始化Encoder和Decoder（channel-independent版本：单通道）"""
+
         self._n_channels = n_channels
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.encoder = Encoder(
@@ -699,13 +541,6 @@ class PatchVQVAETransformer(nn.Module):
         """
         B, T, C = x.shape
         
-        # 确保encoder和decoder已初始化
-        if self.encoder is None or self.decoder is None:
-            if self._n_channels is None:
-                self._init_encoder_decoder(C)
-            else:
-                self._init_encoder_decoder(self._n_channels)
-        
         num_patches = T // self.patch_size
         
         # 重组为 patches: [B, num_patches, patch_size, C]
@@ -716,8 +551,7 @@ class PatchVQVAETransformer(nn.Module):
         if self.use_patch_attention:
             if self.patch_attention is None:
                 raise RuntimeError(
-                    "patch_attention 未初始化。请在创建模型时通过 config['n_channels'] 提供通道数，"
-                    "或使用 load_vqvae_weights 方法时提供 n_channels 参数。"
+                    "patch_attention 未初始化。请在创建模型时通过 config['n_channels'] 提供通道数。"
                 )
             
             # 对每个patch，在patch_size × C上应用时序建模
@@ -828,25 +662,18 @@ class PatchVQVAETransformer(nn.Module):
             # 否则使用原始输入
             recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
-        # Channel-independent Transformer处理: 对每个通道独立处理
-        # z_q: [B, num_patches, C, code_dim]
-        logits_list = []
-        indices_list = []
+        # Channel-independent Transformer处理: 批量处理所有通道以加速
+        # z_q: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
+        B, num_patches, C, code_dim = z_q.shape
+        z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
         
-        for c in range(C):
-            # 提取第c个通道的量化向量: [B, num_patches, code_dim]
-            z_q_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
-            
-            # Transformer处理
-            h_c = self.transformer(z_q_c)  # [B, num_patches, code_dim]
-            logits_c = self.output_head(h_c)  # [B, num_patches, codebook_size]
-            
-            logits_list.append(logits_c)
-            indices_list.append(indices[:, :, c])
+        # 一次性处理所有通道
+        h_flat = self.transformer(z_q_flat)  # [B*C, num_patches, code_dim]
+        logits_flat = self.output_head(h_flat)  # [B*C, num_patches, codebook_size]
         
-        # 合并所有通道: [B, num_patches, C, codebook_size] 和 [B, num_patches, C]
-        logits = torch.stack(logits_list, dim=2)  # [B, num_patches, C, codebook_size]
-        indices_all = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
+        # Reshape回通道分离格式: [B*C, num_patches, codebook_size] -> [B, num_patches, C, codebook_size]
+        logits = logits_flat.reshape(B, C, num_patches, -1).permute(0, 2, 1, 3)  # [B, num_patches, C, codebook_size]
+        indices_all = indices  # [B, num_patches, C]
         
         # NTP: 用位置i预测位置i+1
         return logits[:, :-1, :, :], indices_all[:, 1:, :], vq_loss, recon_loss
@@ -869,42 +696,37 @@ class PatchVQVAETransformer(nn.Module):
         indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
         num_input_patches = z_q.shape[1]
         
-        # Channel-independent: 对每个通道独立处理
-        pred_list = []
+        # Channel-independent: 批量处理所有通道以加速
+        # z_q: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
+        B, num_patches, C, code_dim = z_q.shape
+        z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
         
-        for c in range(C):
-            # 提取第c个通道的量化向量: [B, num_patches, code_dim]
-            z_q_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
-            
-            # 创建占位符（零向量）: [B, num_pred_patches, code_dim]
-            placeholder = torch.zeros(B, num_pred_patches, self.code_dim, device=z_q_c.device, dtype=z_q_c.dtype)
-            
-            # 拼接输入序列和占位符: [B, num_patches + num_pred_patches, code_dim]
-            full_sequence = torch.cat([z_q_c, placeholder], dim=1)  # [B, num_patches + num_pred_patches, code_dim]
-            
-            # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
-            h_full = self.transformer(full_sequence)  # [B, num_patches + num_pred_patches, code_dim]
-            
-            # 只取占位符位置的输出: [B, num_pred_patches, code_dim]
-            h_pred = h_full[:, num_input_patches:, :]  # [B, num_pred_patches, code_dim]
-            
-            # 输出头: [B, num_pred_patches, codebook_size]
-            logits = self.output_head(h_pred)  # [B, num_pred_patches, codebook_size]
-            
-            # 使用 softmax + 加权求和 替代 argmax，保持可微分
-            weights = F.softmax(logits, dim=-1)  # [B, num_pred_patches, codebook_size]
-            codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-            pred_codes = torch.matmul(weights, codebook)  # [B, num_pred_patches, code_dim]
-            
-            # 解码（需要reshape为 [B, num_pred_patches, 1, code_dim] 以匹配decode_from_codes的输入格式）
-            pred_codes_expanded = pred_codes.unsqueeze(2)  # [B, num_pred_patches, 1, code_dim]
-            pred_c = self.decode_from_codes(pred_codes_expanded)  # [B, num_pred_patches*patch_size, 1]
-            pred_c = pred_c[:, :target_len, 0]  # [B, target_len]
-            
-            pred_list.append(pred_c)
+        # 创建占位符（零向量）: [B*C, num_pred_patches, code_dim]
+        placeholder = torch.zeros(B * C, num_pred_patches, self.code_dim, device=z_q_flat.device, dtype=z_q_flat.dtype)
         
-        # 合并所有通道: [B, target_len, C]
-        pred = torch.stack(pred_list, dim=2)  # [B, target_len, C]
+        # 拼接输入序列和占位符: [B*C, num_patches + num_pred_patches, code_dim]
+        full_sequence = torch.cat([z_q_flat, placeholder], dim=1)  # [B*C, num_patches + num_pred_patches, code_dim]
+        
+        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
+        h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, code_dim]
+        
+        # 只取占位符位置的输出: [B*C, num_pred_patches, code_dim]
+        h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
+        
+        # 输出头: [B*C, num_pred_patches, codebook_size]
+        logits = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
+        
+        # 使用 softmax + 加权求和 替代 argmax，保持可微分
+        weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
+        codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
+        pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
+        
+        # Reshape回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
+        pred_codes = pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)  # [B, num_pred_patches, C, code_dim]
+        
+        # 解码
+        pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
+        pred = pred[:, :target_len, :]  # [B, target_len, C]
         
         return pred, vq_loss
     
@@ -925,15 +747,15 @@ class PatchVQVAETransformer(nn.Module):
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
-    def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True, n_channels=None):
+    def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True, freeze=False):
         """
-        加载预训练的VQVAE权重（包括encoder、decoder、VQ和patch_attention/TCN）
+        加载预训练的VQVAE权重（包括encoder、decoder、VQ）
         
         Args:
             checkpoint_path: checkpoint路径
             device: 设备
             load_vq: 是否加载VQ层权重
-            n_channels: 通道数（如果提供且patch_attention未初始化，会立即初始化）
+            freeze: 是否在加载后冻结VQVAE组件（encoder、decoder、VQ）
         """
         import os
         if not os.path.exists(checkpoint_path):
@@ -953,119 +775,65 @@ class PatchVQVAETransformer(nn.Module):
             
             loaded_components = []
             
-            # 辅助函数：加载模块权重
-            def load_module_weights(module, prefix, module_name):
-                if state_dict is not None:
+            # 辅助函数：尝试加载模块权重（支持两种格式）
+            def try_load_module(module, name, state_dict_key=None, prefix=None):
+                # 格式1: codebook_pretrain格式 (encoder_state_dict, decoder_state_dict, vq_state_dict)
+                if state_dict_key and state_dict_key in checkpoint:
+                    try:
+                        module.load_state_dict(checkpoint[state_dict_key], strict=False)
+                        return True
+                    except Exception as e:
+                        print(f"加载{name}权重失败 ({state_dict_key}): {e}")
+                
+                # 格式2: 标准格式 (model_state_dict中包含prefix.)
+                if prefix and state_dict is not None:
                     module_dict = {k.replace(f'{prefix}.', ''): v for k, v in state_dict.items() 
                                   if k.startswith(f'{prefix}.')}
                     if module_dict:
-                        module.load_state_dict(module_dict, strict=False)
+                        try:
+                            module.load_state_dict(module_dict, strict=False)
+                            return True
+                        except Exception as e:
+                            print(f"加载{name}权重失败 ({prefix}): {e}")
+                
+                # 格式3: checkpoint对象属性
+                if hasattr(checkpoint, name.lower()):
+                    try:
+                        module.load_state_dict(getattr(checkpoint, name.lower()).state_dict(), strict=False)
                         return True
-                elif hasattr(checkpoint, prefix):
-                    module.load_state_dict(getattr(checkpoint, prefix).state_dict(), strict=False)
-                    return True
+                    except Exception as e:
+                        print(f"加载{name}权重失败 (checkpoint.{name.lower()}): {e}")
+                
                 return False
             
-            # 加载encoder和decoder
-            if load_module_weights(self.encoder, 'encoder', 'Encoder'):
+            # 加载encoder、decoder、VQ
+            if try_load_module(self.encoder, 'Encoder', 'encoder_state_dict', 'encoder'):
                 loaded_components.append('Encoder')
-            if load_module_weights(self.decoder, 'decoder', 'Decoder'):
+            
+            if try_load_module(self.decoder, 'Decoder', 'decoder_state_dict', 'decoder'):
                 loaded_components.append('Decoder')
             
-            # 加载VQ层
             if load_vq:
-                if state_dict is not None:
-                    vq_keys = [k for k in state_dict.keys() if 'vq' in k.lower() and 'embedding' in k.lower()]
-                    for key in vq_keys:
-                        if ('weight' in key or 'embedding' in key) and hasattr(self.vq, 'embedding'):
-                            try:
-                                self.vq.embedding.weight.data.copy_(state_dict[key])
-                                loaded_components.append('VQ')
-                                break
-                            except:
-                                continue
-                elif hasattr(checkpoint, 'vq'):
-                    vq = checkpoint.vq
-                    if hasattr(vq, 'embedding'):
-                        self.vq.embedding.weight.data.copy_(vq.embedding.weight.data)
-                        loaded_components.append('VQ')
-                    elif hasattr(vq, '_embedding'):
-                        self.vq.embedding.weight.data.copy_(vq._embedding.weight.data)
-                        loaded_components.append('VQ')
+                if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
+                    loaded_components.append('VQ')
+                elif state_dict is not None:
+                    # 尝试直接加载embedding权重
+                    for key in state_dict.keys():
+                        if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
+                            if hasattr(self.vq, 'embedding'):
+                                try:
+                                    self.vq.embedding.weight.data.copy_(state_dict[key])
+                                    loaded_components.append('VQ')
+                                    break
+                                except:
+                                    continue
             
-            # 加载Patch Attention/TCN权重
-            patch_attention_dict = None
-            if state_dict is not None:
-                patch_attention_dict = {k: v for k, v in state_dict.items() if 'patch_attention' in k}
-            elif hasattr(checkpoint, 'patch_attention'):
-                patch_attention_dict = checkpoint.patch_attention.state_dict()
-            
-            if patch_attention_dict:
-                # 如果patch_attention未初始化，尝试初始化
-                if self.patch_attention is None:
-                    if n_channels is not None and self.use_patch_attention:
-                        # 根据权重键名判断类型
-                        # TCN的键名包含'tcn_layers'
-                        # Cross-Attention的键名包含'learnable_query'
-                        # Self-Attention的键名包含'attention'或'pos_embedding'（但没有'learnable_query'）
-                        has_tcn_keys = any('tcn_layers' in k for k in patch_attention_dict.keys())
-                        has_learnable_query = any('learnable_query' in k for k in patch_attention_dict.keys())
-                        has_attention_keys = any('attention' in k or 'pos_embedding' in k for k in patch_attention_dict.keys())
-                        
-                        if has_tcn_keys:
-                            # 尝试从权重推断TCN参数
-                            tcn_num_layers = len([k for k in patch_attention_dict.keys() if 'tcn_layers' in k and 'weight' in k]) // 2
-                            tcn_num_layers = max(1, tcn_num_layers) if tcn_num_layers > 0 else 2
-                            self.patch_attention = PatchTCN(
-                                patch_size=self.patch_size,
-                                n_channels=n_channels,
-                                dropout=self.dropout,
-                                num_layers=tcn_num_layers
-                            ).to(device)
-                        elif has_learnable_query:
-                            self.patch_attention = PatchCrossAttention(
-                                patch_size=self.patch_size,
-                                n_channels=n_channels,
-                                dropout=self.dropout
-                            ).to(device)
-                        elif has_attention_keys:
-                            self.patch_attention = PatchSelfAttention(
-                                patch_size=self.patch_size,
-                                n_channels=n_channels,
-                                dropout=self.dropout
-                            ).to(device)
-                        else:
-                            # 默认使用TCN
-                            self.patch_attention = PatchTCN(
-                                patch_size=self.patch_size,
-                                n_channels=n_channels,
-                                dropout=self.dropout
-                            ).to(device)
-                    else:
-                        raise RuntimeError(
-                            "无法加载 Patch Attention/TCN 权重：patch_attention 未初始化且未提供 n_channels。"
-                            "请通过 config['n_channels'] 或 load_vqvae_weights 的 n_channels 参数提供通道数。"
-                        )
-                
-                # 加载权重
-                try:
-                    clean_dict = {k.replace('model.patch_attention.', '').replace('patch_attention.', ''): v 
-                                 for k, v in patch_attention_dict.items()}
-                    self.patch_attention.load_state_dict(clean_dict, strict=False)
-                    # 判断模块类型
-                    if hasattr(self.patch_attention, 'tcn_layers'):
-                        module_type = 'Patch TCN'
-                    elif hasattr(self.patch_attention, 'learnable_query'):
-                        module_type = 'Patch Cross-Attention'
-                    else:
-                        module_type = 'Patch Self-Attention'
-                    loaded_components.append(module_type)
-                except Exception as e:
-                    print(f"加载 Patch Attention/TCN 权重时出错: {e}")
-            
-            # 打印加载结果
             if loaded_components:
                 print(f"成功加载: {', '.join(loaded_components)}")
+                
+                # 如果指定冻结，则冻结已加载的组件
+                if freeze:
+                    self.freeze_vqvae(components=loaded_components)
             
             return len(loaded_components) > 0
             
@@ -1074,6 +842,70 @@ class PatchVQVAETransformer(nn.Module):
             import traceback
             traceback.print_exc()
             return False
+    
+    def freeze_vqvae(self, components=None):
+        """
+        冻结VQVAE组件（encoder、decoder、VQ）
+        
+        Args:
+            components: 要冻结的组件列表，如 ['Encoder', 'Decoder', 'VQ']。
+                       如果为None，则冻结所有VQVAE组件
+        """
+        if components is None:
+            components = ['Encoder', 'Decoder', 'VQ']
+        
+        frozen = []
+        if 'Encoder' in components:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            frozen.append('Encoder')
+        
+        if 'Decoder' in components:
+            for param in self.decoder.parameters():
+                param.requires_grad = False
+            frozen.append('Decoder')
+        
+        if 'VQ' in components:
+            for param in self.vq.parameters():
+                param.requires_grad = False
+            frozen.append('VQ')
+        
+        if frozen:
+            print(f"✓ 已冻结: {', '.join(frozen)}")
+        
+        return frozen
+    
+    def unfreeze_vqvae(self, components=None):
+        """
+        解冻VQVAE组件（encoder、decoder、VQ）
+        
+        Args:
+            components: 要解冻的组件列表，如 ['Encoder', 'Decoder', 'VQ']。
+                       如果为None，则解冻所有VQVAE组件
+        """
+        if components is None:
+            components = ['Encoder', 'Decoder', 'VQ']
+        
+        unfrozen = []
+        if 'Encoder' in components:
+            for param in self.encoder.parameters():
+                param.requires_grad = True
+            unfrozen.append('Encoder')
+        
+        if 'Decoder' in components:
+            for param in self.decoder.parameters():
+                param.requires_grad = True
+            unfrozen.append('Decoder')
+        
+        if 'VQ' in components:
+            for param in self.vq.parameters():
+                param.requires_grad = True
+            unfrozen.append('VQ')
+        
+        if unfrozen:
+            print(f"✓ 已解冻: {', '.join(unfrozen)}")
+        
+        return unfrozen
 
 
 # ============ 工具函数 ============

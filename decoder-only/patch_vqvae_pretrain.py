@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument('--num_residual_layers', type=int, default=2, help='残差层数')
     parser.add_argument('--num_residual_hiddens', type=int, default=32, help='残差隐藏层维度')
     parser.add_argument('--vqvae_checkpoint', type=str, default=None, help='预训练VQVAE模型路径(可选)')
-    parser.add_argument('--freeze_encoder_vq', type=int, default=0, help='是否冻结encoder和VQ层(1冻结)')
+    parser.add_argument('--freeze_vqvae', type=int, default=1, help='加载VQVAE后是否冻结(1冻结, 0不冻结)')
     parser.add_argument('--load_vq_weights', type=int, default=1, help='是否加载VQ层权重(1加载)')
     
     # Patch内时序建模参数（支持TCN、Self-Attention和Cross-Attention）
@@ -207,15 +207,12 @@ def main():
     # 可选：加载预训练的 VQVAE 权重
     if args.vqvae_checkpoint:
         print(f'\n加载预训练VQVAE: {args.vqvae_checkpoint}')
-        model.load_vqvae_weights(args.vqvae_checkpoint, device, load_vq=bool(args.load_vq_weights), n_channels=dls.vars)
-    
-    # 冻结encoder和VQ层
-    if args.freeze_encoder_vq:
-        for param in model.encoder.parameters():
-            param.requires_grad = False
-        for param in model.vq.parameters():
-            param.requires_grad = False
-        print('✓ 已冻结 Encoder 和 VQ 层')
+        model.load_vqvae_weights(
+            args.vqvae_checkpoint, 
+            device, 
+            load_vq=bool(args.load_vq_weights),
+            freeze=bool(args.freeze_vqvae)
+        )
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())

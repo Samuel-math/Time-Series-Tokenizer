@@ -93,32 +93,26 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
-    # 冻结 encoder
-    for param in model.encoder.parameters():
-        param.requires_grad = False
-    # 冻结 VQ 层
-    for param in model.vq.parameters():
-        param.requires_grad = False
+    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
+    # 使用模型的方法冻结VQVAE组件
+    model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
+    
     # 冻结 patch attention（如果存在）
     if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:
         for param in model.patch_attention.parameters():
             param.requires_grad = False
-        print('冻结了 Encoder、VQ 层和 Patch Attention（将patch映射成码本前的所有参数）')
-    else:
-        print('冻结了 Encoder 和 VQ 层（将patch映射成码本前的所有参数）')
+        print('✓ 已冻结 Patch Attention')
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, scaler):
     """训练一个epoch (只使用MSE loss)"""
     model.train()
-    total_loss_sum = 0  # 累加所有样本的MSE（用于报告）
-    total_samples = 0
+    total_loss = 0
+    n_batches = 0
     
     for batch_x, batch_y in dataloader:
         batch_x = batch_x.to(device)  # [B, context_points, C]
         batch_y = batch_y.to(device)  # [B, target_points, C]
-        batch_size = batch_x.shape[0]
         
         # RevIN归一化 (需要同时对 x 和 y 归一化)
         if revin:
@@ -133,11 +127,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, sc
             if revin:
                 pred = revin(pred, 'denorm')
             
-            # 用于反向传播的loss（使用mean保持梯度行为）
+            # 用于反向传播和报告的loss（使用mean）
             loss = F.mse_loss(pred, batch_y, reduction='mean')
-            
-            # 用于报告的loss（使用sum以便按样本数加权）
-            loss_sum = F.mse_loss(pred, batch_y, reduction='sum')
         
         # 反向传播（只对可训练参数）
         optimizer.zero_grad()
@@ -149,27 +140,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, sc
         scaler.step(optimizer)
         scaler.update()
         
-        # 累加loss和样本数（按样本数加权）
-        total_loss_sum += loss_sum.item()
-        total_samples += batch_size
+        # 累加loss
+        total_loss += loss.item()
+        n_batches += 1
     
     scheduler.step()
     
-    # 按样本数平均，而不是按batch数平均
-    return total_loss_sum / total_samples if total_samples > 0 else 0.0
+    # 按batch数平均
+    return total_loss / n_batches if n_batches > 0 else 0.0
 
 
 def validate_epoch(model, dataloader, revin, args, device, use_amp):
     """验证一个epoch"""
     model.eval()
     total_loss = 0
-    total_samples = 0
+    n_batches = 0
     
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-            batch_size = batch_x.shape[0]
             
             if revin:
                 batch_x = revin(batch_x, 'norm')
@@ -180,13 +170,13 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
             if revin:
                 pred = revin(pred, 'denorm')
             
-            # 使用sum以便按样本数加权
-            mse_loss = F.mse_loss(pred, batch_y, reduction='sum')
+            # 使用mean
+            mse_loss = F.mse_loss(pred, batch_y, reduction='mean')
             total_loss += mse_loss.item()
-            total_samples += batch_size
+            n_batches += 1
     
-    # 按样本数平均，而不是按batch数平均
-    return total_loss / total_samples if total_samples > 0 else 0.0
+    # 按batch数平均
+    return total_loss / n_batches if n_batches > 0 else 0.0
 
 
 def test_model(model, dataloader, revin, args, device, use_amp):
