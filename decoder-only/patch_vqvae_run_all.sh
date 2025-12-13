@@ -58,7 +58,7 @@ FINETUNE_LR=1e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
 # ----- Patch Attention 参数 -----
-USE_PATCH_ATTENTION=1  # 启用patch内时序建模(1启用)
+USE_PATCH_ATTENTION=0  # 启用patch内时序建模(1启用)
 PATCH_ATTENTION_TYPE="tcn"  # 时序建模类型: 'tcn' 或 'attention'
 TCN_NUM_LAYERS=2  # TCN层数（仅TCN模式使用）
 TCN_KERNEL_SIZE=3  # TCN卷积核大小（仅TCN模式使用）
