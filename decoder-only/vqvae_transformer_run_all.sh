@@ -2,13 +2,16 @@
 
 # =====================================================
 # 基于预训练码本模型的Transformer训练脚本
-# 使用已训练好的码本模型（Encoder + VQ + Decoder），全程冻结VQVAE参数
+# 使用已训练好的码本模型（Encoder + VQ），全程冻结VQVAE参数
 # =====================================================
 # 
 # 架构说明:
-# 1. 加载预训练的码本模型（encoder、decoder、VQ，冻结所有参数）
+# 1. 加载预训练的码本模型（encoder、VQ，冻结所有参数）
+#    - 注意：Decoder已被注释掉，不再使用
 # 2. 在码本基础上训练Transformer进行NTP预训练
 # 3. 微调Transformer进行时间序列预测
+#    - Cross-Attention直接输出patch_size维度，不再经过code_dim
+#    - 使用cross_attn_hidden_size控制attention中间维度（默认=patch_size）
 # =====================================================
 
 # =====================================================
@@ -44,6 +47,9 @@ DROPOUT=0.1
 CODEBOOK_EMA=1
 EMA_DECAY=0.99
 EMA_EPS=1e-5
+# transformer_hidden_size: Transformer的hidden_size，默认使用code_dim
+# 如果设置，Transformer内部将使用此维度，输入输出通过投影层与code_dim转换
+TRANSFORMER_HIDDEN_SIZE=""  # 留空表示使用默认值（code_dim），可根据需要设置
 
 # ----- 预训练参数 -----
 PRETRAIN_CONTEXT_POINTS=512
@@ -65,6 +71,11 @@ USE_PATCH_ATTENTION=0  # 启用patch内时序建模(1启用)
 PATCH_ATTENTION_TYPE="tcn"  # 时序建模类型: 'tcn' 或 'attention'
 TCN_NUM_LAYERS=2  # TCN层数（仅TCN模式使用）
 TCN_KERNEL_SIZE=3  # TCN卷积核大小（仅TCN模式使用）
+
+# ----- Cross-Attention 参数（用于微调）-----
+# cross_attn_hidden_size: Cross-attention的中间维度，默认使用patch_size
+# 注意：现在cross-attention直接输出patch_size维度，不再经过code_dim
+CROSS_ATTN_HIDDEN_SIZE=${PATCH_SIZE}  # 默认等于patch_size，可根据需要调整
 
 # ----- 其他参数 -----
 REVIN=1
@@ -119,10 +130,12 @@ echo "码本模型: ${CODEBOOK_CHECKPOINT}"
 echo "模型名称: ${MODEL_NAME}"
 echo "Transformer 输入维度 (code_dim): ${CODE_DIM} (实际值从checkpoint读取)"
 if [ "${FREEZE_VQVAE}" -eq 1 ]; then
-    echo "冻结VQVAE: 是（Encoder + Decoder + VQ）"
+    echo "冻结VQVAE: 是（Encoder + VQ）"
+    echo "注意: Decoder已被注释掉，不再使用"
 else
     echo "冻结VQVAE: 否（所有参数可训练）"
 fi
+echo "Cross-Attention Hidden Size: ${CROSS_ATTN_HIDDEN_SIZE} (默认=patch_size)"
 echo "Patch Attention: ${USE_PATCH_ATTENTION}"
 if [ "${USE_PATCH_ATTENTION}" -eq 1 ]; then
     echo "Patch Attention 类型: ${PATCH_ATTENTION_TYPE}"
@@ -138,7 +151,7 @@ echo "================================================="
 # =====================================================
 echo ""
 echo "================================================="
-echo "阶段 1: NTP预训练（冻结码本：Encoder + Decoder + VQ）"
+echo "阶段 1: NTP预训练（冻结码本：Encoder + VQ）"
 echo "================================================="
 echo "Context Points: ${PRETRAIN_CONTEXT_POINTS}"
 echo "Epochs: ${PRETRAIN_EPOCHS}"
@@ -167,6 +180,8 @@ python patch_vqvae_pretrain.py \
     --patch_attention_type ${PATCH_ATTENTION_TYPE} \
     --tcn_num_layers ${TCN_NUM_LAYERS} \
     --tcn_kernel_size ${TCN_KERNEL_SIZE} \
+    --transformer_hidden_size ${TRANSFORMER_HIDDEN_SIZE} \
+    --cross_attn_hidden_size ${CROSS_ATTN_HIDDEN_SIZE} \
     --vqvae_checkpoint "${CODEBOOK_CHECKPOINT}" \
     --freeze_vqvae ${FREEZE_VQVAE} \
     --load_vq_weights 1 \
@@ -190,7 +205,7 @@ PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
 
 echo ""
 echo "================================================="
-echo "阶段 2: 微调（冻结码本：Encoder + Decoder + VQ）"
+echo "阶段 2: 微调（冻结码本：Encoder + VQ，Cross-Attention直接输出patch_size）"
 echo "================================================="
 echo "预训练模型: ${PRETRAINED_MODEL}"
 echo "Context Points: ${FINETUNE_CONTEXT_POINTS}"

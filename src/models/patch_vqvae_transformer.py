@@ -391,28 +391,49 @@ class PatchCrossAttention(nn.Module):
 
 
 class CausalTransformer(nn.Module):
-    """轻量级 Causal Transformer，输入维度为 code_dim"""
-    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512):
+    """轻量级 Causal Transformer，支持独立的 hidden_size 参数"""
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_size=None, return_hidden_size=False):
         super().__init__()
         self.code_dim = code_dim
+        # 如果未指定 hidden_size，默认使用 code_dim
+        self.hidden_size = hidden_size if hidden_size is not None else code_dim
+        self.return_hidden_size = return_hidden_size
         
-        # 位置编码，维度与 code_dim 一致
-        self.pos_embedding = nn.Embedding(max_len, code_dim)
+        # 如果 hidden_size 与 code_dim 不同，需要输入投影层
+        if self.hidden_size != self.code_dim:
+            self.input_proj = nn.Linear(self.code_dim, self.hidden_size)
+        else:
+            self.input_proj = None
+        
+        # 如果 return_hidden_size=False 且 hidden_size != code_dim，需要输出投影层
+        if not self.return_hidden_size and self.hidden_size != self.code_dim:
+            self.output_proj = nn.Linear(self.hidden_size, self.code_dim)
+        else:
+            self.output_proj = None
+        
+        # 位置编码，维度与 hidden_size 一致
+        self.pos_embedding = nn.Embedding(max_len, self.hidden_size)
         self.drop = nn.Dropout(dropout)
         
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=code_dim, nhead=n_heads, dim_feedforward=d_ff,
+            d_model=self.hidden_size, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(code_dim)
+        self.norm = nn.LayerNorm(self.hidden_size)
     
     def forward(self, x):
         """
         Args:
             x: [B, T, code_dim] 直接是量化后的码本向量
+        Returns:
+            output: [B, T, hidden_size] 或 [B, T, code_dim]，取决于 return_hidden_size
         """
         B, T, _ = x.shape
+        
+        # 输入投影（如果需要）
+        if self.input_proj is not None:
+            x = self.input_proj(x)  # [B, T, code_dim] -> [B, T, hidden_size]
         
         positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
         x = x + self.pos_embedding(positions)
@@ -420,7 +441,13 @@ class CausalTransformer(nn.Module):
         
         mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
         x = self.transformer(x, mask=mask, is_causal=True)
-        return self.norm(x)
+        x = self.norm(x)  # [B, T, hidden_size]
+        
+        # 输出投影（如果需要，且 return_hidden_size=False）
+        if self.output_proj is not None:
+            x = self.output_proj(x)  # [B, T, hidden_size] -> [B, T, code_dim]
+        
+        return x
 
 
 class PatchVQVAETransformer(nn.Module):
@@ -454,6 +481,9 @@ class PatchVQVAETransformer(nn.Module):
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.compressed_len = self.patch_size // self.compression_factor
         self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
+        
+        # Transformer的hidden_size（用于Transformer内部维度，默认使用code_dim）
+        self.transformer_hidden_size = config.get('transformer_hidden_size', None)
         
         # Cross-attention的hidden_size（用于中间维度，默认使用patch_size）
         self.cross_attn_hidden_size = config.get('cross_attn_hidden_size', self.patch_size)
@@ -502,17 +532,20 @@ class PatchVQVAETransformer(nn.Module):
                 self.codebook_size, self.code_dim, self.commitment_cost
             )
         
-        # Transformer (输入维度 = code_dim，无需 token embedding)
+        # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_size)
+        # 如果设置了 transformer_hidden_size，Transformer 直接输出 hidden_size，否则输出 code_dim
+        transformer_output_dim = self.transformer_hidden_size if self.transformer_hidden_size is not None else self.code_dim
         self.transformer = CausalTransformer(
             self.code_dim, self.n_heads, self.n_layers, 
-            self.d_ff, self.dropout
+            self.d_ff, self.dropout, hidden_size=self.transformer_hidden_size,
+            return_hidden_size=(self.transformer_hidden_size is not None)
         )
         
-        # 输出头: code_dim -> codebook_size (预测码本索引)
-        self.output_head = nn.Linear(self.code_dim, self.codebook_size)
+        # 输出头: transformer_output_dim -> codebook_size (预测码本索引)
+        self.output_head = nn.Linear(transformer_output_dim, self.codebook_size)
         
         # Cross-attention层（用于微调：历史patches作为k和v，预测码本元素作为q）
-        # Q: code_dim维度，K/V: patch_size维度，输出: patch_size维度
+        # Q: code_dim维度（从码本中获取的embedding），K/V: patch_size维度，输出: patch_size维度
         d_k = self.cross_attn_hidden_size // self.n_heads
         d_v = self.cross_attn_hidden_size // self.n_heads
         
@@ -717,7 +750,9 @@ class PatchVQVAETransformer(nn.Module):
         z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
         
         # 一次性处理所有通道
-        h_flat = self.transformer(z_q_flat)  # [B*C, num_patches, code_dim]
+        # Transformer输出维度取决于是否设置了transformer_hidden_size
+        transformer_output_dim = self.transformer_hidden_size if self.transformer_hidden_size is not None else self.code_dim
+        h_flat = self.transformer(z_q_flat)  # [B*C, num_patches, transformer_output_dim]
         logits_flat = self.output_head(h_flat)  # [B*C, num_patches, codebook_size]
         
         # Reshape回通道分离格式: [B*C, num_patches, codebook_size] -> [B, num_patches, C, codebook_size]
@@ -771,10 +806,19 @@ class PatchVQVAETransformer(nn.Module):
         full_sequence = torch.cat([z_q_flat, placeholder], dim=1)  # [B*C, num_patches + num_pred_patches, code_dim]
         
         # Transformer处理整个序列（causal mask确保占位符只能看到输入序列）
-        h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, code_dim]
+        # Transformer输出维度取决于是否设置了transformer_hidden_size
+        h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, transformer_output_dim]
         
-        # 只取占位符位置的输出作为初始q: [B*C, num_pred_patches, code_dim]
-        q_init = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
+        # 只取占位符位置的输出，通过output_head得到logits
+        transformer_output_dim = self.transformer_hidden_size if self.transformer_hidden_size is not None else self.code_dim
+        h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, transformer_output_dim]
+        logits_pred = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
+        
+        # 从logits得到码本索引（使用argmax）
+        pred_indices = torch.argmax(logits_pred, dim=-1)  # [B*C, num_pred_patches]
+        
+        # 从码本中获取对应的embedding作为q（用于cross-attention）
+        q_init = self.vq.get_embedding(pred_indices)  # [B*C, num_pred_patches, code_dim]
         
         # 3. 准备k和v：原始patches（保持patch_size维度）
         # x_patches_raw: [B, num_patches, patch_size, C]
@@ -797,7 +841,7 @@ class PatchVQVAETransformer(nn.Module):
         v_flat = v_all.permute(0, 2, 1, 3).reshape(B * C, num_patches, self.patch_size)  # [B*C, num_patches, patch_size]
         
         # 4. Cross-Attention: q attend to k和v（原始patches）
-        # q: [B*C, num_pred_patches, code_dim] (预测的码本元素)
+        # q: [B*C, num_pred_patches, code_dim] (从码本中获取的预测码本元素)
         # k, v: [B*C, num_patches, patch_size] (原始patches)
         # 输出: [B*C, num_pred_patches, patch_size] (直接输出patch_size维度)
         
@@ -1020,6 +1064,34 @@ class PatchVQVAETransformer(nn.Module):
             print(f"✓ 已解冻: {', '.join(unfrozen)}")
         
         return unfrozen
+    
+    def freeze_transformer_and_output_head(self):
+        """
+        冻结Transformer和output_head（用于微调阶段，避免argmax导致的梯度断开问题）
+        """
+        # 冻结Transformer
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+        
+        # 冻结output_head
+        for param in self.output_head.parameters():
+            param.requires_grad = False
+        
+        print("✓ 已冻结: Transformer, OutputHead")
+    
+    def unfreeze_transformer_and_output_head(self):
+        """
+        解冻Transformer和output_head
+        """
+        # 解冻Transformer
+        for param in self.transformer.parameters():
+            param.requires_grad = True
+        
+        # 解冻output_head
+        for param in self.output_head.parameters():
+            param.requires_grad = True
+        
+        print("✓ 已解冻: Transformer, OutputHead")
 
 
 # ============ 工具函数 ============
@@ -1052,6 +1124,8 @@ def get_model_config(args):
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
+        # Transformer hidden_size（可选，默认使用code_dim）
+        'transformer_hidden_size': getattr(args, 'transformer_hidden_size', None),
         # Cross-attention hidden_size（可选，默认使用patch_size）
         'cross_attn_hidden_size': getattr(args, 'cross_attn_hidden_size', None),
     }

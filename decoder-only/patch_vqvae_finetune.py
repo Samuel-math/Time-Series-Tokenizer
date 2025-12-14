@@ -95,7 +95,7 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
+    """冻结encoder、decoder、VQ层、patch attention、Transformer和output_head（将patch映射成码本前的所有参数）"""
     # 使用模型的方法冻结VQVAE组件
     model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
     
@@ -104,6 +104,9 @@ def freeze_encoder_vq(model, freeze_patch_attention=True):
         for param in model.patch_attention.parameters():
             param.requires_grad = False
         print('✓ 已冻结 Patch Attention')
+    
+    # 冻结 Transformer 和 output_head（避免argmax导致的梯度断开问题）
+    model.freeze_transformer_and_output_head()
 
 
 def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler):

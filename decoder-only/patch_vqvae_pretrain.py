@@ -65,6 +65,12 @@ def parse_args():
     parser.add_argument('--tcn_kernel_size', type=int, default=3, help='TCN卷积核大小')
     parser.add_argument('--tcn_hidden_dim', type=int, default=None, help='TCN隐藏层维度(默认等于n_channels)')
     
+    # Transformer参数
+    parser.add_argument('--transformer_hidden_size', type=int, default=None, help='Transformer的hidden_size（默认使用code_dim）')
+    
+    # Cross-Attention参数（用于微调阶段）
+    parser.add_argument('--cross_attn_hidden_size', type=int, default=None, help='Cross-attention的中间维度（默认使用patch_size）')
+    
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
