@@ -587,14 +587,14 @@ class PatchVQVAETransformer(nn.Module):
             embedding_dim=self.embedding_dim,
             compression_factor=self.compression_factor
         )
-        # self.decoder = Decoder(
-        #     in_channels=self.embedding_dim,
-        #     num_hiddens=self.num_hiddens,
-        #     num_residual_layers=self.num_residual_layers,
-        #     num_residual_hiddens=self.num_residual_hiddens,
-        #     compression_factor=self.compression_factor,
-        #     out_channels=1  # 单通道输出
-        # )
+        self.decoder = Decoder(
+            in_channels=self.embedding_dim,
+            num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            compression_factor=self.compression_factor,
+            out_channels=1  # 单通道输出
+        )
     
     def encode_to_indices(self, x, return_processed_patches=False, return_raw_patches=False):
         """
