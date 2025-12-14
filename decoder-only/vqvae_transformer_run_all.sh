@@ -50,6 +50,7 @@ TRANSFORMER_HIDDEN_DIM=""  # 留空表示使用默认值（code_dim），可根�
 
 # ----- 预训练参数 -----
 PRETRAIN_CONTEXT_POINTS=512
+PRETRAIN_TARGET_POINTS=96  # 预训练时target序列的长度
 PRETRAIN_EPOCHS=100
 PRETRAIN_BATCH_SIZE=128
 PRETRAIN_LR=3e-4
@@ -152,6 +153,7 @@ echo "================================================="
 PRETRAIN_ARGS=(
     --dset ${DSET}
     --context_points ${PRETRAIN_CONTEXT_POINTS}
+    --target_points ${PRETRAIN_TARGET_POINTS}
     --batch_size ${PRETRAIN_BATCH_SIZE}
     --patch_size ${PATCH_SIZE}
     --embedding_dim ${EMBEDDING_DIM}
