@@ -50,6 +50,7 @@ def parse_args():
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
+    parser.add_argument('--eval_interval_batches', type=int, default=100, help='每N个batch评估一次')
     
     return parser.parse_args()
 
@@ -104,50 +105,37 @@ def freeze_encoder_vq(model, freeze_patch_attention=True):
         print('✓ 已冻结 Patch Attention')
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, scaler):
-    """训练一个epoch (只使用MSE loss)"""
-    model.train()
-    total_loss = 0
-    n_batches = 0
+def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler):
+    """训练一个batch"""
+    batch_x = batch_x.to(device)  # [B, context_points, C]
+    batch_y = batch_y.to(device)  # [B, target_points, C]
     
-    for batch_x, batch_y in dataloader:
-        batch_x = batch_x.to(device)  # [B, context_points, C]
-        batch_y = batch_y.to(device)  # [B, target_points, C]
+    # RevIN归一化
+    if revin:
+        batch_x = revin(batch_x, 'norm')
+    
+    with amp.autocast(enabled=scaler.is_enabled()):
+        # 前向传播: 预测码本索引 -> 解码
+        pred, _ = model.forward_finetune(batch_x, args.target_points)
         
-        # RevIN归一化 (需要同时对 x 和 y 归一化)
+        # RevIN反归一化
         if revin:
-            # 合并后归一化，确保统计量一致
-            batch_x = revin(batch_x, 'norm')
+            pred = revin(pred, 'denorm')
         
-        with amp.autocast(enabled=scaler.is_enabled()):
-            # 前向传播: 预测码本索引 -> 解码
-            pred, _ = model.forward_finetune(batch_x, args.target_points)
-            
-            # RevIN反归一化
-            if revin:
-                pred = revin(pred, 'denorm')
-            
-            # 用于反向传播和报告的loss（使用mean）
-            loss = F.mse_loss(pred, batch_y, reduction='mean')
-        
-        # 反向传播（只对可训练参数）
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        # 只对可训练参数进行梯度裁剪
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        
-        # 累加loss
-        total_loss += loss.item()
-        n_batches += 1
+        # 用于反向传播和报告的loss（使用mean）
+        loss = F.mse_loss(pred, batch_y, reduction='mean')
     
-    scheduler.step()
+    # 反向传播（只对可训练参数）
+    optimizer.zero_grad()
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    # 只对可训练参数进行梯度裁剪
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+    scaler.step(optimizer)
+    scaler.update()
     
-    # 按batch数平均
-    return total_loss / n_batches if n_batches > 0 else 0.0
+    return loss.item()
 
 
 def validate_epoch(model, dataloader, revin, args, device, use_amp):
@@ -262,43 +250,84 @@ def main():
     # 训练
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
-    no_improve_count = 0  # 早停计数器
-    early_stop_patience = 10  # 连续10个epoch不下降就停止
+    train_batch_losses = []  # 记录每个batch的loss
+    no_improve_count = 0  # 早停计数器（基于评估次数）
+    early_stop_patience = 10  # 连续10次评估不下降就停止
     
-    print(f'\n开始微调，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
+    global_batch_count = 0
+    eval_count = 0  # 评估次数计数
+    start_time = time.time()
+    
+    print(f'\n开始微调，共 {args.n_epochs} 个 epoch')
+    print(f'评估策略: 每 {args.eval_interval_batches} 个 batch 评估一次')
+    print(f'早停: 连续 {early_stop_patience} 次评估不下降则停止')
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
-        # 训练
-        train_loss = train_epoch(model, dls.train, optimizer, scheduler, revin, args, device, scaler)
+        model.train()
+        epoch_train_losses = []
         
-        # 验证
-        val_loss = validate_epoch(model, dls.valid, revin, args, device, use_amp)
+        for batch_idx, (batch_x, batch_y) in enumerate(dls.train):
+            # 训练一个batch
+            loss = train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
+            epoch_train_losses.append(loss)
+            train_batch_losses.append(loss)
+            global_batch_count += 1
+            
+            # 每N个batch进行一次评估
+            if global_batch_count % args.eval_interval_batches == 0:
+                eval_count += 1
+                scheduler.step()  # 更新学习率
+                
+                # 计算最近N个batch的平均训练loss
+                recent_batches = epoch_train_losses[-args.eval_interval_batches:]
+                avg_train_loss = np.mean(recent_batches)
+                
+                # 验证评估
+                val_loss = validate_epoch(model, dls.valid, revin, args, device, use_amp)
+                
+                train_losses.append(avg_train_loss)
+                valid_losses.append(val_loss)
+                
+                total_time = time.time() - start_time
+                
+                # 检查是否是最佳模型
+                is_best = val_loss < best_val_loss
+                if is_best:
+                    best_val_loss = val_loss
+                    no_improve_count = 0  # 重置计数器
+                    
+                    # 保存最佳模型
+                    checkpoint = {
+                        'model_state_dict': model.state_dict(),
+                        'config': config,
+                        'args': vars(args),
+                        'global_batch_count': global_batch_count,
+                        'epoch': epoch,
+                        'eval_count': eval_count,
+                        'train_loss': avg_train_loss,
+                        'val_loss': val_loss,
+                        'timestamp': datetime.now().isoformat(),
+                        'total_training_time_seconds': total_time,
+                    }
+                    torch.save(checkpoint, save_dir / f'{model_name}.pth')
+                else:
+                    no_improve_count += 1
+                
+                # 打印进度
+                status = "*Best*" if is_best else ""
+                print(f"Batch {global_batch_count:6d} | Epoch {epoch+1:3d}/{args.n_epochs} | "
+                      f"Train Loss: {avg_train_loss:.6f} | Valid Loss: {val_loss:.6f} | "
+                      f"Time: {total_time/60:.1f}min {status}")
+                
+                # 早停检查
+                if no_improve_count >= early_stop_patience:
+                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 次评估未下降")
+                    break
         
-        train_losses.append(train_loss)
-        valid_losses.append(val_loss)
-        
-        # 打印进度
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            no_improve_count = 0  # 重置计数器
-            checkpoint = {
-                'model_state_dict': model.state_dict(),
-                'config': config,
-                'args': vars(args),
-                'epoch': epoch,
-                'val_loss': best_val_loss,
-            }
-            torch.save(checkpoint, save_dir / f'{model_name}.pth')
-            print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-                  f"Train Loss: {train_loss:.6f} | Valid Loss: {val_loss:.6f} | *Best*")
-        else:
-            no_improve_count += 1
-            print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-                  f"Train Loss: {train_loss:.6f} | Valid Loss: {val_loss:.6f}")
-            if no_improve_count >= early_stop_patience:
-                print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
-                break
+        # 如果早停，跳出epoch循环
+        if no_improve_count >= early_stop_patience:
+            break
     
     # 测试
     print('\n' + '=' * 80)
@@ -318,10 +347,10 @@ def main():
     })
     results_df.to_csv(save_dir / f'{model_name}_results.csv', index=False)
     
-    # 保存训练历史 (使用实际训练的epoch数)
-    actual_epochs = len(train_losses)
+    # 保存训练历史 (基于评估次数)
     history_df = pd.DataFrame({
-        'epoch': range(1, actual_epochs + 1),
+        'eval_count': range(1, len(train_losses) + 1),
+        'global_batch_count': [args.eval_interval_batches * i for i in range(1, len(train_losses) + 1)],
         'train_loss': train_losses,
         'valid_loss': valid_losses,
     })

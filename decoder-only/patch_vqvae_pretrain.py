@@ -258,7 +258,7 @@ def main():
               f"Valid Loss: {val_metrics['loss']:.4f}")
         
         # 保存最佳模型 (前20个epoch不保存也不记录)
-        if epoch >= 20:
+        if epoch >= 3:
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
                 no_improve_count = 0  # 重置计数器
