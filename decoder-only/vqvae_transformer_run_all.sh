@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # =====================================================
-# 基于预训练VQVAE的Transformer训练脚本
-# 使用已训练好的VQVAE模型，全程冻结VQVAE参数
+# 基于预训练码本模型的Transformer训练脚本
+# 使用已训练好的码本模型（Encoder + VQ + Decoder），全程冻结VQVAE参数
 # =====================================================
 # 
 # 架构说明:
-# 1. 加载预训练的VQVAE模型（冻结所有参数）
-# 2. 在VQVAE基础上训练Transformer进行NTP预训练
+# 1. 加载预训练的码本模型（encoder、decoder、VQ，冻结所有参数）
+# 2. 在码本基础上训练Transformer进行NTP预训练
 # 3. 微调Transformer进行时间序列预测
 # =====================================================
 
@@ -18,37 +18,40 @@
 DSET="ettm1"
 MODEL_ID=1
 
-# ----- VQVAE模型路径 -----
-# 自动查找saved_models/vqvae下的best_model.pth，或手动指定
-VQVAE_CHECKPOINT=""  # 如果为空，脚本会自动查找
-# VQVAE_CHECKPOINT="saved_models/vqvae/ettm1/.../best_model.pth"  # 手动指定路径
+# ----- 码本模型路径（相对于decoder-only目录）-----
+# 如果为空，脚本会自动查找，或手动指定完整路径
+CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps16_cb256_cd128_model1.pth"
+# CODEBOOK_CHECKPOINT=""  # 如果为空，脚本会自动查找
 
-# ----- Patch 参数 -----
+# ----- Patch 参数（会从码本checkpoint中自动读取，这里作为备用）-----
 PATCH_SIZE=16
 COMPRESSION_FACTOR=4
 
-# ----- VQVAE 参数（需要与预训练VQVAE匹配）-----
-EMBEDDING_DIM=64
-CODEBOOK_SIZE=14
+# ----- VQVAE 参数（会从码本checkpoint中自动读取，这里作为备用）-----
+EMBEDDING_DIM=32
+CODEBOOK_SIZE=256
 NUM_HIDDENS=64
 NUM_RESIDUAL_LAYERS=2
 NUM_RESIDUAL_HIDDENS=32
 
 # ----- Transformer 参数 -----
-# code_dim = embedding_dim * (patch_size / compression_factor) = 64 * 4 = 256
+# code_dim = embedding_dim * (patch_size / compression_factor)
 # n_heads 需要整除 code_dim
-N_LAYERS=3
+N_LAYERS=4
 N_HEADS=4
 D_FF=256
-DROPOUT=0.3
+DROPOUT=0.1
+CODEBOOK_EMA=1
+EMA_DECAY=0.99
+EMA_EPS=1e-5
 
 # ----- 预训练参数 -----
 PRETRAIN_CONTEXT_POINTS=512
 PRETRAIN_EPOCHS=100
 PRETRAIN_BATCH_SIZE=128
 PRETRAIN_LR=3e-4
-VQ_WEIGHT=0.0  # VQVAE已冻结，设为0
-RECON_WEIGHT=0.1
+VQ_WEIGHT=0.0  # 码本已冻结，设为0
+RECON_WEIGHT=0.0  # 码本已冻结，设为0
 
 # ----- 微调参数 -----
 FINETUNE_CONTEXT_POINTS=512
@@ -58,7 +61,7 @@ FINETUNE_LR=1e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
 # ----- Patch Attention 参数 -----
-USE_PATCH_ATTENTION=1  # 启用patch内时序建模(1启用)
+USE_PATCH_ATTENTION=0  # 启用patch内时序建模(1启用)
 PATCH_ATTENTION_TYPE="tcn"  # 时序建模类型: 'tcn' 或 'attention'
 TCN_NUM_LAYERS=2  # TCN层数（仅TCN模式使用）
 TCN_KERNEL_SIZE=3  # TCN卷积核大小（仅TCN模式使用）
@@ -66,51 +69,60 @@ TCN_KERNEL_SIZE=3  # TCN卷积核大小（仅TCN模式使用）
 # ----- 其他参数 -----
 REVIN=1
 WEIGHT_DECAY=1e-4
-FREEZE_ENCODER_VQ=1  # 冻结encoder和VQ层
-LOAD_VQ_WEIGHTS=1  # 加载VQ权重
+FREEZE_VQVAE=1  # 是否冻结VQVAE组件（1冻结，0不冻结）
 
 # =====================================================
-# 自动查找VQVAE模型（如果未指定）
+# 自动查找码本模型（如果未指定）
 # =====================================================
 
-if [ -z "${VQVAE_CHECKPOINT}" ]; then
-    echo "正在查找VQVAE模型..."
-    # 查找saved_models/vqvae下的best_model.pth
-    VQVAE_CHECKPOINT=$(find saved_models/vqvae -name "best_model.pth" -type f 2>/dev/null | head -1)
+if [ -z "${CODEBOOK_CHECKPOINT}" ]; then
+    echo "正在查找码本模型..."
+    # 查找vqvae-only目录下的码本模型
+    CODEBOOK_CHECKPOINT=$(find ../vqvae-only/saved_models/vqvae_only -name "codebook_*.pth" -type f 2>/dev/null | head -1)
     
-    if [ -z "${VQVAE_CHECKPOINT}" ]; then
-        # 尝试查找checkpoints目录下的
-        VQVAE_CHECKPOINT=$(find saved_models/vqvae -path "*/checkpoints/best_model.pth" -type f 2>/dev/null | head -1)
-    fi
-    
-    if [ -z "${VQVAE_CHECKPOINT}" ]; then
-        echo "错误: 未找到VQVAE模型！"
-        echo "请手动设置 VQVAE_CHECKPOINT 变量，或确保 saved_models/vqvae 下有 best_model.pth 文件"
+    if [ -z "${CODEBOOK_CHECKPOINT}" ]; then
+        echo "错误: 未找到码本模型！"
+        echo "请手动设置 CODEBOOK_CHECKPOINT 变量，或确保 ../vqvae-only/saved_models/vqvae_only 下有 codebook_*.pth 文件"
         exit 1
     fi
 fi
 
-if [ ! -f "${VQVAE_CHECKPOINT}" ]; then
-    echo "错误: VQVAE模型文件不存在: ${VQVAE_CHECKPOINT}"
+# 处理相对路径（相对于decoder-only目录）
+if [[ ! "${CODEBOOK_CHECKPOINT}" = /* ]]; then
+    # 获取脚本所在目录（decoder-only）
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # 转换为绝对路径
+    CODEBOOK_CHECKPOINT="${SCRIPT_DIR}/${CODEBOOK_CHECKPOINT}"
+fi
+
+# 规范化路径（处理 .. 和 .）
+CODEBOOK_CHECKPOINT=$(readlink -f "${CODEBOOK_CHECKPOINT}" 2>/dev/null || realpath "${CODEBOOK_CHECKPOINT}" 2>/dev/null || echo "${CODEBOOK_CHECKPOINT}")
+
+if [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
+    echo "错误: 码本模型文件不存在: ${CODEBOOK_CHECKPOINT}"
     exit 1
 fi
 
-echo "找到VQVAE模型: ${VQVAE_CHECKPOINT}"
+echo "找到码本模型: ${CODEBOOK_CHECKPOINT}"
 
 # =====================================================
-# 计算 code_dim 用于模型命名
+# 计算 code_dim 用于模型命名（会从checkpoint中读取实际值）
 # =====================================================
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
-MODEL_NAME="vqvae_transformer_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_model${MODEL_ID}"
+MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_model${MODEL_ID}"
 
 echo "================================================="
-echo "基于预训练VQVAE的Transformer训练"
+echo "基于预训练码本模型的Transformer训练"
 echo "================================================="
 echo "数据集: ${DSET}"
-echo "VQVAE模型: ${VQVAE_CHECKPOINT}"
+echo "码本模型: ${CODEBOOK_CHECKPOINT}"
 echo "模型名称: ${MODEL_NAME}"
-echo "Transformer 输入维度 (code_dim): ${CODE_DIM}"
-echo "冻结VQVAE: 是"
+echo "Transformer 输入维度 (code_dim): ${CODE_DIM} (实际值从checkpoint读取)"
+if [ "${FREEZE_VQVAE}" -eq 1 ]; then
+    echo "冻结VQVAE: 是（Encoder + Decoder + VQ）"
+else
+    echo "冻结VQVAE: 否（所有参数可训练）"
+fi
 echo "Patch Attention: ${USE_PATCH_ATTENTION}"
 if [ "${USE_PATCH_ATTENTION}" -eq 1 ]; then
     echo "Patch Attention 类型: ${PATCH_ATTENTION_TYPE}"
@@ -122,11 +134,11 @@ fi
 echo "================================================="
 
 # =====================================================
-# 阶段 1: 预训练（NTP）
+# 阶段 1: 预训练（NTP，基于码本模型）
 # =====================================================
 echo ""
 echo "================================================="
-echo "阶段 1: NTP预训练（冻结VQVAE）"
+echo "阶段 1: NTP预训练（冻结码本：Encoder + Decoder + VQ）"
 echo "================================================="
 echo "Context Points: ${PRETRAIN_CONTEXT_POINTS}"
 echo "Epochs: ${PRETRAIN_EPOCHS}"
@@ -148,13 +160,16 @@ python patch_vqvae_pretrain.py \
     --num_hiddens ${NUM_HIDDENS} \
     --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
     --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
+    --codebook_ema ${CODEBOOK_EMA} \
+    --ema_decay ${EMA_DECAY} \
+    --ema_eps ${EMA_EPS} \
     --use_patch_attention ${USE_PATCH_ATTENTION} \
     --patch_attention_type ${PATCH_ATTENTION_TYPE} \
     --tcn_num_layers ${TCN_NUM_LAYERS} \
     --tcn_kernel_size ${TCN_KERNEL_SIZE} \
-    --vqvae_checkpoint ${VQVAE_CHECKPOINT} \
-    --freeze_encoder_vq ${FREEZE_ENCODER_VQ} \
-    --load_vq_weights ${LOAD_VQ_WEIGHTS} \
+    --vqvae_checkpoint "${CODEBOOK_CHECKPOINT}" \
+    --freeze_vqvae ${FREEZE_VQVAE} \
+    --load_vq_weights 1 \
     --n_epochs ${PRETRAIN_EPOCHS} \
     --lr ${PRETRAIN_LR} \
     --weight_decay ${WEIGHT_DECAY} \
@@ -175,7 +190,7 @@ PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
 
 echo ""
 echo "================================================="
-echo "阶段 2: 微调（冻结VQVAE）"
+echo "阶段 2: 微调（冻结码本：Encoder + Decoder + VQ）"
 echo "================================================="
 echo "预训练模型: ${PRETRAINED_MODEL}"
 echo "Context Points: ${FINETUNE_CONTEXT_POINTS}"
