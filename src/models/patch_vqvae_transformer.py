@@ -390,6 +390,101 @@ class PatchCrossAttention(nn.Module):
         return out
 
 
+class CrossAttentionLayer(nn.Module):
+    """单层 Cross-Attention，用于微调阶段"""
+    def __init__(self, q_dim, k_v_dim, hidden_size, n_heads, d_ff, dropout=0.1):
+        """
+        Args:
+            q_dim: Q的输入维度（第一层是code_dim，后续层是patch_size）
+            k_v_dim: K/V的输入维度（patch_size）
+            hidden_size: attention的中间维度
+            n_heads: 注意力头数
+            d_ff: FFN的隐藏层维度
+            dropout: dropout率
+        """
+        super().__init__()
+        self.q_dim = q_dim
+        self.k_v_dim = k_v_dim
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        d_k = hidden_size // n_heads
+        d_v = hidden_size // n_heads
+        
+        # Q的投影层
+        self.W_Q = nn.Linear(q_dim, d_k * n_heads, bias=True)
+        # K的投影层
+        self.W_K = nn.Linear(k_v_dim, d_k * n_heads, bias=True)
+        # V的投影层
+        self.W_V = nn.Linear(k_v_dim, d_v * n_heads, bias=True)
+        
+        # Scaled Dot-Product Attention
+        self.scale = nn.Parameter(torch.tensor(d_k ** -0.5))
+        self.dropout = nn.Dropout(dropout)
+        
+        # 输出投影：输出patch_size维度
+        self.to_out = nn.Sequential(
+            nn.Linear(n_heads * d_v, k_v_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # LayerNorm和FFN
+        self.norm1 = nn.LayerNorm(k_v_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(k_v_dim, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, k_v_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(k_v_dim)
+    
+    def forward(self, q, k, v):
+        """
+        Args:
+            q: [B*C, num_pred_patches, q_dim] 查询（预测的码本元素或前一层输出）
+            k: [B*C, num_patches, k_v_dim] 键（原始patches）
+            v: [B*C, num_patches, k_v_dim] 值（原始patches）
+        Returns:
+            output: [B*C, num_pred_patches, k_v_dim] 输出（patch_size维度）
+        """
+        bs = q.size(0)
+        d_k = self.hidden_size // self.n_heads
+        d_v = self.hidden_size // self.n_heads
+        
+        # 投影Q, K, V
+        q_s = self.W_Q(q).view(bs, -1, self.n_heads, d_k).transpose(1, 2)  # [B*C, n_heads, num_pred_patches, d_k]
+        k_s = self.W_K(k).view(bs, -1, self.n_heads, d_k).permute(0, 2, 3, 1)  # [B*C, n_heads, d_k, num_patches]
+        v_s = self.W_V(v).view(bs, -1, self.n_heads, d_v).transpose(1, 2)  # [B*C, n_heads, num_patches, d_v]
+        
+        # Scaled Dot-Product Attention
+        attn_scores = torch.matmul(q_s, k_s) * self.scale  # [B*C, n_heads, num_pred_patches, num_patches]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B*C, n_heads, num_pred_patches, num_patches]
+        attn_weights = self.dropout(attn_weights)
+        
+        # 应用attention权重到V
+        attn_out = torch.matmul(attn_weights, v_s)  # [B*C, n_heads, num_pred_patches, d_v]
+        
+        # Reshape并投影输出
+        attn_out = attn_out.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * d_v)  # [B*C, num_pred_patches, n_heads * d_v]
+        attn_out = self.to_out(attn_out)  # [B*C, num_pred_patches, k_v_dim]
+        
+        # 残差连接和LayerNorm（第一层使用零向量作为残差，后续层使用前一层输出）
+        if self.q_dim == self.k_v_dim:
+            # 如果q_dim == k_v_dim，可以直接使用q作为残差
+            q_residual = q
+        else:
+            # 如果维度不匹配，使用零向量作为残差
+            q_residual = torch.zeros(bs, q.size(1), self.k_v_dim, device=q.device, dtype=q.dtype)
+        
+        q_attended = self.norm1(q_residual + attn_out)  # [B*C, num_pred_patches, k_v_dim]
+        
+        # FFN和残差连接
+        ffn_out = self.ff(q_attended)  # [B*C, num_pred_patches, k_v_dim]
+        q_final = self.norm2(q_attended + ffn_out)  # [B*C, num_pred_patches, k_v_dim]
+        
+        return q_final
+
+
 class CausalTransformer(nn.Module):
     """轻量级 Causal Transformer，支持独立的 hidden_size 参数"""
     def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_size=None, return_hidden_size=False):
@@ -487,6 +582,8 @@ class PatchVQVAETransformer(nn.Module):
         
         # Cross-attention的hidden_size（用于中间维度，默认使用patch_size）
         self.cross_attn_hidden_size = config.get('cross_attn_hidden_size', self.patch_size)
+        # Cross-attention层数（默认1层）
+        self.cross_attn_layers = config.get('cross_attn_layers', 1)
         
         # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
         self.use_patch_attention = config.get('use_patch_attention', False)
@@ -545,37 +642,26 @@ class PatchVQVAETransformer(nn.Module):
         self.output_head = nn.Linear(transformer_output_dim, self.codebook_size)
         
         # Cross-attention层（用于微调：历史patches作为k和v，预测码本元素作为q）
-        # Q: code_dim维度（从码本中获取的embedding），K/V: patch_size维度，输出: patch_size维度
-        d_k = self.cross_attn_hidden_size // self.n_heads
-        d_v = self.cross_attn_hidden_size // self.n_heads
-        
-        # Q的投影层（code_dim -> d_k * n_heads）
-        self.cross_attn_W_Q = nn.Linear(self.code_dim, d_k * self.n_heads, bias=True)
-        # K的投影层（patch_size -> d_k * n_heads）
-        self.cross_attn_W_K = nn.Linear(self.patch_size, d_k * self.n_heads, bias=True)
-        # V的投影层（patch_size -> d_v * n_heads）
-        self.cross_attn_W_V = nn.Linear(self.patch_size, d_v * self.n_heads, bias=True)
-        
-        # Scaled Dot-Product Attention
-        self.cross_attn_scale = nn.Parameter(torch.tensor(d_k ** -0.5))
-        self.cross_attn_dropout = nn.Dropout(self.dropout)
-        
-        # 输出投影：直接输出patch_size维度
-        self.cross_attn_to_out = nn.Sequential(
-            nn.Linear(self.n_heads * d_v, self.patch_size),
-            nn.Dropout(self.dropout)
-        )
-        
-        # 使用hidden_size作为中间维度进行归一化和FFN
-        self.cross_attn_norm = nn.LayerNorm(self.patch_size)
-        self.cross_attn_ff = nn.Sequential(
-            nn.Linear(self.patch_size, self.d_ff),
-            nn.GELU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.d_ff, self.patch_size),
-            nn.Dropout(self.dropout)
-        )
-        self.cross_attn_ff_norm = nn.LayerNorm(self.patch_size)
+        # 多层Cross-Attention，增强表达能力
+        # 第一层：Q输入是code_dim，后续层：Q输入是patch_size
+        self.cross_attn_layers_list = nn.ModuleList()
+        for i in range(self.cross_attn_layers):
+            if i == 0:
+                # 第一层：Q的输入维度是code_dim
+                q_dim = self.code_dim
+            else:
+                # 后续层：Q的输入维度是patch_size
+                q_dim = self.patch_size
+            
+            layer = CrossAttentionLayer(
+                q_dim=q_dim,
+                k_v_dim=self.patch_size,
+                hidden_size=self.cross_attn_hidden_size,
+                n_heads=self.n_heads,
+                d_ff=self.d_ff,
+                dropout=self.dropout
+            )
+            self.cross_attn_layers_list.append(layer)
 
         self._n_channels = n_channels
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
@@ -840,42 +926,16 @@ class PatchVQVAETransformer(nn.Module):
         k_flat = k_all.permute(0, 2, 1, 3).reshape(B * C, num_patches, self.patch_size)  # [B*C, num_patches, patch_size]
         v_flat = v_all.permute(0, 2, 1, 3).reshape(B * C, num_patches, self.patch_size)  # [B*C, num_patches, patch_size]
         
-        # 4. Cross-Attention: q attend to k和v（原始patches）
-        # q: [B*C, num_pred_patches, code_dim] (从码本中获取的预测码本元素)
-        # k, v: [B*C, num_patches, patch_size] (原始patches)
+        # 4. 多层Cross-Attention: q attend to k和v（原始patches）
+        # q: [B*C, num_pred_patches, code_dim] (从码本中获取的预测码本元素，第一层)
+        # k, v: [B*C, num_patches, patch_size] (原始patches，所有层共享)
         # 输出: [B*C, num_pred_patches, patch_size] (直接输出patch_size维度)
         
-        # 投影Q, K, V
-        bs = q_init.size(0)
-        d_k = self.cross_attn_hidden_size // self.n_heads
-        d_v = self.cross_attn_hidden_size // self.n_heads
+        q = q_init  # 第一层的输入
+        for i, cross_attn_layer in enumerate(self.cross_attn_layers_list):
+            q = cross_attn_layer(q, k_flat, v_flat)  # [B*C, num_pred_patches, patch_size]
         
-        q_s = self.cross_attn_W_Q(q_init).view(bs, -1, self.n_heads, d_k).transpose(1, 2)  # [B*C, n_heads, num_pred_patches, d_k]
-        k_s = self.cross_attn_W_K(k_flat).view(bs, -1, self.n_heads, d_k).permute(0, 2, 3, 1)  # [B*C, n_heads, d_k, num_patches]
-        v_s = self.cross_attn_W_V(v_flat).view(bs, -1, self.n_heads, d_v).transpose(1, 2)  # [B*C, n_heads, num_patches, d_v]
-        
-        # Scaled Dot-Product Attention
-        attn_scores = torch.matmul(q_s, k_s) * self.cross_attn_scale  # [B*C, n_heads, num_pred_patches, num_patches]
-        attn_weights = F.softmax(attn_scores, dim=-1)  # [B*C, n_heads, num_pred_patches, num_patches]
-        attn_weights = self.cross_attn_dropout(attn_weights)
-        
-        # 应用attention权重到V
-        attn_out = torch.matmul(attn_weights, v_s)  # [B*C, n_heads, num_pred_patches, d_v]
-        
-        # Reshape并投影输出：直接输出patch_size维度
-        attn_out = attn_out.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * d_v)  # [B*C, num_pred_patches, n_heads * d_v]
-        attn_out = self.cross_attn_to_out(attn_out)  # [B*C, num_pred_patches, patch_size]
-        
-        # 残差连接：需要将q_init从code_dim投影到patch_size
-        # 由于q_init是code_dim维度，而attn_out是patch_size维度，我们需要一个临时投影
-        # 或者使用零向量作为残差（因为维度不匹配）
-        # 这里我们使用零向量作为残差连接的起点
-        q_init_patch = torch.zeros(bs, num_pred_patches, self.patch_size, device=q_init.device, dtype=q_init.dtype)
-        q_attended = self.cross_attn_norm(q_init_patch + attn_out)  # [B*C, num_pred_patches, patch_size]
-        
-        # FFN
-        ffn_out = self.cross_attn_ff(q_attended)  # [B*C, num_pred_patches, patch_size]
-        q_final = self.cross_attn_ff_norm(q_attended + ffn_out)  # [B*C, num_pred_patches, patch_size]
+        q_final = q  # 最后一层的输出
         
         # 5. 直接输出patches，无需经过codebook
         # q_final: [B*C, num_pred_patches, patch_size]
@@ -1128,6 +1188,8 @@ def get_model_config(args):
         'transformer_hidden_size': getattr(args, 'transformer_hidden_size', None),
         # Cross-attention hidden_size（可选，默认使用patch_size）
         'cross_attn_hidden_size': getattr(args, 'cross_attn_hidden_size', None),
+        # Cross-attention层数（可选，默认1层）
+        'cross_attn_layers': getattr(args, 'cross_attn_layers', 1),
     }
     
     # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）

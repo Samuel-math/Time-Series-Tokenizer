@@ -70,6 +70,7 @@ def parse_args():
     
     # Cross-Attention参数（用于微调阶段）
     parser.add_argument('--cross_attn_hidden_size', type=int, default=None, help='Cross-attention的中间维度（默认使用patch_size）')
+    parser.add_argument('--cross_attn_layers', type=int, default=1, help='Cross-attention层数（默认1层，可增加层数增强表达能力）')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')

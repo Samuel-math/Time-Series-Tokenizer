@@ -84,6 +84,8 @@ TCN_KERNEL_SIZE=3  # TCN卷积核大小（仅TCN模式使用）
 # cross_attn_hidden_size: Cross-attention的中间维度，默认使用patch_size
 # 注意：现在cross-attention直接输出patch_size维度，不再经过code_dim
 CROSS_ATTN_HIDDEN_SIZE=${PATCH_SIZE}  # 默认等于patch_size，可根据需要调整
+# cross_attn_layers: Cross-attention层数，默认1层，可以增加层数增强表达能力
+CROSS_ATTN_LAYERS=1  # 默认1层，可根据需要增加（如2、3层）
 
 # ----- 其他参数 -----
 REVIN=1
@@ -190,6 +192,7 @@ python patch_vqvae_pretrain.py \
     --tcn_kernel_size ${TCN_KERNEL_SIZE} \
     --transformer_hidden_size ${TRANSFORMER_HIDDEN_SIZE} \
     --cross_attn_hidden_size ${CROSS_ATTN_HIDDEN_SIZE} \
+    --cross_attn_layers ${CROSS_ATTN_LAYERS} \
     --vqvae_checkpoint "${CODEBOOK_CHECKPOINT}" \
     --freeze_vqvae ${FREEZE_VQVAE} \
     --load_vq_weights 1 \
