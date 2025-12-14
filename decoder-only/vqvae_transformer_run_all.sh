@@ -44,6 +44,9 @@ DROPOUT=0.1
 CODEBOOK_EMA=1
 EMA_DECAY=0.99
 EMA_EPS=1e-5
+# transformer_hidden_dim: Transformer的hidden_dim，默认使用code_dim
+# 如果设置，Transformer内部将使用此维度，输入输出通过投影层与code_dim转换
+TRANSFORMER_HIDDEN_DIM=""  # 留空表示使用默认值（code_dim），可根据需要设置
 
 # ----- 预训练参数 -----
 PRETRAIN_CONTEXT_POINTS=512
@@ -157,6 +160,7 @@ python patch_vqvae_pretrain.py \
     --n_heads ${N_HEADS} \
     --d_ff ${D_FF} \
     --dropout ${DROPOUT} \
+    --transformer_hidden_dim ${TRANSFORMER_HIDDEN_DIM} \
     --num_hiddens ${NUM_HIDDENS} \
     --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
     --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \

@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument('--n_heads', type=int, default=4, help='注意力头数 (需整除 code_dim)')
     parser.add_argument('--d_ff', type=int, default=256, help='FFN维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
+    parser.add_argument('--transformer_hidden_dim', type=int, default=None, help='Transformer的hidden_dim（默认使用code_dim）')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
     parser.add_argument('--codebook_ema', type=int, default=1, help='码本使用EMA更新(1启用)')
     parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减系数')

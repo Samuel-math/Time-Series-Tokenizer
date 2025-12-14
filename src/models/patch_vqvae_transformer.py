@@ -390,28 +390,44 @@ class PatchCrossAttention(nn.Module):
 
 
 class CausalTransformer(nn.Module):
-    """轻量级 Causal Transformer，输入维度为 code_dim"""
-    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512):
+    """轻量级 Causal Transformer，支持独立的 hidden_dim 参数"""
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_dim=None):
         super().__init__()
         self.code_dim = code_dim
+        # 如果未指定 hidden_dim，默认使用 code_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else code_dim
         
-        # 位置编码，维度与 code_dim 一致
-        self.pos_embedding = nn.Embedding(max_len, code_dim)
+        # 如果 hidden_dim 与 code_dim 不同，需要输入和输出投影层
+        if self.hidden_dim != self.code_dim:
+            self.input_proj = nn.Linear(self.code_dim, self.hidden_dim)
+            self.output_proj = nn.Linear(self.hidden_dim, self.code_dim)
+        else:
+            self.input_proj = None
+            self.output_proj = None
+        
+        # 位置编码，维度与 hidden_dim 一致
+        self.pos_embedding = nn.Embedding(max_len, self.hidden_dim)
         self.drop = nn.Dropout(dropout)
         
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=code_dim, nhead=n_heads, dim_feedforward=d_ff,
+            d_model=self.hidden_dim, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(code_dim)
+        self.norm = nn.LayerNorm(self.hidden_dim)
     
     def forward(self, x):
         """
         Args:
             x: [B, T, code_dim] 直接是量化后的码本向量
+        Returns:
+            output: [B, T, code_dim] 输出维度与输入一致
         """
         B, T, _ = x.shape
+        
+        # 输入投影（如果需要）
+        if self.input_proj is not None:
+            x = self.input_proj(x)  # [B, T, code_dim] -> [B, T, hidden_dim]
         
         positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
         x = x + self.pos_embedding(positions)
@@ -419,7 +435,13 @@ class CausalTransformer(nn.Module):
         
         mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
         x = self.transformer(x, mask=mask, is_causal=True)
-        return self.norm(x)
+        x = self.norm(x)  # [B, T, hidden_dim]
+        
+        # 输出投影（如果需要）
+        if self.output_proj is not None:
+            x = self.output_proj(x)  # [B, T, hidden_dim] -> [B, T, code_dim]
+        
+        return x
 
 
 class PatchVQVAETransformer(nn.Module):
@@ -453,6 +475,9 @@ class PatchVQVAETransformer(nn.Module):
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.compressed_len = self.patch_size // self.compression_factor
         self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
+        
+        # Transformer的hidden_dim（用于Transformer内部维度，默认使用code_dim）
+        self.transformer_hidden_dim = config.get('transformer_hidden_dim', None)
         
         # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
         self.use_patch_attention = config.get('use_patch_attention', False)
@@ -498,13 +523,14 @@ class PatchVQVAETransformer(nn.Module):
                 self.codebook_size, self.code_dim, self.commitment_cost
             )
         
-        # Transformer (输入维度 = code_dim，无需 token embedding)
+        # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
         self.transformer = CausalTransformer(
             self.code_dim, self.n_heads, self.n_layers, 
-            self.d_ff, self.dropout
+            self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
         )
         
         # 输出头: code_dim -> codebook_size (预测码本索引)
+        # 注意：Transformer输出始终是code_dim（通过输出投影），所以output_head输入维度是code_dim
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
 
         self._n_channels = n_channels
@@ -938,6 +964,8 @@ def get_model_config(args):
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
+        # Transformer hidden_dim（可选，默认使用code_dim）
+        'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
     }
     
     # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
