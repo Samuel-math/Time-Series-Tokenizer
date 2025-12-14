@@ -12,7 +12,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda import amp
 import argparse
 from pathlib import Path
@@ -246,10 +245,9 @@ def main():
     # 模型文件名
     model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
     
-    # 优化器和调度器
+    # 优化器（固定学习率，不使用学习率衰减）
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
                       lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
     # 训练
     best_val_loss = float('inf')
@@ -272,9 +270,6 @@ def main():
         for batch_x, batch_y in dls.train:
             loss = train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
             epoch_train_losses.append(loss)
-        
-        # Epoch结束，更新学习率
-        scheduler.step()
         
         # 计算平均训练loss
         avg_train_loss = np.mean(epoch_train_losses)
