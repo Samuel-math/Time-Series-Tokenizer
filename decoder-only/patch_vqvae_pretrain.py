@@ -1,6 +1,6 @@
 """
 Patch-based VQVAE + Transformer 预训练脚本
-使用 Next Token Prediction (NTP) 损失
+基于input的index预测target的index概率分布
 """
 
 import numpy as np
@@ -94,26 +94,28 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     if trainable_params is None:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    for batch_x, _ in dataloader:
-        batch_x = batch_x.to(device)  # [B, T, C]
+    for batch_x, batch_y in dataloader:
+        batch_x = batch_x.to(device)  # [B, input_len, C]
+        batch_y = batch_y.to(device)  # [B, target_len, C]
         
         # RevIN归一化
         if revin:
             batch_x = revin(batch_x, 'norm')
+            batch_y = revin(batch_y, 'norm')
         
-        # 前向传播
-        logits, targets, vq_loss, recon_loss = model.forward_pretrain(batch_x)
-        # logits: [B, num_patches-1, C, codebook_size] (channel-independent)
-        # targets: [B, num_patches-1, C]
+        # 前向传播：基于input的index预测target的index概率分布
+        logits, target_indices, vq_loss, recon_loss = model.forward_pretrain(batch_x, batch_y)
+        # logits: [B, num_target_patches, C, codebook_size] (channel-independent)
+        # target_indices: [B, num_target_patches, C]
         
-        # NTP损失 (CrossEntropy)
-        B, num_patches_m1, C, codebook_size = logits.shape
-        logits_flat = logits.reshape(-1, codebook_size)  # [B*(num_patches-1)*C, codebook_size]
-        targets_flat = targets.reshape(-1)  # [B*(num_patches-1)*C]
-        ntp_loss = F.cross_entropy(logits_flat, targets_flat)
+        # 预测损失 (CrossEntropy)
+        B, num_target_patches, C, codebook_size = logits.shape
+        logits_flat = logits.reshape(-1, codebook_size)  # [B*num_target_patches*C, codebook_size]
+        target_indices_flat = target_indices.reshape(-1)  # [B*num_target_patches*C]
+        pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
         
         # 总损失
-        loss = ntp_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
+        loss = pred_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
         
         # 反向传播（只对可训练参数）
         optimizer.zero_grad()
@@ -122,7 +124,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         optimizer.step()
         
         total_loss += loss.item()
-        total_ntp_loss += ntp_loss.item()
+        total_ntp_loss += pred_loss.item()
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
         n_batches += 1
@@ -131,7 +133,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     
     return {
         'loss': total_loss / n_batches,
-        'ntp_loss': total_ntp_loss / n_batches,
+        'pred_loss': total_ntp_loss / n_batches,
         'vq_loss': total_vq_loss / n_batches,
         'recon_loss': total_recon_loss / n_batches,
     }
@@ -147,32 +149,34 @@ def validate_epoch(model, dataloader, revin, args, device):
     n_batches = 0
     
     with torch.no_grad():
-        for batch_x, _ in dataloader:
-            batch_x = batch_x.to(device)
+        for batch_x, batch_y in dataloader:
+            batch_x = batch_x.to(device)  # [B, input_len, C]
+            batch_y = batch_y.to(device)  # [B, target_len, C]
             
             if revin:
                 batch_x = revin(batch_x, 'norm')
+                batch_y = revin(batch_y, 'norm')
             
-            logits, targets, vq_loss, recon_loss = model.forward_pretrain(batch_x)
+            logits, target_indices, vq_loss, recon_loss = model.forward_pretrain(batch_x, batch_y)
             
-            # logits: [B, num_patches-1, C, codebook_size] (channel-independent)
-            # targets: [B, num_patches-1, C]
-            B, num_patches_m1, C, codebook_size = logits.shape
-            logits_flat = logits.reshape(-1, codebook_size)  # [B*(num_patches-1)*C, codebook_size]
-            targets_flat = targets.reshape(-1)  # [B*(num_patches-1)*C]
-            ntp_loss = F.cross_entropy(logits_flat, targets_flat)
+            # logits: [B, num_target_patches, C, codebook_size] (channel-independent)
+            # target_indices: [B, num_target_patches, C]
+            B, num_target_patches, C, codebook_size = logits.shape
+            logits_flat = logits.reshape(-1, codebook_size)  # [B*num_target_patches*C, codebook_size]
+            target_indices_flat = target_indices.reshape(-1)  # [B*num_target_patches*C]
+            pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
             
-            loss = ntp_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
+            loss = pred_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
             
             total_loss += loss.item()
-            total_ntp_loss += ntp_loss.item()
+            total_ntp_loss += pred_loss.item()
             total_vq_loss += vq_loss.item()
             total_recon_loss += recon_loss.item()
             n_batches += 1
     
     return {
         'loss': total_loss / n_batches,
-        'ntp_loss': total_ntp_loss / n_batches,
+        'pred_loss': total_ntp_loss / n_batches,
         'vq_loss': total_vq_loss / n_batches,
         'recon_loss': total_recon_loss / n_batches,
     }
@@ -254,9 +258,9 @@ def main():
         
         # 打印进度
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} (NTP: {train_metrics['ntp_loss']:.4f}, "
+              f"Train Loss: {train_metrics['loss']:.4f} (Pred: {train_metrics['pred_loss']:.4f}, "
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
-              f"Valid Loss: {val_metrics['loss']:.4f}")
+              f"Valid Loss: {val_metrics['loss']:.4f} (Pred: {val_metrics['pred_loss']:.4f})")
         
         # 保存最佳模型 (前20个epoch不保存也不记录)
         if epoch >= 3:

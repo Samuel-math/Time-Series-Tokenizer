@@ -661,48 +661,71 @@ class PatchVQVAETransformer(nn.Module):
         
         return x_recon
     
-    def forward_pretrain(self, x):
+    def forward_pretrain(self, x, target):
         """
-        预训练: NTP (channel-independent版本)
-        对每个通道独立处理，直接用量化后的码本向量 z_q 作为 Transformer 输入
-        """
-        B, T, C = x.shape
+        预训练: 基于input的index预测target的index概率分布 (channel-independent版本)
         
-        # 编码（返回处理后的patches用于重构损失）
+        Args:
+            x: [B, input_len, C] 输入序列
+            target: [B, target_len, C] 目标序列
+        Returns:
+            logits: [B, num_target_patches, C, codebook_size] 目标序列的索引概率分布
+            target_indices: [B, num_target_patches, C] 目标序列的真实索引
+            vq_loss: VQ损失
+            recon_loss: 重构损失
+        """
+        B, input_len, C = x.shape
+        _, target_len, C_target = target.shape
+        assert C == C_target, "输入和目标序列的通道数必须相同"
+        
+        # 1. 编码输入序列
         if self.use_patch_attention:
-            indices, vq_loss, z_q, x_patches_processed = self.encode_to_indices(x, return_processed_patches=True)
+            input_indices, vq_loss_input, z_q_input, x_patches_processed = self.encode_to_indices(x, return_processed_patches=True)
         else:
-            indices, vq_loss, z_q = self.encode_to_indices(x, return_processed_patches=False)
+            input_indices, vq_loss_input, z_q_input = self.encode_to_indices(x, return_processed_patches=False)
             x_patches_processed = None
-        num_patches = indices.shape[1]
         
-        # 重构损失
-        x_recon = self.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
+        # 2. 编码目标序列（用于计算损失）
+        target_indices, vq_loss_target, z_q_target = self.encode_to_indices(target, return_processed_patches=False)
         
-        # 如果使用了patch时序建模，计算处理后的patches与重构结果的损失
+        # VQ损失（输入和目标序列的平均）
+        vq_loss = (vq_loss_input + vq_loss_target) / 2
+        
+        # 重构损失（仅使用输入序列）
+        num_input_patches = input_indices.shape[1]
+        x_recon = self.decode_from_codes(z_q_input)  # [B, num_input_patches * patch_size, C]
+        
         if self.use_patch_attention and x_patches_processed is not None:
-            # 将处理后的patches reshape为 [B, num_patches * patch_size, C]
-            x_processed = x_patches_processed.reshape(B, num_patches * self.patch_size, C)
+            x_processed = x_patches_processed.reshape(B, num_input_patches * self.patch_size, C)
             recon_loss = F.mse_loss(x_recon, x_processed[:, :x_recon.shape[1], :])
         else:
-            # 否则使用原始输入
             recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
-        # Channel-independent Transformer处理: 批量处理所有通道以加速
-        # z_q: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
-        B, num_patches, C, code_dim = z_q.shape
-        z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
+        # 3. Channel-independent Transformer处理: 批量处理所有通道以加速
+        # z_q_input: [B, num_input_patches, C, code_dim] -> [B*C, num_input_patches, code_dim]
+        B, num_input_patches, C, code_dim = z_q_input.shape
+        z_q_input_flat = z_q_input.permute(0, 2, 1, 3).reshape(B * C, num_input_patches, code_dim)  # [B*C, num_input_patches, code_dim]
         
-        # 一次性处理所有通道
-        h_flat = self.transformer(z_q_flat)  # [B*C, num_patches, code_dim]
-        logits_flat = self.output_head(h_flat)  # [B*C, num_patches, codebook_size]
+        # 4. 创建占位符用于预测目标序列
+        num_target_patches = target_indices.shape[1]
+        placeholder = torch.zeros(B * C, num_target_patches, code_dim, device=z_q_input_flat.device, dtype=z_q_input_flat.dtype)
         
-        # Reshape回通道分离格式: [B*C, num_patches, codebook_size] -> [B, num_patches, C, codebook_size]
-        logits = logits_flat.reshape(B, C, num_patches, -1).permute(0, 2, 1, 3)  # [B, num_patches, C, codebook_size]
-        indices_all = indices  # [B, num_patches, C]
+        # 5. 拼接输入序列和占位符: [B*C, num_input_patches + num_target_patches, code_dim]
+        full_sequence = torch.cat([z_q_input_flat, placeholder], dim=1)
         
-        # NTP: 用位置i预测位置i+1
-        return logits[:, :-1, :, :], indices_all[:, 1:, :], vq_loss, recon_loss
+        # 6. Transformer处理完整序列（causal mask确保占位符只能看到输入序列）
+        h_full = self.transformer(full_sequence)  # [B*C, num_input_patches + num_target_patches, code_dim]
+        
+        # 7. 只取占位符位置的输出: [B*C, num_target_patches, code_dim]
+        h_target = h_full[:, num_input_patches:, :]
+        
+        # 8. 输出头: 预测目标序列的索引概率分布
+        logits_flat = self.output_head(h_target)  # [B*C, num_target_patches, codebook_size]
+        
+        # 9. Reshape回通道分离格式: [B*C, num_target_patches, codebook_size] -> [B, num_target_patches, C, codebook_size]
+        logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)  # [B, num_target_patches, C, codebook_size]
+        
+        return logits, target_indices, vq_loss, recon_loss
     
     def forward_finetune(self, x, target_len):
         """
@@ -756,10 +779,14 @@ class PatchVQVAETransformer(nn.Module):
         
         return pred, vq_loss
     
-    def forward(self, x, target_len=None, mode='pretrain'):
+    def forward(self, x, target=None, target_len=None, mode='pretrain'):
         if mode == 'pretrain':
-            return self.forward_pretrain(x)
+            if target is None:
+                raise ValueError("pretrain mode requires target argument")
+            return self.forward_pretrain(x, target)
         else:
+            if target_len is None:
+                raise ValueError("finetune mode requires target_len argument")
             return self.forward_finetune(x, target_len)
     
     @torch.no_grad()
