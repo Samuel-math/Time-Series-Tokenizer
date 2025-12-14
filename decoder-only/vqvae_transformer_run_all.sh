@@ -148,19 +148,27 @@ echo "Epochs: ${PRETRAIN_EPOCHS}"
 echo "Batch Size: ${PRETRAIN_BATCH_SIZE}"
 echo "================================================="
 
-python patch_vqvae_pretrain.py \
-    --dset ${DSET} \
-    --context_points ${PRETRAIN_CONTEXT_POINTS} \
-    --batch_size ${PRETRAIN_BATCH_SIZE} \
-    --patch_size ${PATCH_SIZE} \
-    --embedding_dim ${EMBEDDING_DIM} \
-    --compression_factor ${COMPRESSION_FACTOR} \
-    --codebook_size ${CODEBOOK_SIZE} \
-    --n_layers ${N_LAYERS} \
-    --n_heads ${N_HEADS} \
-    --d_ff ${D_FF} \
-    --dropout ${DROPOUT} \
-    --transformer_hidden_dim ${TRANSFORMER_HIDDEN_DIM} \
+# 构建命令参数
+PRETRAIN_ARGS=(
+    --dset ${DSET}
+    --context_points ${PRETRAIN_CONTEXT_POINTS}
+    --batch_size ${PRETRAIN_BATCH_SIZE}
+    --patch_size ${PATCH_SIZE}
+    --embedding_dim ${EMBEDDING_DIM}
+    --compression_factor ${COMPRESSION_FACTOR}
+    --codebook_size ${CODEBOOK_SIZE}
+    --n_layers ${N_LAYERS}
+    --n_heads ${N_HEADS}
+    --d_ff ${D_FF}
+    --dropout ${DROPOUT}
+)
+
+# 只在 TRANSFORMER_HIDDEN_DIM 不为空时添加该参数
+if [ -n "${TRANSFORMER_HIDDEN_DIM}" ]; then
+    PRETRAIN_ARGS+=(--transformer_hidden_dim ${TRANSFORMER_HIDDEN_DIM})
+fi
+
+PRETRAIN_ARGS+=(
     --num_hiddens ${NUM_HIDDENS} \
     --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
     --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
@@ -181,6 +189,9 @@ python patch_vqvae_pretrain.py \
     --vq_weight ${VQ_WEIGHT} \
     --recon_weight ${RECON_WEIGHT} \
     --model_id ${MODEL_ID}
+)
+
+python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
 
 if [ $? -ne 0 ]; then
     echo "预训练失败，退出"
