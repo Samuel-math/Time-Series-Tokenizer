@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import math
 
 from .vqvae import Encoder, Decoder
+from .layers.attention import MultiheadAttention
 
 
 class FlattenedVectorQuantizer(nn.Module):
@@ -454,6 +455,9 @@ class PatchVQVAETransformer(nn.Module):
         self.compressed_len = self.patch_size // self.compression_factor
         self.code_dim = self.embedding_dim * self.compressed_len  # Transformer 输入维度
         
+        # Cross-attention的hidden_size（用于中间维度，默认使用patch_size）
+        self.cross_attn_hidden_size = config.get('cross_attn_hidden_size', self.patch_size)
+        
         # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
         self.use_patch_attention = config.get('use_patch_attention', False)
         patch_attention_type = config.get('patch_attention_type', 'tcn')  # 'tcn', 'attention', 或 'cross_attention'
@@ -506,6 +510,39 @@ class PatchVQVAETransformer(nn.Module):
         
         # 输出头: code_dim -> codebook_size (预测码本索引)
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
+        
+        # Cross-attention层（用于微调：历史patches作为k和v，预测码本元素作为q）
+        # Q: code_dim维度，K/V: patch_size维度，输出: patch_size维度
+        d_k = self.cross_attn_hidden_size // self.n_heads
+        d_v = self.cross_attn_hidden_size // self.n_heads
+        
+        # Q的投影层（code_dim -> d_k * n_heads）
+        self.cross_attn_W_Q = nn.Linear(self.code_dim, d_k * self.n_heads, bias=True)
+        # K的投影层（patch_size -> d_k * n_heads）
+        self.cross_attn_W_K = nn.Linear(self.patch_size, d_k * self.n_heads, bias=True)
+        # V的投影层（patch_size -> d_v * n_heads）
+        self.cross_attn_W_V = nn.Linear(self.patch_size, d_v * self.n_heads, bias=True)
+        
+        # Scaled Dot-Product Attention
+        self.cross_attn_scale = nn.Parameter(torch.tensor(d_k ** -0.5))
+        self.cross_attn_dropout = nn.Dropout(self.dropout)
+        
+        # 输出投影：直接输出patch_size维度
+        self.cross_attn_to_out = nn.Sequential(
+            nn.Linear(self.n_heads * d_v, self.patch_size),
+            nn.Dropout(self.dropout)
+        )
+        
+        # 使用hidden_size作为中间维度进行归一化和FFN
+        self.cross_attn_norm = nn.LayerNorm(self.patch_size)
+        self.cross_attn_ff = nn.Sequential(
+            nn.Linear(self.patch_size, self.d_ff),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.d_ff, self.patch_size),
+            nn.Dropout(self.dropout)
+        )
+        self.cross_attn_ff_norm = nn.LayerNorm(self.patch_size)
 
         self._n_channels = n_channels
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
@@ -517,27 +554,29 @@ class PatchVQVAETransformer(nn.Module):
             embedding_dim=self.embedding_dim,
             compression_factor=self.compression_factor
         )
-        self.decoder = Decoder(
-            in_channels=self.embedding_dim,
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            compression_factor=self.compression_factor,
-            out_channels=1  # 单通道输出
-        )
+        # self.decoder = Decoder(
+        #     in_channels=self.embedding_dim,
+        #     num_hiddens=self.num_hiddens,
+        #     num_residual_layers=self.num_residual_layers,
+        #     num_residual_hiddens=self.num_residual_hiddens,
+        #     compression_factor=self.compression_factor,
+        #     out_channels=1  # 单通道输出
+        # )
     
-    def encode_to_indices(self, x, return_processed_patches=False):
+    def encode_to_indices(self, x, return_processed_patches=False, return_raw_patches=False):
         """
         编码为码本索引和量化向量（channel-independent版本）
         
         Args:
             x: [B, T, C]
             return_processed_patches: 是否返回经过时序建模处理后的patches
+            return_raw_patches: 是否返回编码前的原始patches（用于cross-attention）
         Returns:
             indices: [B, num_patches, C]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
             x_patches_processed: [B, num_patches, patch_size, C] (如果return_processed_patches=True)
+            x_patches_raw: [B, num_patches, patch_size, C] (如果return_raw_patches=True)
         """
         B, T, C = x.shape
         
@@ -546,6 +585,9 @@ class PatchVQVAETransformer(nn.Module):
         # 重组为 patches: [B, num_patches, patch_size, C]
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
+        
+        # 保存原始patches（用于cross-attention）
+        x_patches_raw = x_patches if return_raw_patches else None
         
         # 应用Patch内时序建模（TCN或Attention，如果启用）
         if self.use_patch_attention:
@@ -598,9 +640,16 @@ class PatchVQVAETransformer(nn.Module):
         z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C  # 平均VQ损失
         
+        # 根据返回标志返回不同的结果
+        result = [indices, vq_loss, z_q]
         if return_processed_patches:
-            return indices, vq_loss, z_q, x_patches_processed
-        return indices, vq_loss, z_q
+            result.append(x_patches_processed)
+        if return_raw_patches:
+            result.append(x_patches_raw)
+        
+        if len(result) == 3:
+            return tuple(result)
+        return tuple(result)
     
     def decode_from_codes(self, z_q):
         """
@@ -680,20 +729,33 @@ class PatchVQVAETransformer(nn.Module):
     
     def forward_finetune(self, x, target_len):
         """
-        微调: 预测未来序列（非自回归版本，channel-independent）
+        微调: 使用Cross-Attention预测未来序列（channel-independent）
         
-        1. 编码输入为量化向量
-        2. 创建占位符位置（pred_len / patch_size个）
-        3. Transformer 处理整个序列（输入 + 占位符），一次性预测所有未来patches
-        4. 从码本获取向量并解码
+        1. 编码历史输入，获取原始patches（作为k和v）
+        2. 预测未来码本元素（作为q）
+        3. 使用Cross-Attention让q attend to k和v（原始patches）
+        4. 解码得到最终预测
         
-        非自回归：先留出对应数量的位置，然后对应预测，最终解码
+        Args:
+            x: [B, T, C] 历史时间序列
+            target_len: 预测长度
+        Returns:
+            pred: [B, target_len, C] 预测结果
+            vq_loss: VQ损失
         """
         B, T, C = x.shape
         num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
         
-        # 编码输入
-        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
+        # 1. 编码历史输入，获取原始patches和量化向量
+        result = self.encode_to_indices(x, return_raw_patches=True)
+        if len(result) == 4:
+            indices, vq_loss, z_q, x_patches_raw = result
+        else:
+            indices, vq_loss, z_q = result
+            # 如果没有返回原始patches，从输入重新构建
+            num_patches = indices.shape[1]
+            x_patches_raw = x[:, :num_patches * self.patch_size, :].reshape(B, num_patches, self.patch_size, C)
+        
         num_input_patches = z_q.shape[1]
         
         # Channel-independent: 批量处理所有通道以加速
@@ -701,31 +763,83 @@ class PatchVQVAETransformer(nn.Module):
         B, num_patches, C, code_dim = z_q.shape
         z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
         
+        # 2. 预测未来码本元素（作为q）
         # 创建占位符（零向量）: [B*C, num_pred_patches, code_dim]
         placeholder = torch.zeros(B * C, num_pred_patches, self.code_dim, device=z_q_flat.device, dtype=z_q_flat.dtype)
         
         # 拼接输入序列和占位符: [B*C, num_patches + num_pred_patches, code_dim]
         full_sequence = torch.cat([z_q_flat, placeholder], dim=1)  # [B*C, num_patches + num_pred_patches, code_dim]
         
-        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
+        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列）
         h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, code_dim]
         
-        # 只取占位符位置的输出: [B*C, num_pred_patches, code_dim]
-        h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
+        # 只取占位符位置的输出作为初始q: [B*C, num_pred_patches, code_dim]
+        q_init = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
         
-        # 输出头: [B*C, num_pred_patches, codebook_size]
-        logits = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
+        # 3. 准备k和v：原始patches（保持patch_size维度）
+        # x_patches_raw: [B, num_patches, patch_size, C]
+        # 对每个通道独立处理
+        k_list = []
+        v_list = []
         
-        # 使用 softmax + 加权求和 替代 argmax，保持可微分
-        weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
-        codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-        pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
+        for c in range(C):
+            # 提取第c个通道的patches: [B, num_patches, patch_size]
+            x_patches_c = x_patches_raw[:, :, :, c]  # [B, num_patches, patch_size]
+            k_list.append(x_patches_c)
+            v_list.append(x_patches_c)
         
-        # Reshape回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
-        pred_codes = pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)  # [B, num_pred_patches, C, code_dim]
+        # 合并所有通道: [B, num_patches, C, patch_size]
+        k_all = torch.stack(k_list, dim=2)  # [B, num_patches, C, patch_size]
+        v_all = torch.stack(v_list, dim=2)  # [B, num_patches, C, patch_size]
         
-        # 解码
-        pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
+        # Reshape为批量格式: [B*C, num_patches, patch_size]
+        k_flat = k_all.permute(0, 2, 1, 3).reshape(B * C, num_patches, self.patch_size)  # [B*C, num_patches, patch_size]
+        v_flat = v_all.permute(0, 2, 1, 3).reshape(B * C, num_patches, self.patch_size)  # [B*C, num_patches, patch_size]
+        
+        # 4. Cross-Attention: q attend to k和v（原始patches）
+        # q: [B*C, num_pred_patches, code_dim] (预测的码本元素)
+        # k, v: [B*C, num_patches, patch_size] (原始patches)
+        # 输出: [B*C, num_pred_patches, patch_size] (直接输出patch_size维度)
+        
+        # 投影Q, K, V
+        bs = q_init.size(0)
+        d_k = self.cross_attn_hidden_size // self.n_heads
+        d_v = self.cross_attn_hidden_size // self.n_heads
+        
+        q_s = self.cross_attn_W_Q(q_init).view(bs, -1, self.n_heads, d_k).transpose(1, 2)  # [B*C, n_heads, num_pred_patches, d_k]
+        k_s = self.cross_attn_W_K(k_flat).view(bs, -1, self.n_heads, d_k).permute(0, 2, 3, 1)  # [B*C, n_heads, d_k, num_patches]
+        v_s = self.cross_attn_W_V(v_flat).view(bs, -1, self.n_heads, d_v).transpose(1, 2)  # [B*C, n_heads, num_patches, d_v]
+        
+        # Scaled Dot-Product Attention
+        attn_scores = torch.matmul(q_s, k_s) * self.cross_attn_scale  # [B*C, n_heads, num_pred_patches, num_patches]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B*C, n_heads, num_pred_patches, num_patches]
+        attn_weights = self.cross_attn_dropout(attn_weights)
+        
+        # 应用attention权重到V
+        attn_out = torch.matmul(attn_weights, v_s)  # [B*C, n_heads, num_pred_patches, d_v]
+        
+        # Reshape并投影输出：直接输出patch_size维度
+        attn_out = attn_out.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * d_v)  # [B*C, num_pred_patches, n_heads * d_v]
+        attn_out = self.cross_attn_to_out(attn_out)  # [B*C, num_pred_patches, patch_size]
+        
+        # 残差连接：需要将q_init从code_dim投影到patch_size
+        # 由于q_init是code_dim维度，而attn_out是patch_size维度，我们需要一个临时投影
+        # 或者使用零向量作为残差（因为维度不匹配）
+        # 这里我们使用零向量作为残差连接的起点
+        q_init_patch = torch.zeros(bs, num_pred_patches, self.patch_size, device=q_init.device, dtype=q_init.dtype)
+        q_attended = self.cross_attn_norm(q_init_patch + attn_out)  # [B*C, num_pred_patches, patch_size]
+        
+        # FFN
+        ffn_out = self.cross_attn_ff(q_attended)  # [B*C, num_pred_patches, patch_size]
+        q_final = self.cross_attn_ff_norm(q_attended + ffn_out)  # [B*C, num_pred_patches, patch_size]
+        
+        # 5. 直接输出patches，无需经过codebook
+        # q_final: [B*C, num_pred_patches, patch_size]
+        # Reshape回通道分离格式: [B*C, num_pred_patches, patch_size] -> [B, num_pred_patches, C, patch_size]
+        pred_patches = q_final.reshape(B, C, num_pred_patches, self.patch_size).permute(0, 2, 1, 3)  # [B, num_pred_patches, C, patch_size]
+        
+        # Reshape为时间序列: [B, num_pred_patches * patch_size, C]
+        pred = pred_patches.reshape(B, -1, C)  # [B, num_pred_patches * patch_size, C]
         pred = pred[:, :target_len, :]  # [B, target_len, C]
         
         return pred, vq_loss
@@ -938,6 +1052,8 @@ def get_model_config(args):
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
+        # Cross-attention hidden_size（可选，默认使用patch_size）
+        'cross_attn_hidden_size': getattr(args, 'cross_attn_hidden_size', None),
     }
     
     # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）

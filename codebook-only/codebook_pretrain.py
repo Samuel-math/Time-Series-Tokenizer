@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.models.codebook_model import CodebookModel
 from src.models.layers.revin import RevIN
+from src.models.vqgan_discriminator import TimeSeriesDiscriminator, PerceptualLoss
 from src.basics import set_device
 from datautils import get_dls
 
@@ -60,6 +61,13 @@ def parse_args():
     parser.add_argument('--vq_weight', type=float, default=1.0, help='VQ损失权重')
     parser.add_argument('--recon_weight', type=float, default=1.0, help='重构损失权重')
     
+    # VQGAN参数
+    parser.add_argument('--use_vqgan', type=int, default=0, help='是否使用VQGAN（1启用，0禁用）')
+    parser.add_argument('--discriminator_lr', type=float, default=1e-4, help='判别器学习率')
+    parser.add_argument('--discriminator_weight', type=float, default=0.1, help='判别器损失权重')
+    parser.add_argument('--perceptual_weight', type=float, default=1.0, help='感知损失权重')
+    parser.add_argument('--discriminator_start_epoch', type=int, default=5, help='从第几个epoch开始训练判别器')
+    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/codebook/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -86,14 +94,23 @@ def get_model_config(args):
     return config
 
 
-def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
+def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, 
+                discriminator=None, disc_optimizer=None, perceptual_loss=None, epoch=0):
     """训练一个epoch"""
     model.train()
+    if discriminator is not None:
+        discriminator.train()
+    
     total_loss = 0
     total_vq_loss = 0
     total_recon_loss = 0
     total_perplexity = 0
+    total_disc_loss = 0
+    total_gen_loss = 0
+    total_perceptual_loss = 0
     n_batches = 0
+    
+    use_vqgan = args.use_vqgan and epoch >= args.discriminator_start_epoch
     
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
@@ -111,10 +128,48 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         recon_len = num_patches * model.patch_size
         recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
         
-        # 总损失
+        # 基础损失
         loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
         
-        # 反向传播
+        # VQGAN损失
+        disc_loss = 0
+        gen_loss = 0
+        perceptual_loss_val = 0
+        
+        if use_vqgan and discriminator is not None:
+            # 感知损失
+            if perceptual_loss is not None:
+                perceptual_loss_val = perceptual_loss(batch_x[:, :recon_len, :], x_recon)
+                loss += args.perceptual_weight * perceptual_loss_val
+            
+            # 训练判别器
+            if disc_optimizer is not None:
+                disc_optimizer.zero_grad()
+                
+                # 真实数据
+                real_prob = discriminator(batch_x[:, :recon_len, :])
+                real_loss = F.binary_cross_entropy(real_prob, torch.ones_like(real_prob))
+                
+                # 重构数据
+                fake_prob = discriminator(x_recon.detach())
+                fake_loss = F.binary_cross_entropy(fake_prob, torch.zeros_like(fake_prob))
+                
+                disc_loss = (real_loss + fake_loss) / 2
+                
+                if scaler.is_enabled():
+                    scaler.scale(disc_loss).backward()
+                    scaler.step(disc_optimizer)
+                    scaler.update()
+                else:
+                    disc_loss.backward()
+                    disc_optimizer.step()
+            
+            # 生成器损失（对抗损失）
+            fake_prob_gen = discriminator(x_recon)
+            gen_loss = F.binary_cross_entropy(fake_prob_gen, torch.ones_like(fake_prob_gen))
+            loss += args.discriminator_weight * gen_loss
+        
+        # 反向传播（生成器）
         optimizer.zero_grad()
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -137,6 +192,9 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
         total_perplexity += perplexity
+        total_disc_loss += disc_loss if isinstance(disc_loss, (int, float)) else disc_loss.item()
+        total_gen_loss += gen_loss if isinstance(gen_loss, (int, float)) else gen_loss.item()
+        total_perceptual_loss += perceptual_loss_val if isinstance(perceptual_loss_val, (int, float)) else perceptual_loss_val.item()
         n_batches += 1
     
     return {
@@ -144,6 +202,9 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
+        'disc_loss': total_disc_loss / n_batches if n_batches > 0 else 0.0,
+        'gen_loss': total_gen_loss / n_batches if n_batches > 0 else 0.0,
+        'perceptual_loss': total_perceptual_loss / n_batches if n_batches > 0 else 0.0,
     }
 
 
@@ -229,6 +290,30 @@ def main():
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
+    # VQGAN组件
+    discriminator = None
+    disc_optimizer = None
+    perceptual_loss = None
+    
+    if args.use_vqgan:
+        print('\n初始化VQGAN组件...')
+        # 判别器
+        discriminator = TimeSeriesDiscriminator(
+            n_channels=dls.vars,
+            patch_size=args.patch_size,
+            num_hiddens=64,
+            num_layers=3
+        ).to(device)
+        disc_optimizer = AdamW(discriminator.parameters(), lr=args.discriminator_lr, weight_decay=args.weight_decay)
+        
+        # 感知损失
+        perceptual_loss = PerceptualLoss(n_channels=dls.vars, num_layers=2).to(device)
+        
+        disc_params = sum(p.numel() for p in discriminator.parameters())
+        print(f'  判别器参数: {disc_params:,}')
+        print(f'  感知损失: 已启用')
+        print(f'  判别器训练起始epoch: {args.discriminator_start_epoch}')
+    
     # 优化器和调度器
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=args.lr * 0.01)  # eta_min设为初始lr的1%
@@ -248,22 +333,37 @@ def main():
     
     for epoch in range(args.n_epochs):
         # 训练
-        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
+        train_metrics = train_epoch(
+            model, dls.train, optimizer, revin, args, device, scaler,
+            discriminator=discriminator,
+            disc_optimizer=disc_optimizer,
+            perceptual_loss=perceptual_loss,
+            epoch=epoch
+        )
         
         # 验证
         val_metrics = validate_epoch(model, dls.valid, revin, args, device)
         
         # 在验证后更新学习率
         scheduler.step()
+        if disc_optimizer is not None:
+            # 判别器学习率也更新（可选）
+            pass
         
         train_losses.append(train_metrics['loss'])
         valid_losses.append(val_metrics['loss'])
         
         # 打印进度（包含当前学习率）
         current_lr = optimizer.param_groups[0]['lr']
+        loss_str = f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
+        loss_str += f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}"
+        
+        if args.use_vqgan and epoch >= args.discriminator_start_epoch:
+            loss_str += f", Disc: {train_metrics['disc_loss']:.4f}, Gen: {train_metrics['gen_loss']:.4f}"
+            loss_str += f", Perceptual: {train_metrics['perceptual_loss']:.4f}"
+        
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | LR: {current_lr:.2e} | "
-              f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
-              f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
+              f"{loss_str}) | "
               f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
               f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
         
@@ -285,6 +385,11 @@ def main():
                     'train_loss': train_metrics['loss'],
                     'val_loss': val_metrics['loss'],
                 }
+                
+                # 如果使用VQGAN，也保存判别器
+                if args.use_vqgan and discriminator is not None:
+                    checkpoint['discriminator_state_dict'] = discriminator.state_dict()
+                
                 torch.save(checkpoint, save_dir / f'{model_name}.pth')
                 print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
             elif model_saved:
