@@ -9,9 +9,15 @@
 # 1. 加载预训练的码本模型（encoder、VQ，冻结所有参数）
 #    - 注意：Decoder已被注释掉，不再使用
 # 2. 在码本基础上训练Transformer进行NTP预训练
+#    - Transformer支持独立的hidden_size参数（transformer_hidden_size）
+#    - 如果设置，Transformer内部使用hidden_size，输入输出通过投影层与code_dim转换
+#    - output_head的输入维度匹配Transformer的输出维度（hidden_size或code_dim）
 # 3. 微调Transformer进行时间序列预测
+#    - 冻结组件：Encoder、VQ、Patch Attention、Transformer、Output Head
+#    - Transformer输出通过output_head得到logits，argmax后从码本获取embedding作为cross-attention的q
 #    - Cross-Attention直接输出patch_size维度，不再经过code_dim
-#    - 使用cross_attn_hidden_size控制attention中间维度（默认=patch_size）
+#    - 使用cross_attn_hidden_size控制cross-attention中间维度（默认=patch_size）
+#    - 冻结Transformer和Output Head避免argmax导致的梯度断开问题
 # =====================================================
 
 # =====================================================
@@ -48,8 +54,10 @@ CODEBOOK_EMA=1
 EMA_DECAY=0.99
 EMA_EPS=1e-5
 # transformer_hidden_size: Transformer的hidden_size，默认使用code_dim
-# 如果设置，Transformer内部将使用此维度，输入输出通过投影层与code_dim转换
-TRANSFORMER_HIDDEN_SIZE=""  # 留空表示使用默认值（code_dim），可根据需要设置
+#   - 如果设置，Transformer内部将使用此维度，输入输出通过投影层与code_dim转换
+#   - output_head的输入维度会自动匹配Transformer的输出维度（hidden_size或code_dim）
+#   - 在微调阶段，Transformer和output_head会被冻结
+TRANSFORMER_HIDDEN_SIZE=256  # 留空表示使用默认值（code_dim），可根据需要设置
 
 # ----- 预训练参数 -----
 PRETRAIN_CONTEXT_POINTS=512
@@ -205,7 +213,8 @@ PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
 
 echo ""
 echo "================================================="
-echo "阶段 2: 微调（冻结码本：Encoder + VQ，Cross-Attention直接输出patch_size）"
+echo "阶段 2: 微调（冻结：Encoder + VQ + Patch Attention + Transformer + Output Head）"
+echo "         Cross-Attention直接输出patch_size维度"
 echo "================================================="
 echo "预训练模型: ${PRETRAINED_MODEL}"
 echo "Context Points: ${FINETUNE_CONTEXT_POINTS}"
