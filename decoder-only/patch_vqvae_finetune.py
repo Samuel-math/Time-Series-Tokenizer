@@ -52,7 +52,7 @@ def parse_args():
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
-    parser.add_argument('--eval_interval_batches', type=int, default=100, help='每N个batch评估一次')
+    parser.add_argument('--evals_per_epoch', type=int, default=4, help='每个epoch评估次数')
     
     return parser.parse_args()
 
@@ -252,38 +252,35 @@ def main():
     # 训练
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
-    train_batch_losses = []  # 记录每个batch的loss
-    no_improve_count = 0  # 早停计数器（基于评估次数）
-    early_stop_patience = 10  # 连续10次评估不下降就停止
+    no_improve_epochs = 0  # 连续无改善的epoch数
+    early_stop_patience = 10  # 连续10个epoch无下降就停止
+    best_epoch = -1  # 最佳模型所在的epoch
     
-    global_batch_count = 0
-    eval_count = 0  # 评估次数计数
     start_time = time.time()
+    total_batches = len(dls.train)
+    batches_per_eval = total_batches // args.evals_per_epoch  # 每个评估点之间的batch数
     
     print(f'\n开始微调，共 {args.n_epochs} 个 epoch')
-    print(f'评估策略: 每 {args.eval_interval_batches} 个 batch 评估一次')
-    print(f'早停: 连续 {early_stop_patience} 次评估不下降则停止')
+    print(f'评估策略: 每个 epoch 评估 {args.evals_per_epoch} 次（每 {batches_per_eval} 个 batch 评估一次）')
+    print(f'早停: 连续 {early_stop_patience} 个 epoch 无改善则停止')
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
         model.train()
         epoch_train_losses = []
+        epoch_best_val_loss = float('inf')  # 当前epoch的最佳验证损失
         
         for batch_idx, (batch_x, batch_y) in enumerate(dls.train):
             # 训练一个batch
             loss = train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
             epoch_train_losses.append(loss)
-            train_batch_losses.append(loss)
-            global_batch_count += 1
             
-            # 每N个batch进行一次评估
-            if global_batch_count % args.eval_interval_batches == 0:
-                eval_count += 1
-                scheduler.step()  # 更新学习率
-                
-                # 计算最近N个batch的平均训练loss
-                recent_batches = epoch_train_losses[-args.eval_interval_batches:]
-                avg_train_loss = np.mean(recent_batches)
+            # 每个epoch评估4次：在1/4, 2/4, 3/4, 4/4处评估
+            if (batch_idx + 1) % batches_per_eval == 0 or (batch_idx + 1) == total_batches:
+                # 计算当前段的平均训练loss
+                segment_start = max(0, batch_idx + 1 - batches_per_eval)
+                segment_losses = epoch_train_losses[segment_start:]
+                avg_train_loss = np.mean(segment_losses)
                 
                 # 验证评估
                 val_loss = validate_epoch(model, dls.valid, revin, args, device, use_amp)
@@ -291,44 +288,63 @@ def main():
                 train_losses.append(avg_train_loss)
                 valid_losses.append(val_loss)
                 
-                total_time = time.time() - start_time
+                # 更新当前epoch的最佳验证损失
+                if val_loss < epoch_best_val_loss:
+                    epoch_best_val_loss = val_loss
                 
-                # 检查是否是最佳模型
-                is_best = val_loss < best_val_loss
-                if is_best:
-                    best_val_loss = val_loss
-                    no_improve_count = 0  # 重置计数器
-                    
-                    # 保存最佳模型
-                    checkpoint = {
-                        'model_state_dict': model.state_dict(),
-                        'config': config,
-                        'args': vars(args),
-                        'global_batch_count': global_batch_count,
-                        'epoch': epoch,
-                        'eval_count': eval_count,
-                        'train_loss': avg_train_loss,
-                        'val_loss': val_loss,
-                        'timestamp': datetime.now().isoformat(),
-                        'total_training_time_seconds': total_time,
-                    }
-                    torch.save(checkpoint, save_dir / f'{model_name}.pth')
-                else:
-                    no_improve_count += 1
+                total_time = time.time() - start_time
+                eval_idx = (batch_idx + 1) // batches_per_eval
                 
                 # 打印进度
-                status = "*Best*" if is_best else ""
-                print(f"Batch {global_batch_count:6d} | Epoch {epoch+1:3d}/{args.n_epochs} | "
+                print(f"Epoch {epoch+1:3d}/{args.n_epochs} | Eval {eval_idx}/{args.evals_per_epoch} | "
                       f"Train Loss: {avg_train_loss:.6f} | Valid Loss: {val_loss:.6f} | "
-                      f"Time: {total_time/60:.1f}min {status}")
-                
-                # 早停检查
-                if no_improve_count >= early_stop_patience:
-                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 次评估未下降")
-                    break
+                      f"Time: {total_time/60:.1f}min")
         
-        # 如果早停，跳出epoch循环
-        if no_improve_count >= early_stop_patience:
+        # Epoch结束，更新学习率
+        scheduler.step()
+        
+        # 检查当前epoch是否改善了最佳验证损失
+        if epoch_best_val_loss < best_val_loss:
+            best_val_loss = epoch_best_val_loss
+            best_epoch = epoch
+            no_improve_epochs = 0  # 重置计数器
+            
+            # 保存最佳模型
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'config': config,
+                'args': vars(args),
+                'epoch': epoch,
+                'train_loss': np.mean(epoch_train_losses),
+                'val_loss': epoch_best_val_loss,
+                'timestamp': datetime.now().isoformat(),
+                'total_training_time_seconds': time.time() - start_time,
+            }
+            torch.save(checkpoint, save_dir / f'{model_name}.pth')
+            print(f"  -> Epoch {epoch+1} 最佳模型已保存 (val_loss: {epoch_best_val_loss:.6f})")
+        else:
+            no_improve_epochs += 1
+            print(f"  -> Epoch {epoch+1} 无改善 (当前最佳: epoch {best_epoch+1}, val_loss: {best_val_loss:.6f}, "
+                  f"连续 {no_improve_epochs} 个epoch无改善)")
+        
+        # 早停检查：连续10个epoch无改善
+        if no_improve_epochs >= early_stop_patience:
+            print(f"\n>>> 早停: 连续 {early_stop_patience} 个 epoch 无改善")
+            # 保存当前模型（10个epoch无改善时的模型）
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'config': config,
+                'args': vars(args),
+                'epoch': epoch,
+                'train_loss': np.mean(epoch_train_losses),
+                'val_loss': epoch_best_val_loss,
+                'timestamp': datetime.now().isoformat(),
+                'total_training_time_seconds': time.time() - start_time,
+                'early_stopped': True,
+            }
+            final_model_name = f'{model_name}_final_epoch{epoch+1}.pth'
+            torch.save(checkpoint, save_dir / final_model_name)
+            print(f"  -> 最终模型已保存: {final_model_name}")
             break
     
     # 测试
@@ -352,7 +368,6 @@ def main():
     # 保存训练历史 (基于评估次数)
     history_df = pd.DataFrame({
         'eval_count': range(1, len(train_losses) + 1),
-        'global_batch_count': [args.eval_interval_batches * i for i in range(1, len(train_losses) + 1)],
         'train_loss': train_losses,
         'valid_loss': valid_losses,
     })
