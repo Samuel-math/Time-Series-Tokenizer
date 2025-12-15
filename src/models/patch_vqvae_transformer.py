@@ -23,15 +23,63 @@ class FlattenedVectorQuantizer(nn.Module):
     展平的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
     """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, init_method='uniform'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
+        self.init_method = init_method
         
         # 码本: [codebook_size, code_dim]
         self.embedding = nn.Embedding(codebook_size, code_dim)
-        self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        
+        # 初始化方法
+        if init_method == 'uniform':
+            self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        elif init_method == 'normal':
+            nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        elif init_method == 'xavier':
+            nn.init.xavier_uniform_(self.embedding.weight)
+        elif init_method == 'kaiming':
+            nn.init.kaiming_uniform_(self.embedding.weight)
+        else:
+            # 默认uniform
+            self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+    
+    def init_from_data(self, z_samples, method='kmeans', random_state=42):
+        """
+        从数据初始化码本（数据驱动初始化）
+        
+        Args:
+            z_samples: [N, code_dim] encoder输出的样本
+            method: 'kmeans' 或 'random_sample'
+            random_state: 随机种子
+        """
+        if method == 'kmeans':
+            try:
+                from sklearn.cluster import KMeans
+                z_np = z_samples.detach().cpu().numpy()
+                kmeans = KMeans(n_clusters=self.codebook_size, random_state=random_state, n_init=10, max_iter=300)
+                kmeans.fit(z_np)
+                centroids = torch.tensor(kmeans.cluster_centers_, dtype=z_samples.dtype, device=z_samples.device)
+                self.embedding.weight.data.copy_(centroids)
+                print(f"✓ 码本已从K-means聚类初始化 (codebook_size={self.codebook_size}, 样本数={len(z_samples)})")
+            except ImportError:
+                print("警告: sklearn未安装，使用随机采样初始化")
+                method = 'random_sample'
+        
+        if method == 'random_sample':
+            # 随机采样N个样本作为码本中心
+            N = z_samples.size(0)
+            if N >= self.codebook_size:
+                perm = torch.randperm(N, generator=torch.Generator().manual_seed(random_state))[:self.codebook_size]
+                centroids = z_samples[perm]
+            else:
+                # 如果样本数不足，使用重复采样
+                indices = torch.randint(0, N, (self.codebook_size,), generator=torch.Generator().manual_seed(random_state))
+                centroids = z_samples[indices]
+            self.embedding.weight.data.copy_(centroids)
+            print(f"✓ 码本已从随机采样初始化 (codebook_size={self.codebook_size}, 样本数={N})")
     
     def forward(self, z_flat):
         """
@@ -66,17 +114,31 @@ class FlattenedVectorQuantizerEMA(nn.Module):
     使用 EMA 更新码本的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
     """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, init_method='uniform'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
         self.decay = decay
         self.eps = eps
+        self.init_method = init_method
         
         # 码本权重与EMA状态
-        embed = torch.randn(codebook_size, code_dim)
-        embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        if init_method == 'uniform':
+            embed = torch.randn(codebook_size, code_dim)
+            embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        elif init_method == 'normal':
+            embed = torch.randn(codebook_size, code_dim) * 0.02
+        elif init_method == 'xavier':
+            embed = torch.empty(codebook_size, code_dim)
+            nn.init.xavier_uniform_(embed)
+        elif init_method == 'kaiming':
+            embed = torch.empty(codebook_size, code_dim)
+            nn.init.kaiming_uniform_(embed)
+        else:
+            embed = torch.randn(codebook_size, code_dim)
+            embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        
         self.embedding = nn.Embedding(codebook_size, code_dim)
         self.embedding.weight.data.copy_(embed)
         self.embedding.weight.requires_grad = False
@@ -85,6 +147,43 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         self.register_buffer('ema_w', embed.clone())
         # 标志：是否禁用EMA更新（当VQ被冻结时）
         self._disable_ema_update = False
+    
+    def init_from_data(self, z_samples, method='kmeans', random_state=42):
+        """
+        从数据初始化码本（数据驱动初始化）
+        
+        Args:
+            z_samples: [N, code_dim] encoder输出的样本
+            method: 'kmeans' 或 'random_sample'
+            random_state: 随机种子
+        """
+        if method == 'kmeans':
+            try:
+                from sklearn.cluster import KMeans
+                z_np = z_samples.detach().cpu().numpy()
+                kmeans = KMeans(n_clusters=self.codebook_size, random_state=random_state, n_init=10, max_iter=300)
+                kmeans.fit(z_np)
+                centroids = torch.tensor(kmeans.cluster_centers_, dtype=z_samples.dtype, device=z_samples.device)
+                self.embedding.weight.data.copy_(centroids)
+                self.ema_w.data.copy_(centroids)
+                print(f"✓ 码本已从K-means聚类初始化 (codebook_size={self.codebook_size}, 样本数={len(z_samples)})")
+            except ImportError:
+                print("警告: sklearn未安装，使用随机采样初始化")
+                method = 'random_sample'
+        
+        if method == 'random_sample':
+            # 随机采样N个样本作为码本中心
+            N = z_samples.size(0)
+            if N >= self.codebook_size:
+                perm = torch.randperm(N, generator=torch.Generator().manual_seed(random_state))[:self.codebook_size]
+                centroids = z_samples[perm]
+            else:
+                # 如果样本数不足，使用重复采样
+                indices = torch.randint(0, N, (self.codebook_size,), generator=torch.Generator().manual_seed(random_state))
+                centroids = z_samples[indices]
+            self.embedding.weight.data.copy_(centroids)
+            self.ema_w.data.copy_(centroids)
+            print(f"✓ 码本已从随机采样初始化 (codebook_size={self.codebook_size}, 样本数={N})")
     
     def forward(self, z_flat):
         """
@@ -516,14 +615,17 @@ class PatchVQVAETransformer(nn.Module):
             self.patch_attention = None
         
         # VQ (码本维度 = code_dim)
+        vq_init_method = config.get('vq_init_method', 'uniform')
         if self.use_codebook_ema:
             self.vq = FlattenedVectorQuantizerEMA(
                 self.codebook_size, self.code_dim, self.commitment_cost,
-                decay=self.ema_decay, eps=self.ema_eps
+                decay=self.ema_decay, eps=self.ema_eps,
+                init_method=vq_init_method
             )
         else:
             self.vq = FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost
+                self.codebook_size, self.code_dim, self.commitment_cost,
+                init_method=vq_init_method
             )
         
         # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)

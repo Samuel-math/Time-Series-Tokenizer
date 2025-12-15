@@ -45,15 +45,79 @@ class CodebookModel(nn.Module):
         )
         
         # VQ
+        init_method = config.get('vq_init_method', 'uniform')
         if config.get('codebook_ema', False):
             self.vq = FlattenedVectorQuantizerEMA(
                 self.codebook_size, self.code_dim, self.commitment_cost,
-                decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5)
+                decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
+                init_method=init_method
             )
         else:
             self.vq = FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost
+                self.codebook_size, self.code_dim, self.commitment_cost,
+                init_method=init_method
             )
+    
+    def init_codebook_from_data(self, dataloader, device, num_samples=10000, method='kmeans', revin=None):
+        """
+        从数据初始化码本（数据驱动初始化）
+        
+        Args:
+            dataloader: 数据加载器
+            device: 设备
+            num_samples: 收集的样本数量
+            method: 'kmeans' 或 'random_sample'
+            revin: RevIN归一化器（可选）
+        """
+        self.eval()
+        z_samples_list = []
+        n_collected = 0
+        
+        print(f"\n收集encoder输出用于码本初始化（目标样本数: {num_samples}）...")
+        
+        with torch.no_grad():
+            for batch_x, _ in dataloader:
+                if n_collected >= num_samples:
+                    break
+                
+                batch_x = batch_x.to(device)
+                
+                # RevIN归一化（如果使用）
+                if revin is not None:
+                    batch_x = revin(batch_x, 'norm')
+                
+                B, T, C = batch_x.shape
+                num_patches = T // self.patch_size
+                x = batch_x[:, :num_patches * self.patch_size, :]
+                x_patches = x.reshape(B, num_patches, self.patch_size, C)
+                
+                # 收集所有通道的encoder输出
+                for c in range(C):
+                    x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
+                    x_c_flat = x_c.reshape(B * num_patches, self.patch_size)
+                    x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size]
+                    
+                    # Encoder输出
+                    z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
+                    z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+                    
+                    z_samples_list.append(z_flat)
+                    n_collected += z_flat.size(0)
+                    
+                    if n_collected >= num_samples:
+                        break
+        
+        # 合并所有样本
+        z_samples = torch.cat(z_samples_list, dim=0)  # [N, code_dim]
+        if z_samples.size(0) > num_samples:
+            z_samples = z_samples[:num_samples]
+        
+        print(f"已收集 {z_samples.size(0)} 个encoder输出样本")
+        
+        # 初始化码本
+        self.vq.init_from_data(z_samples, method=method)
+        
+        self.train()  # 恢复训练模式
     
     def encode_to_indices(self, x):
         """

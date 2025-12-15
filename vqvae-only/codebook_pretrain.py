@@ -51,6 +51,20 @@ def parse_args():
     parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减率')
     parser.add_argument('--ema_eps', type=float, default=1e-5, help='EMA epsilon')
     
+    # 码本初始化参数
+    parser.add_argument('--vq_init_method', type=str, default='uniform', 
+                       choices=['uniform', 'normal', 'xavier', 'kaiming'],
+                       help='码本初始化方法（uniform/normal/xavier/kaiming）')
+    parser.add_argument('--codebook_init_from_data', type=int, default=0, 
+                       help='是否从数据初始化码本（1启用，使用K-means聚类）')
+    parser.add_argument('--codebook_init_samples', type=int, default=10000,
+                       help='用于初始化码本的样本数量')
+    parser.add_argument('--codebook_init_method', type=str, default='kmeans',
+                       choices=['kmeans', 'random_sample'],
+                       help='数据初始化方法（kmeans/random_sample）')
+    parser.add_argument('--codebook_report_interval', type=int, default=5,
+                       help='码本利用率报告间隔（每N个epoch报告一次）')
+    
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
@@ -78,12 +92,45 @@ def get_model_config(args):
         'codebook_ema': bool(args.codebook_ema),
         'ema_decay': args.ema_decay,
         'ema_eps': args.ema_eps,
+        'vq_init_method': args.vq_init_method,
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
         'use_patch_attention': False,  # 码本预训练不使用patch attention
     }
     return config
+
+
+def compute_codebook_usage_stats(indices, codebook_size):
+    """
+    计算码本利用率统计信息
+    
+    Args:
+        indices: [B, num_patches, C] 码本索引
+        codebook_size: 码本大小
+    Returns:
+        dict: 包含利用率统计信息的字典
+    """
+    indices_flat = indices.reshape(-1).cpu()  # [N]
+    unique_indices = torch.unique(indices_flat)
+    num_used = len(unique_indices)
+    usage_rate = num_used / codebook_size
+    
+    # 计算每个码本元素的使用频率
+    counts = torch.bincount(indices_flat, minlength=codebook_size)
+    num_unused = (counts == 0).sum().item()
+    
+    # 最常用的前5个码本元素
+    top5_counts, top5_indices = torch.topk(counts, k=min(5, codebook_size))
+    top5_usage = [(idx.item(), count.item()) for idx, count in zip(top5_indices, top5_counts) if count > 0]
+    
+    return {
+        'num_used': num_used,
+        'num_unused': num_unused,
+        'usage_rate': usage_rate,
+        'top5_usage': top5_usage,
+        'total_tokens': len(indices_flat),
+    }
 
 
 def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
@@ -94,6 +141,9 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     total_recon_loss = 0
     total_perplexity = 0
     n_batches = 0
+    
+    # 用于累积码本使用统计
+    all_indices_list = []
     
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
@@ -131,17 +181,25 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         unique_indices = torch.unique(indices.reshape(-1))
         perplexity = len(unique_indices) / args.codebook_size
         
+        # 累积索引用于统计
+        all_indices_list.append(indices.detach().cpu())
+        
         total_loss += loss.item()
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
         total_perplexity += perplexity
         n_batches += 1
     
+    # 计算整个epoch的码本利用率统计
+    all_indices_epoch = torch.cat(all_indices_list, dim=0)  # [total_B, num_patches, C]
+    codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
+    
     return {
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
+        'codebook_stats': codebook_stats,
     }
 
 
@@ -153,6 +211,9 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_recon_loss = 0
     total_perplexity = 0
     n_batches = 0
+    
+    # 用于累积码本使用统计
+    all_indices_list = []
     
     with torch.no_grad():
         for batch_x, _ in dataloader:
@@ -178,17 +239,25 @@ def validate_epoch(model, dataloader, revin, args, device):
             unique_indices = torch.unique(indices.reshape(-1))
             perplexity = len(unique_indices) / args.codebook_size
             
+            # 累积索引用于统计
+            all_indices_list.append(indices.cpu())
+            
             total_loss += loss.item()
             total_vq_loss += vq_loss.item()
             total_recon_loss += recon_loss.item()
             total_perplexity += perplexity
             n_batches += 1
     
+    # 计算整个epoch的码本利用率统计
+    all_indices_epoch = torch.cat(all_indices_list, dim=0)  # [total_B, num_patches, C]
+    codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
+    
     return {
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
+        'codebook_stats': codebook_stats,
     }
 
 
@@ -218,14 +287,25 @@ def main():
     config = get_model_config(args)
     model = CodebookModel(config, dls.vars).to(device)
     
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    
+    # 数据驱动的码本初始化（如果启用）
+    if args.codebook_init_from_data:
+        print(f'\n使用数据驱动初始化码本（方法: {args.codebook_init_method}）...')
+        model.init_codebook_from_data(
+            dls.train, device, 
+            num_samples=args.codebook_init_samples,
+            method=args.codebook_init_method,
+            revin=revin
+        )
+    
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     print(f'\n码本模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  所有参数均可训练')
-    
-    # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    print(f'  码本初始化方法: {args.vq_init_method}' + (' + 数据驱动' if args.codebook_init_from_data else ''))
     
     # 优化器和调度器
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -256,11 +336,32 @@ def main():
         valid_losses.append(val_metrics['loss'])
         
         # 打印进度
+        train_stats = train_metrics.get('codebook_stats', {})
+        val_stats = val_metrics.get('codebook_stats', {})
+        
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
               f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
               f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
+        
+        # 定期报告码本利用率（每5个epoch或每10个epoch）
+        report_interval = getattr(args, 'codebook_report_interval', 5)
+        if (epoch + 1) % report_interval == 0 or epoch == 0:
+            train_usage = train_stats.get('usage_rate', 0.0) * 100
+            val_usage = val_stats.get('usage_rate', 0.0) * 100
+            train_used = train_stats.get('num_used', 0)
+            val_used = val_stats.get('num_used', 0)
+            train_unused = train_stats.get('num_unused', 0)
+            val_unused = val_stats.get('num_unused', 0)
+            
+            print(f"  └─ 码本利用率: Train {train_usage:.1f}% ({train_used}/{args.codebook_size} 使用, {train_unused} 未使用) | "
+                  f"Valid {val_usage:.1f}% ({val_used}/{args.codebook_size} 使用, {val_unused} 未使用)")
+            
+            # 显示最常用的码本元素（仅训练集）
+            if train_stats.get('top5_usage'):
+                top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
+                print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
         # 保存最佳模型
         if epoch >= 5:  # 前5个epoch不保存
