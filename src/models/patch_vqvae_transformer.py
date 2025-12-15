@@ -83,6 +83,8 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         
         self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))
         self.register_buffer('ema_w', embed.clone())
+        # 标志：是否禁用EMA更新（当VQ被冻结时）
+        self._disable_ema_update = False
     
     def forward(self, z_flat):
         """
@@ -100,7 +102,8 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         indices = torch.argmin(distances, dim=1)
         quantized = self.embedding(indices)
         
-        if self.training:
+        # EMA更新：只在训练模式且未禁用时执行
+        if self.training and not self._disable_ema_update:
             with torch.no_grad():
                 one_hot = F.one_hot(indices, self.codebook_size).type(z_flat.dtype)
                 
@@ -921,6 +924,9 @@ class PatchVQVAETransformer(nn.Module):
         if 'VQ' in components:
             for param in self.vq.parameters():
                 param.requires_grad = False
+            # 如果使用EMA codebook，禁用EMA更新
+            if isinstance(self.vq, FlattenedVectorQuantizerEMA):
+                self.vq._disable_ema_update = True
             frozen.append('VQ')
         
         if frozen:
@@ -953,6 +959,9 @@ class PatchVQVAETransformer(nn.Module):
         if 'VQ' in components:
             for param in self.vq.parameters():
                 param.requires_grad = True
+            # 如果使用EMA codebook，重新启用EMA更新
+            if isinstance(self.vq, FlattenedVectorQuantizerEMA):
+                self.vq._disable_ema_update = False
             unfrozen.append('VQ')
         
         if unfrozen:
