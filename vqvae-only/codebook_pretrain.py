@@ -17,6 +17,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda import amp
 import argparse
 from pathlib import Path
+import random
 
 # 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -55,15 +56,10 @@ def parse_args():
     parser.add_argument('--vq_init_method', type=str, default='uniform', 
                        choices=['uniform', 'normal', 'xavier', 'kaiming'],
                        help='码本初始化方法（uniform/normal/xavier/kaiming）')
-    parser.add_argument('--codebook_init_from_data', type=int, default=0, 
-                       help='是否从数据初始化码本（1启用，使用K-means聚类）')
-    parser.add_argument('--codebook_init_samples', type=int, default=10000,
-                       help='用于初始化码本的样本数量')
-    parser.add_argument('--codebook_init_method', type=str, default='kmeans',
-                       choices=['kmeans', 'random_sample'],
-                       help='数据初始化方法（kmeans/random_sample）')
     parser.add_argument('--codebook_report_interval', type=int, default=5,
                        help='码本利用率报告间隔（每N个epoch报告一次）')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='随机数种子（用于可复现性）')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -261,9 +257,44 @@ def validate_epoch(model, dataloader, revin, args, device):
     }
 
 
+def set_seed(seed):
+    """
+    设置随机数种子以确保可复现性
+    
+    Args:
+        seed: 随机数种子
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 确保CUDA操作的确定性（可能影响性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 设置Python的hash随机化（用于字典等）
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"✓ 随机数种子已设置为: {seed}")
+
+
+def worker_init_fn(worker_id):
+    """
+    数据加载器worker的初始化函数，确保每个worker的随机性也是可复现的
+    
+    Args:
+        worker_id: worker的ID
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def main():
     args = parse_args()
     print('Args:', args)
+    
+    # 设置随机数种子
+    set_seed(args.seed)
     
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -290,22 +321,12 @@ def main():
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
-    # 数据驱动的码本初始化（如果启用）
-    if args.codebook_init_from_data:
-        print(f'\n使用数据驱动初始化码本（方法: {args.codebook_init_method}）...')
-        model.init_codebook_from_data(
-            dls.train, device, 
-            num_samples=args.codebook_init_samples,
-            method=args.codebook_init_method,
-            revin=revin
-        )
-    
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     print(f'\n码本模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  所有参数均可训练')
-    print(f'  码本初始化方法: {args.vq_init_method}' + (' + 数据驱动' if args.codebook_init_from_data else ''))
+    print(f'  码本初始化方法: {args.vq_init_method}')
     
     # 优化器和调度器
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

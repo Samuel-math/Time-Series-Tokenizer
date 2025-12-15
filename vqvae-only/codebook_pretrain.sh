@@ -26,10 +26,8 @@ EMA_EPS=1e-5
 
 # 码本初始化参数
 VQ_INIT_METHOD="uniform"  # 初始化方法: uniform/normal/xavier/kaiming
-CODEBOOK_INIT_FROM_DATA=1  # 是否从数据初始化码本（1启用，推荐使用K-means）
-CODEBOOK_INIT_SAMPLES=10000  # 用于初始化码本的样本数量
-CODEBOOK_INIT_METHOD="kmeans"  # 数据初始化方法: kmeans/random_sample
 CODEBOOK_REPORT_INTERVAL=5  # 码本利用率报告间隔（每N个epoch报告一次）
+SEED=42  # 随机数种子（用于可复现性）
 
 # 训练参数
 N_EPOCHS=50
@@ -63,10 +61,8 @@ python vqvae-only/codebook_pretrain.py \
     --ema_decay $EMA_DECAY \
     --ema_eps $EMA_EPS \
     --vq_init_method $VQ_INIT_METHOD \
-    --codebook_init_from_data $CODEBOOK_INIT_FROM_DATA \
-    --codebook_init_samples $CODEBOOK_INIT_SAMPLES \
-    --codebook_init_method $CODEBOOK_INIT_METHOD \
     --codebook_report_interval $CODEBOOK_REPORT_INTERVAL \
+    --seed $SEED \
     --n_epochs $N_EPOCHS \
     --lr $LR \
     --weight_decay $WEIGHT_DECAY \
