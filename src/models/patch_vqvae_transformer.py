@@ -488,15 +488,46 @@ class PatchVQVAETransformer(nn.Module):
                     init_method=vq_init_method
                 )
         
-        # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
-        self.transformer = CausalTransformer(
-            self.code_dim, self.n_heads, self.n_layers, 
-            self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
-        )
-        
-        # 输出头: code_dim -> codebook_size (预测码本索引)
-        # 注意：Transformer输出始终是code_dim（通过输出投影），所以output_head输入维度是code_dim
-        self.output_head = nn.Linear(self.code_dim, self.codebook_size)
+        # Transformer 和输出头
+        # 如果使用残差量化，为每一层创建独立的transformer和output_head
+        if use_residual_vq:
+            self.use_multi_layer_transformer = True
+            self.residual_vq_layers = residual_vq_layers
+            
+            # 获取每一层的codebook大小
+            if isinstance(residual_vq_codebook_sizes, (list, tuple)):
+                codebook_sizes_list = residual_vq_codebook_sizes
+            else:
+                codebook_sizes_list = [residual_vq_codebook_sizes] * residual_vq_layers
+            
+            # 为每一层创建独立的transformer和output_head
+            self.transformers = nn.ModuleList([
+                CausalTransformer(
+                    self.code_dim, self.n_heads, self.n_layers,
+                    self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
+                ) for _ in range(residual_vq_layers)
+            ])
+            
+            self.output_heads = nn.ModuleList([
+                nn.Linear(self.code_dim, codebook_sizes_list[i])
+                for i in range(residual_vq_layers)
+            ])
+            
+            # 为了兼容性，保留单层的transformer和output_head（使用第一层）
+            self.transformer = self.transformers[0]
+            self.output_head = self.output_heads[0]
+        else:
+            self.use_multi_layer_transformer = False
+            self.residual_vq_layers = 1
+            
+            # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
+            self.transformer = CausalTransformer(
+                self.code_dim, self.n_heads, self.n_layers,
+                self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
+            )
+            
+            # 输出头: code_dim -> codebook_size (预测码本索引)
+            self.output_head = nn.Linear(self.code_dim, self.codebook_size)
 
         self._n_channels = n_channels
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
@@ -654,8 +685,8 @@ class PatchVQVAETransformer(nn.Module):
             x: [B, input_len, C] 输入序列
             target: [B, target_len, C] 目标序列
         Returns:
-            logits: [B, num_target_patches, C, codebook_size] 目标序列的索引概率分布
-            target_indices: [B, num_target_patches, C] 目标序列的真实索引
+            logits: [B, num_target_patches, C, codebook_size] (单层) 或 [B, num_target_patches, C, num_layers, codebook_size] (残差量化多层)
+            target_indices: [B, num_target_patches, C] (单层) 或 [B, num_target_patches, C, num_layers] (残差量化多层)
             vq_loss: VQ损失
             recon_loss: 重构损失
         """
@@ -687,16 +718,56 @@ class PatchVQVAETransformer(nn.Module):
         full_sequence = torch.cat([z_q_input_flat, placeholder], dim=1)
         
         # 5. Transformer处理并预测
-        h_full = self.transformer(full_sequence)
-        h_target = h_full[:, num_input_patches:, :]
-        logits_flat = self.output_head(h_target)
-        logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)
-        
-        # 对于残差量化，只使用第一层索引作为target
-        if target_indices.dim() == 4:
-            target_indices_flat = target_indices[:, :, :, 0]
-        else:
+        if self.use_multi_layer_transformer and target_indices.dim() == 4:
+            # 残差量化：为每一层分别预测
+            num_layers = target_indices.shape[3]
+            logits_list = []
+            target_indices_list = []
+            
+            for layer_idx in range(num_layers):
+                # 使用对应层的transformer和output_head
+                transformer = self.transformers[layer_idx]
+                output_head = self.output_heads[layer_idx]
+                
+                # Transformer处理
+                h_full = transformer(full_sequence)
+                h_target = h_full[:, num_input_patches:, :]
+                
+                # 预测该层的logits
+                logits_flat = output_head(h_target)  # [B*C, num_target_patches, codebook_size_i]
+                logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)  # [B, num_target_patches, C, codebook_size_i]
+                logits_list.append(logits)
+                
+                # 提取该层的target indices
+                target_indices_layer = target_indices[:, :, :, layer_idx]  # [B, num_target_patches, C]
+                target_indices_list.append(target_indices_layer)
+            
+            # 合并所有层的logits: [B, num_target_patches, C, num_layers, codebook_size_i]
+            # 注意：每层的codebook_size可能不同，所以不能直接stack
+            # 返回logits_list和target_indices_list，让训练代码处理
+            # 为了兼容性，将logits_list stack成一个tensor（如果所有层codebook_size相同）
+            # 否则返回列表
+            if len(set([logits.shape[-1] for logits in logits_list])) == 1:
+                # 所有层codebook_size相同，可以stack
+                logits = torch.stack(logits_list, dim=3)  # [B, num_target_patches, C, num_layers, codebook_size]
+            else:
+                # codebook_size不同，返回列表
+                logits = logits_list
+            
+            # target_indices已经是 [B, num_target_patches, C, num_layers]
             target_indices_flat = target_indices
+        else:
+            # 单层量化：使用单个transformer和output_head
+            h_full = self.transformer(full_sequence)
+            h_target = h_full[:, num_input_patches:, :]
+            logits_flat = self.output_head(h_target)
+            logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)
+            
+            # 对于残差量化但只使用第一层的情况
+            if target_indices.dim() == 4:
+                target_indices_flat = target_indices[:, :, :, 0]
+            else:
+                target_indices_flat = target_indices
         
         return logits, target_indices_flat, vq_loss, recon_loss
     
@@ -729,22 +800,47 @@ class PatchVQVAETransformer(nn.Module):
         # 拼接输入序列和占位符: [B*C, num_patches + num_pred_patches, code_dim]
         full_sequence = torch.cat([z_q_flat, placeholder], dim=1)  # [B*C, num_patches + num_pred_patches, code_dim]
         
-        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
-        h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, code_dim]
-        
-        # 只取占位符位置的输出: [B*C, num_pred_patches, code_dim]
-        h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
-        
-        # 输出头: [B*C, num_pred_patches, codebook_size]
-        logits = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
-        
-        # 使用 softmax + 加权求和 替代 argmax，保持可微分
-        weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
-        codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-        pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
-        
-        # Reshape回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
-        pred_codes = pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)  # [B, num_pred_patches, C, code_dim]
+        # Transformer处理并预测
+        if self.use_multi_layer_transformer:
+            # 残差量化：为每一层分别预测，然后合并
+            pred_codes_list = []
+            
+            for layer_idx in range(self.residual_vq_layers):
+                transformer = self.transformers[layer_idx]
+                output_head = self.output_heads[layer_idx]
+                
+                # Transformer处理
+                h_full = transformer(full_sequence)
+                h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
+                
+                # 输出头预测
+                logits = output_head(h_pred)  # [B*C, num_pred_patches, codebook_size_i]
+                
+                # 使用 softmax + 加权求和 替代 argmax，保持可微分
+                weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size_i]
+                # 获取对应层的codebook
+                codebook = self.vq.codebooks[layer_idx].embedding.weight  # [codebook_size_i, code_dim]
+                pred_codes_layer = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
+                pred_codes_list.append(pred_codes_layer)
+            
+            # 合并所有层的预测（相加）
+            pred_codes = sum(pred_codes_list)  # [B*C, num_pred_patches, code_dim]
+            
+            # Reshape回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
+            pred_codes = pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)
+        else:
+            # 单层量化
+            h_full = self.transformer(full_sequence)
+            h_pred = h_full[:, num_input_patches:, :]
+            logits = self.output_head(h_pred)
+            
+            # 使用 softmax + 加权求和 替代 argmax，保持可微分
+            weights = F.softmax(logits, dim=-1)
+            codebook = self.vq.embedding.weight
+            pred_codes = torch.matmul(weights, codebook)
+            
+            # Reshape回通道分离格式
+            pred_codes = pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)
         
         # 解码
         pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]

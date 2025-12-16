@@ -33,7 +33,7 @@ SEED=42  # 随机数种子（用于可复现性）
 USE_RESIDUAL_VQ=1  # 是否使用残差量化（1启用，0禁用）
 RESIDUAL_VQ_LAYERS=2  # 残差量化层数（建议2-3层）
 RESIDUAL_VQ_COMBINE_METHOD="sum"  # 合并方式：sum（相加）或concat（拼接）
-RESIDUAL_VQ_CODEBOOK_SIZES=""  # 每层codebook大小，用逗号分隔，如 "256,128"。如果为空，所有层使用统一的CODEBOOK_SIZE
+RESIDUAL_VQ_CODEBOOK_SIZES="256,128"  # 每层codebook大小，用逗号分隔，如 "256,128"。如果为空，所有层使用统一的CODEBOOK_SIZE
 
 # 训练参数
 N_EPOCHS=50
@@ -48,6 +48,26 @@ RECON_WEIGHT=1.0
 SAVE_PATH="saved_models/vqvae_only/"
 MODEL_ID=1
 
+echo "================================================="
+echo "码本预训练"
+echo "================================================="
+echo "数据集: ${DSET}"
+echo "Patch Size: ${PATCH_SIZE}"
+echo "Codebook Size: ${CODEBOOK_SIZE}"
+if [ "${USE_RESIDUAL_VQ}" -eq 1 ]; then
+    echo "残差量化: 启用 (${RESIDUAL_VQ_LAYERS}层)"
+    echo "  合并方式: ${RESIDUAL_VQ_COMBINE_METHOD}"
+    if [ -n "${RESIDUAL_VQ_CODEBOOK_SIZES}" ]; then
+        echo "  每层codebook大小: ${RESIDUAL_VQ_CODEBOOK_SIZES}"
+    else
+        echo "  每层codebook大小: ${CODEBOOK_SIZE} (统一)"
+    fi
+else
+    echo "残差量化: 禁用"
+fi
+echo "================================================="
+echo ""
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
@@ -57,8 +77,8 @@ python codebook_pretrain.py \
     --features $FEATURES \
     --patch_size $PATCH_SIZE \
     --embedding_dim $EMBEDDING_DIM \
-    --codebook_size $CODEBOOK_SIZE \
     --compression_factor $COMPRESSION_FACTOR \
+    --codebook_size $CODEBOOK_SIZE \
     --num_hiddens $NUM_HIDDENS \
     --num_residual_layers $NUM_RESIDUAL_LAYERS \
     --num_residual_hiddens $NUM_RESIDUAL_HIDDENS \

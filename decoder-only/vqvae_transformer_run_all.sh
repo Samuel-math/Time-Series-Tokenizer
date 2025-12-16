@@ -132,6 +132,17 @@ echo "数据集: ${DSET}"
 echo "码本模型: ${CODEBOOK_CHECKPOINT}"
 echo "模型名称: ${MODEL_NAME}"
 echo "Transformer 输入维度 (code_dim): ${CODE_DIM} (实际值从checkpoint读取)"
+if [ "${USE_RESIDUAL_VQ}" -eq 1 ]; then
+    echo "残差量化: 启用 (${RESIDUAL_VQ_LAYERS}层)"
+    echo "  合并方式: ${RESIDUAL_VQ_COMBINE_METHOD}"
+    if [ -n "${RESIDUAL_VQ_CODEBOOK_SIZES}" ]; then
+        echo "  每层codebook大小: ${RESIDUAL_VQ_CODEBOOK_SIZES}"
+    else
+        echo "  每层codebook大小: ${CODEBOOK_SIZE} (统一)"
+    fi
+else
+    echo "残差量化: 禁用"
+fi
 if [ "${FREEZE_VQVAE}" -eq 1 ]; then
     echo "冻结VQVAE: 是（Encoder + Decoder + VQ）"
 else

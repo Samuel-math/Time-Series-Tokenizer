@@ -109,14 +109,40 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         
         # 前向传播：基于input的index预测target的index概率分布
         logits, target_indices, vq_loss, recon_loss = model.forward_pretrain(batch_x, batch_y)
-        # logits: [B, num_target_patches, C, codebook_size] (channel-independent)
-        # target_indices: [B, num_target_patches, C]
         
-        # 预测损失 (CrossEntropy)
-        B, num_target_patches, C, codebook_size = logits.shape
-        logits_flat = logits.reshape(-1, codebook_size)  # [B*num_target_patches*C, codebook_size]
-        target_indices_flat = target_indices.reshape(-1)  # [B*num_target_patches*C]
-        pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
+        # 处理多层预测（残差量化）或单层预测
+        if isinstance(logits, list):
+            # 残差量化：每层codebook_size不同，logits是列表
+            pred_loss = 0
+            for layer_idx, logits_layer in enumerate(logits):
+                # logits_layer: [B, num_target_patches, C, codebook_size_i]
+                # target_indices: [B, num_target_patches, C, num_layers]
+                target_indices_layer = target_indices[:, :, :, layer_idx]  # [B, num_target_patches, C]
+                B, num_target_patches, C, codebook_size_i = logits_layer.shape
+                logits_flat = logits_layer.reshape(-1, codebook_size_i)
+                target_flat = target_indices_layer.reshape(-1)
+                pred_loss += F.cross_entropy(logits_flat, target_flat)
+            pred_loss = pred_loss / len(logits)  # 平均所有层的损失
+        elif logits.dim() == 5:
+            # 残差量化：所有层codebook_size相同，logits是5维tensor [B, num_target_patches, C, num_layers, codebook_size]
+            # target_indices: [B, num_target_patches, C, num_layers]
+            num_layers = logits.shape[3]
+            pred_loss = 0
+            for layer_idx in range(num_layers):
+                logits_layer = logits[:, :, :, layer_idx, :]  # [B, num_target_patches, C, codebook_size]
+                target_indices_layer = target_indices[:, :, :, layer_idx]  # [B, num_target_patches, C]
+                B, num_target_patches, C, codebook_size = logits_layer.shape
+                logits_flat = logits_layer.reshape(-1, codebook_size)
+                target_flat = target_indices_layer.reshape(-1)
+                pred_loss += F.cross_entropy(logits_flat, target_flat)
+            pred_loss = pred_loss / num_layers  # 平均所有层的损失
+        else:
+            # 单层量化：logits: [B, num_target_patches, C, codebook_size]
+            # target_indices: [B, num_target_patches, C]
+            B, num_target_patches, C, codebook_size = logits.shape
+            logits_flat = logits.reshape(-1, codebook_size)
+            target_indices_flat = target_indices.reshape(-1)
+            pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
         
         # 总损失
         loss = pred_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
@@ -163,12 +189,35 @@ def validate_epoch(model, dataloader, revin, args, device):
             
             logits, target_indices, vq_loss, recon_loss = model.forward_pretrain(batch_x, batch_y)
             
-            # logits: [B, num_target_patches, C, codebook_size] (channel-independent)
-            # target_indices: [B, num_target_patches, C]
-            B, num_target_patches, C, codebook_size = logits.shape
-            logits_flat = logits.reshape(-1, codebook_size)  # [B*num_target_patches*C, codebook_size]
-            target_indices_flat = target_indices.reshape(-1)  # [B*num_target_patches*C]
-            pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
+            # 处理多层预测（残差量化）或单层预测
+            if isinstance(logits, list):
+                # 残差量化：每层codebook_size不同，logits是列表
+                pred_loss = 0
+                for layer_idx, logits_layer in enumerate(logits):
+                    target_indices_layer = target_indices[:, :, :, layer_idx]
+                    B, num_target_patches, C, codebook_size_i = logits_layer.shape
+                    logits_flat = logits_layer.reshape(-1, codebook_size_i)
+                    target_flat = target_indices_layer.reshape(-1)
+                    pred_loss += F.cross_entropy(logits_flat, target_flat)
+                pred_loss = pred_loss / len(logits)
+            elif logits.dim() == 5:
+                # 残差量化：所有层codebook_size相同，logits是5维tensor
+                num_layers = logits.shape[3]
+                pred_loss = 0
+                for layer_idx in range(num_layers):
+                    logits_layer = logits[:, :, :, layer_idx, :]
+                    target_indices_layer = target_indices[:, :, :, layer_idx]
+                    B, num_target_patches, C, codebook_size = logits_layer.shape
+                    logits_flat = logits_layer.reshape(-1, codebook_size)
+                    target_flat = target_indices_layer.reshape(-1)
+                    pred_loss += F.cross_entropy(logits_flat, target_flat)
+                pred_loss = pred_loss / num_layers
+            else:
+                # 单层量化
+                B, num_target_patches, C, codebook_size = logits.shape
+                logits_flat = logits.reshape(-1, codebook_size)
+                target_indices_flat = target_indices.reshape(-1)
+                pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
             
             loss = pred_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
             
