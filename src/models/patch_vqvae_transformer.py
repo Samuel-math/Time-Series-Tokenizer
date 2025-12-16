@@ -140,14 +140,20 @@ class ResidualVectorQuantizer(nn.Module):
         residual = z_flat
         total_loss = 0
         indices_list = []
+        quantized_residuals_for_recon = []  # 收集STE-enabled的量化残差用于重建
         
         for codebook in self.codebooks:
-            loss, quantized_residual, indices = codebook(residual)
+            loss, quantized_residual_ste, indices = codebook(residual)
             total_loss += loss
-            residual = residual - quantized_residual.detach()
+            # 对于下一层，使用detached的残差以保持残差学习特性
+            residual = residual - quantized_residual_ste.detach()
             indices_list.append(indices)
+            # 保存STE-enabled的输出用于重建，确保梯度可以回传到encoder
+            quantized_residuals_for_recon.append(quantized_residual_ste)
         
-        quantized = z_flat - residual
+        # 最终的量化向量应该是所有STE-enabled量化残差的和
+        # 这样recon_loss的梯度可以通过每层的STE路径回传到encoder
+        quantized = sum(quantized_residuals_for_recon)
         
         return total_loss, quantized, indices_list
     
@@ -212,14 +218,20 @@ class ResidualVectorQuantizerEMA(nn.Module):
         residual = z_flat
         total_loss = 0
         indices_list = []
+        quantized_residuals_for_recon = []  # 收集STE-enabled的量化残差用于重建
         
         for codebook in self.codebooks:
-            loss, quantized_residual, indices = codebook(residual)
+            loss, quantized_residual_ste, indices = codebook(residual)
             total_loss += loss
-            residual = residual - quantized_residual.detach()
+            # 对于下一层，使用detached的残差以保持残差学习特性
+            residual = residual - quantized_residual_ste.detach()
             indices_list.append(indices)
+            # 保存STE-enabled的输出用于重建，确保梯度可以回传到encoder
+            quantized_residuals_for_recon.append(quantized_residual_ste)
         
-        quantized = z_flat - residual
+        # 最终的量化向量应该是所有STE-enabled量化残差的和
+        # 这样recon_loss的梯度可以通过每层的STE路径回传到encoder
+        quantized = sum(quantized_residuals_for_recon)
         
         return total_loss, quantized, indices_list
     
@@ -345,9 +357,12 @@ class FlattenedVectorQuantizerEMA(nn.Module):
                 embed_normalized = self.ema_w / cluster_size.unsqueeze(1)
                 self.embedding.weight.data.copy_(embed_normalized)
         
-        # 只有commitment项
-        e_latent_loss = F.mse_loss(z_flat, quantized.detach())
-        loss = self.commitment_cost * e_latent_loss
+        # VQ损失：包含commitment loss和codebook loss
+        # commitment loss: 让encoder输出接近quantized（codebook更新通过EMA，不需要梯度）
+        e_latent_loss = F.mse_loss(quantized.detach(), z_flat)
+        # codebook loss: 让quantized接近encoder输出（通过straight-through estimator传递梯度）
+        q_latent_loss = F.mse_loss(quantized, z_flat.detach())
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
         quantized = z_flat + (quantized - z_flat).detach()
         return loss, quantized, indices
