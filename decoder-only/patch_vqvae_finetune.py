@@ -252,7 +252,7 @@ def main():
     best_val_loss = float('inf')
     train_losses, valid_losses = [], []
     no_improve_epochs = 0  # 连续无改善的epoch数
-    early_stop_patience = 10  # 连续10个epoch无下降就停止
+    early_stop_patience = 5  # 连续5个epoch无下降就停止
     best_epoch = -1  # 最佳模型所在的epoch
     
     start_time = time.time()
