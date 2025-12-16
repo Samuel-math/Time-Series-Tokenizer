@@ -29,6 +29,11 @@ VQ_INIT_METHOD="uniform"  # 初始化方法: uniform/normal/xavier/kaiming
 CODEBOOK_REPORT_INTERVAL=5  # 码本利用率报告间隔（每N个epoch报告一次）
 SEED=42  # 随机数种子（用于可复现性）
 
+# 残差量化参数（减少量化误差）
+USE_RESIDUAL_VQ=1  # 是否使用残差量化（1启用，0禁用）
+RESIDUAL_VQ_LAYERS=2  # 残差量化层数（建议2-3层）
+RESIDUAL_VQ_COMBINE_METHOD="sum"  # 合并方式：sum（相加）或concat（拼接）
+
 # 训练参数
 N_EPOCHS=50
 LR=1e-4
@@ -42,7 +47,7 @@ RECON_WEIGHT=1.0
 SAVE_PATH="saved_models/vqvae_only/"
 MODEL_ID=1
 
-python vqvae-only/codebook_pretrain.py \
+python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
     --batch_size $BATCH_SIZE \
@@ -62,6 +67,7 @@ python vqvae-only/codebook_pretrain.py \
     --ema_eps $EMA_EPS \
     --use_residual_vq $USE_RESIDUAL_VQ \
     --residual_vq_layers $RESIDUAL_VQ_LAYERS \
+    --residual_vq_combine_method $RESIDUAL_VQ_COMBINE_METHOD \
     --vq_init_method $VQ_INIT_METHOD \
     --codebook_report_interval $CODEBOOK_REPORT_INTERVAL \
     --seed $SEED \

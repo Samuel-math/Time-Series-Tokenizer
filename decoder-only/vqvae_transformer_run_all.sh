@@ -64,6 +64,12 @@ FINETUNE_BATCH_SIZE=64
 FINETUNE_LR=1e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
+# ----- 残差量化参数（减少量化误差）-----
+USE_RESIDUAL_VQ=1  # 是否使用残差量化（1启用，0禁用）
+RESIDUAL_VQ_LAYERS=2  # 残差量化层数（建议2-3层）
+RESIDUAL_VQ_COMBINE_METHOD="sum"  # 合并方式：sum（相加）或concat（拼接）
+VQ_INIT_METHOD="uniform"  # 码本初始化方法: uniform/normal/xavier/kaiming
+
 # ----- 其他参数 -----
 REVIN=1
 WEIGHT_DECAY=1e-4
@@ -163,6 +169,10 @@ PRETRAIN_ARGS+=(
     --codebook_ema ${CODEBOOK_EMA} \
     --ema_decay ${EMA_DECAY} \
     --ema_eps ${EMA_EPS} \
+    --use_residual_vq ${USE_RESIDUAL_VQ} \
+    --residual_vq_layers ${RESIDUAL_VQ_LAYERS} \
+    --residual_vq_combine_method ${RESIDUAL_VQ_COMBINE_METHOD} \
+    --vq_init_method ${VQ_INIT_METHOD} \
     --vqvae_checkpoint "${CODEBOOK_CHECKPOINT}" \
     --freeze_vqvae ${FREEZE_VQVAE} \
     --load_vq_weights 1 \
