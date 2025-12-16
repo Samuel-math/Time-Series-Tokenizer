@@ -62,15 +62,11 @@ def parse_args():
     # 残差量化参数（减少量化误差）
     parser.add_argument('--use_residual_vq', type=int, default=0, help='是否使用残差量化（多层码本，减少量化误差）')
     parser.add_argument('--residual_vq_layers', type=int, default=2, help='残差量化层数（建议2-3层）')
+    parser.add_argument('--residual_vq_combine_method', type=str, default='sum', choices=['sum', 'concat'],
+                       help='残差量化合并方式：sum（相加）或concat（拼接）')
     parser.add_argument('--vq_init_method', type=str, default='uniform', choices=['uniform', 'normal', 'xavier', 'kaiming'],
                        help='码本初始化方法（uniform/normal/xavier/kaiming）')
     
-    # Patch内时序建模参数（支持TCN、Self-Attention和Cross-Attention）
-    parser.add_argument('--use_patch_attention', type=int, default=0, help='是否使用patch内时序建模(1启用)')
-    parser.add_argument('--patch_attention_type', type=str, default='tcn', choices=['tcn', 'attention', 'cross_attention'], help='时序建模类型: tcn、attention或cross_attention')
-    parser.add_argument('--tcn_num_layers', type=int, default=2, help='TCN层数')
-    parser.add_argument('--tcn_kernel_size', type=int, default=3, help='TCN卷积核大小')
-    parser.add_argument('--tcn_hidden_dim', type=int, default=None, help='TCN隐藏层维度(默认等于n_channels)')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')

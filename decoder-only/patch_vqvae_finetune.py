@@ -62,7 +62,7 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
     Args:
         checkpoint_path: checkpoint路径
         device: 设备
-        n_channels: 通道数（如果提供且启用patch_attention，会在创建模型时立即初始化）
+        n_channels: 通道数（已废弃，保留以兼容旧代码）
     """
     print(f'加载预训练模型: {checkpoint_path}')
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -70,22 +70,10 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
     config = checkpoint['config']
     state_dict = checkpoint['model_state_dict']
     
-    # 检查checkpoint中是否有patch_attention权重
-    has_patch_attention = any('patch_attention' in k for k in state_dict.keys())
-    
-    # 如果checkpoint有patch_attention权重但config未开启，强制开启
-    if has_patch_attention and not config.get('use_patch_attention', False):
-        print('检测到checkpoint中有patch_attention权重，强制启用use_patch_attention')
-        config['use_patch_attention'] = True
-    
-    # 如果启用patch_attention且提供了通道数，添加到config中以便立即初始化
-    if config.get('use_patch_attention', False) and n_channels is not None:
-        config['n_channels'] = n_channels
-    
-    # 创建模型（如果use_patch_attention=True且n_channels存在，会自动初始化patch_attention）
+    # 创建模型
     model = PatchVQVAETransformer(config).to(device)
     
-    # 直接加载所有权重（包括patch_attention），使用strict=False允许架构差异
+    # 直接加载所有权重，使用strict=False允许架构差异
     model.load_state_dict(state_dict, strict=False)
     
     print(f'预训练模型配置: {config}')
@@ -94,16 +82,10 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
     return model, config
 
 
-def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
+def freeze_encoder_vq(model):
+    """冻结encoder、decoder、VQ层（将patch映射成码本前的所有参数）"""
     # 使用模型的方法冻结VQVAE组件
     model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
-    
-    # 冻结 patch attention（如果存在）
-    if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:
-        for param in model.patch_attention.parameters():
-            param.requires_grad = False
-        print('✓ 已冻结 Patch Attention')
 
 
 def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler):
@@ -214,18 +196,17 @@ def main():
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 先获取数据以知道通道数（用于提前初始化patch_attention）
+    # 先获取数据
     args.dset_finetune = args.dset
     dls = get_dls(args)
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
-    # 加载预训练模型（传入通道数以便立即初始化patch_attention）
-    model, config = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars)
+    # 加载预训练模型
+    model, config = load_pretrained_model(args.pretrained_model, device)
     
-    # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
-    patch_attention_loaded = hasattr(model, 'patch_attention') and model.patch_attention is not None
-    freeze_encoder_vq(model, freeze_patch_attention=patch_attention_loaded)
+    # 冻结 encoder、VQ 层（将patch映射成码本前的所有参数）
+    freeze_encoder_vq(model)
     
     # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

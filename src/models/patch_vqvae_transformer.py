@@ -19,10 +19,7 @@ from .vqvae import Encoder, Decoder
 
 
 class FlattenedVectorQuantizer(nn.Module):
-    """
-    展平的 Vector Quantizer
-    码本维度 = embedding_dim * compressed_len
-    """
+    """展平的 Vector Quantizer"""
     def __init__(self, codebook_size, code_dim, commitment_cost=0.25, init_method='uniform'):
         super().__init__()
         self.codebook_size = codebook_size
@@ -30,10 +27,8 @@ class FlattenedVectorQuantizer(nn.Module):
         self.commitment_cost = commitment_cost
         self.init_method = init_method
         
-        # 码本: [codebook_size, code_dim]
         self.embedding = nn.Embedding(codebook_size, code_dim)
         
-        # 初始化方法
         if init_method == 'uniform':
             self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
         elif init_method == 'normal':
@@ -43,7 +38,6 @@ class FlattenedVectorQuantizer(nn.Module):
         elif init_method == 'kaiming':
             nn.init.kaiming_uniform_(self.embedding.weight)
         else:
-            # 默认uniform
             self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
     
     def init_from_data(self, z_samples, method='kmeans', random_state=42):
@@ -110,22 +104,14 @@ class FlattenedVectorQuantizer(nn.Module):
 
 
 class ResidualVectorQuantizer(nn.Module):
-    """
-    残差向量量化器（Residual Vector Quantization）
-    使用多层码本来逐步拟合残差，减少量化误差
-    
-    原理：
-    1. 第一层量化：z -> z_q1，残差 r1 = z - z_q1
-    2. 第二层量化：r1 -> r_q1，残差 r2 = r1 - r_q1
-    3. 最终量化：z_q = z_q1 + r_q1
-    4. 可以继续量化r2，形成更多层
-    """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, num_layers=2, init_method='uniform'):
+    """残差向量量化器：使用多层码本逐步拟合残差，减少量化误差"""
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, num_layers=2, init_method='uniform', combine_method='sum'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
         self.num_layers = num_layers
+        self.combine_method = combine_method  # 'sum' 或 'concat'
         
         # 创建多层码本
         self.codebooks = nn.ModuleList([
@@ -146,19 +132,13 @@ class ResidualVectorQuantizer(nn.Module):
         total_loss = 0
         indices_list = []
         
-        # 逐层量化残差
-        for i, codebook in enumerate(self.codebooks):
-            # 量化当前残差
+        for codebook in self.codebooks:
             loss, quantized_residual, indices = codebook(residual)
             total_loss += loss
-            
-            # 更新残差：residual = residual - quantized_residual
             residual = residual - quantized_residual.detach()
-            
             indices_list.append(indices)
         
-        # 最终量化结果：所有层量化结果的和
-        quantized = z_flat - residual  # 等价于 sum(quantized_residuals)
+        quantized = z_flat - residual
         
         return total_loss, quantized, indices_list
     
@@ -169,24 +149,24 @@ class ResidualVectorQuantizer(nn.Module):
         Args:
             indices_list: List[[N]] 每层的码本索引
         Returns:
-            quantized: [N, code_dim] 最终量化结果
+            quantized: [N, code_dim] (sum) 或 [N, code_dim * num_layers] (concat)
         """
-        quantized = None
-        for i, (codebook, indices) in enumerate(zip(self.codebooks, indices_list)):
-            if quantized is None:
-                quantized = codebook.get_embedding(indices)
-            else:
-                quantized = quantized + codebook.get_embedding(indices)
+        embeddings = [self.codebooks[i].get_embedding(indices_list[i]) for i in range(self.num_layers)]
+        
+        if self.combine_method == 'concat':
+            quantized = torch.cat(embeddings, dim=1)  # [N, code_dim * num_layers]
+        else:  # 'sum'
+            quantized = embeddings[0]
+            for emb in embeddings[1:]:
+                quantized = quantized + emb
+        
         return quantized
 
 
 class ResidualVectorQuantizerEMA(nn.Module):
-    """
-    残差向量量化器（EMA版本）
-    使用EMA更新多层码本
-    """
+    """残差向量量化器（EMA版本）：使用EMA更新多层码本"""
     def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, 
-                 num_layers=2, init_method='uniform'):
+                 num_layers=2, init_method='uniform', combine_method='sum'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
@@ -194,6 +174,7 @@ class ResidualVectorQuantizerEMA(nn.Module):
         self.decay = decay
         self.eps = eps
         self.num_layers = num_layers
+        self.combine_method = combine_method  # 'sum' 或 'concat'
         
         # 创建多层EMA码本
         self.codebooks = nn.ModuleList([
@@ -214,19 +195,13 @@ class ResidualVectorQuantizerEMA(nn.Module):
         total_loss = 0
         indices_list = []
         
-        # 逐层量化残差
-        for i, codebook in enumerate(self.codebooks):
-            # 量化当前残差
+        for codebook in self.codebooks:
             loss, quantized_residual, indices = codebook(residual)
             total_loss += loss
-            
-            # 更新残差：residual = residual - quantized_residual
             residual = residual - quantized_residual.detach()
-            
             indices_list.append(indices)
         
-        # 最终量化结果：所有层量化结果的和
-        quantized = z_flat - residual  # 等价于 sum(quantized_residuals)
+        quantized = z_flat - residual
         
         return total_loss, quantized, indices_list
     
@@ -237,22 +212,22 @@ class ResidualVectorQuantizerEMA(nn.Module):
         Args:
             indices_list: List[[N]] 每层的码本索引
         Returns:
-            quantized: [N, code_dim] 最终量化结果
+            quantized: [N, code_dim] (sum) 或 [N, code_dim * num_layers] (concat)
         """
-        quantized = None
-        for i, (codebook, indices) in enumerate(zip(self.codebooks, indices_list)):
-            if quantized is None:
-                quantized = codebook.get_embedding(indices)
-            else:
-                quantized = quantized + codebook.get_embedding(indices)
+        embeddings = [self.codebooks[i].get_embedding(indices_list[i]) for i in range(self.num_layers)]
+        
+        if self.combine_method == 'concat':
+            quantized = torch.cat(embeddings, dim=1)  # [N, code_dim * num_layers]
+        else:  # 'sum'
+            quantized = embeddings[0]
+            for emb in embeddings[1:]:
+                quantized = quantized + emb
+        
         return quantized
 
 
 class FlattenedVectorQuantizerEMA(nn.Module):
-    """
-    使用 EMA 更新码本的 Vector Quantizer
-    码本维度 = embedding_dim * compressed_len
-    """
+    """使用 EMA 更新码本的 Vector Quantizer"""
     def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, init_method='uniform'):
         super().__init__()
         self.codebook_size = codebook_size
@@ -262,7 +237,6 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         self.eps = eps
         self.init_method = init_method
         
-        # 码本权重与EMA状态
         if init_method == 'uniform':
             embed = torch.randn(codebook_size, code_dim)
             embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
@@ -284,7 +258,6 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         
         self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))
         self.register_buffer('ema_w', embed.clone())
-        # 标志：是否禁用EMA更新（当VQ被冻结时）
         self._disable_ema_update = False
     
     def init_from_data(self, z_samples, method='kmeans', random_state=42):
@@ -311,13 +284,11 @@ class FlattenedVectorQuantizerEMA(nn.Module):
                 method = 'random_sample'
         
         if method == 'random_sample':
-            # 随机采样N个样本作为码本中心
             N = z_samples.size(0)
             if N >= self.codebook_size:
                 perm = torch.randperm(N, generator=torch.Generator().manual_seed(random_state))[:self.codebook_size]
                 centroids = z_samples[perm]
             else:
-                # 如果样本数不足，使用重复采样
                 indices = torch.randint(0, N, (self.codebook_size,), generator=torch.Generator().manual_seed(random_state))
                 centroids = z_samples[indices]
             self.embedding.weight.data.copy_(centroids)
@@ -365,269 +336,6 @@ class FlattenedVectorQuantizerEMA(nn.Module):
     
     def get_embedding(self, indices):
         return self.embedding(indices)
-
-
-class PatchTCN(nn.Module):
-    """
-    使用TCN（Temporal Convolutional Network）处理patch内时间信息
-    输入: [B*num_patches, patch_size, C]
-    输出: [B*num_patches, patch_size, C]
-    使用因果卷积和膨胀卷积捕捉时序依赖
-    """
-    def __init__(self, patch_size, n_channels, dropout=0.1, num_layers=2, kernel_size=3, hidden_dim=None):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_channels = n_channels
-        self.num_layers = num_layers
-        self.kernel_size = kernel_size
-        self.hidden_dim = hidden_dim or n_channels
-        
-        # TCN层：多层因果卷积，每层dilation递增
-        self.tcn_layers = nn.ModuleList()
-        for i in range(num_layers):
-            dilation = 2 ** i  # dilation: 1, 2, 4, 8, ...
-            in_channels = n_channels if i == 0 else self.hidden_dim
-            out_channels = self.hidden_dim
-            
-            # 因果卷积：padding = (kernel_size - 1) * dilation
-            # 这样确保输出长度 = 输入长度（不考虑padding）
-            padding = (kernel_size - 1) * dilation
-            
-            tcn_block = nn.Sequential(
-                nn.Conv1d(
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    padding=padding,
-                    bias=False
-                ),
-                nn.BatchNorm1d(out_channels),
-                nn.GELU(),
-                nn.Dropout(dropout)
-            )
-            self.tcn_layers.append(tcn_block)
-        
-        # 输出投影层：hidden_dim -> n_channels
-        if self.hidden_dim != n_channels:
-            self.output_proj = nn.Conv1d(self.hidden_dim, n_channels, kernel_size=1)
-        else:
-            self.output_proj = None
-    
-    def forward(self, x):
-        """
-        Args:
-            x: [B*num_patches, patch_size, C]
-        Returns:
-            out: [B*num_patches, patch_size, C]
-        """
-        B, T, C = x.shape  # B = B*num_patches, T = patch_size
-        
-        # 保存原始输入用于残差连接
-        residual = x
-        
-        # Conv1d需要 [B, C, T] 格式
-        x = x.permute(0, 2, 1)  # [B, C, patch_size]
-        
-        # 通过TCN层
-        for i, tcn_layer in enumerate(self.tcn_layers):
-            x_out = tcn_layer(x)  # [B, hidden_dim, patch_size + padding]
-            
-            # 裁剪padding，保持输出长度与输入相同
-            # 由于使用了因果padding，输出长度可能略大于输入，需要裁剪
-            x_out = x_out[:, :, :T]  # [B, hidden_dim, patch_size]
-            
-            # 残差连接（如果维度匹配）
-            if x.shape[1] == x_out.shape[1] and x.shape[2] == x_out.shape[2]:
-                x = x + x_out
-            else:
-                x = x_out
-        
-        # 输出投影
-        if self.output_proj is not None:
-            x = self.output_proj(x)  # [B, C, patch_size]
-        
-        # 转回 [B, patch_size, C]
-        x = x.permute(0, 2, 1)  # [B, patch_size, C]
-        
-        # 整体残差连接
-        out = residual + x
-        
-        return out
-
-
-class PatchSelfAttention(nn.Module):
-    """
-    处理patch内时间信息的Self-Attention层
-    对所有通道一起在patch_size个时间步之间应用self-attention
-    输入: [B*num_patches, patch_size, C]
-    输出: [B*num_patches, patch_size, C]
-    在时间步之间做attention，同时可以看到所有通道的信息，捕捉时序和通道间交互
-    """
-    def __init__(self, patch_size, n_channels, dropout=0.1):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_channels = n_channels
-        
-        # 位置编码（patch内的时间位置）
-        self.pos_embedding = nn.Embedding(patch_size, n_channels)
-        
-        # 使用nn.MultiheadAttention，embed_dim = n_channels
-        # 自动调整num_heads以确保embed_dim能被num_heads整除
-        num_heads = 1
-        if n_channels >= 4:
-            # 尝试找到合适的num_heads（不超过4，且能整除n_channels）
-            for h in [4, 2, 1]:
-                if n_channels % h == 0:
-                    num_heads = h
-                    break
-        
-        self.attention = nn.MultiheadAttention(
-            embed_dim=n_channels,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-        
-        # Layer norm
-        self.norm1 = nn.LayerNorm(n_channels)
-        self.norm2 = nn.LayerNorm(n_channels)
-        
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(n_channels, n_channels * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(n_channels * 2, n_channels),
-            nn.Dropout(dropout)
-        )
-    
-    def forward(self, x):
-        """
-        Args:
-            x: [B*num_patches, patch_size, C]
-        Returns:
-            out: [B*num_patches, patch_size, C]
-        """
-        B, T, C = x.shape  # B = B*num_patches, T = patch_size
-        
-        # 保存原始输入用于残差连接
-        residual = x
-        
-        # 位置编码
-        positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(B, -1)
-        pos_emb = self.pos_embedding(positions)  # [B, patch_size, C]
-        
-        # 添加位置编码
-        x_pos = x + pos_emb
-        
-        # Self-attention（在时间步之间，对所有通道一起）
-        attn_out, _ = self.attention(x_pos, x_pos, x_pos)  # [B, patch_size, C]
-        
-        # 残差连接和Layer Norm
-        x_normed = self.norm1(x + self.dropout(attn_out))  # [B, patch_size, C]
-        
-        # FFN（带残差连接）
-        ffn_out = self.ffn(x_normed)  # [B, patch_size, C]
-        x_out = self.norm2(x_normed + ffn_out)  # [B, patch_size, C]
-        
-        # 整体残差连接：输入 + 处理后的输出
-        out = residual + x_out
-        
-        return out
-
-
-class PatchCrossAttention(nn.Module):
-    """
-    处理patch内时间信息的Cross-Attention层
-    使用可学习的query，key和value来自输入
-    输入: [B*num_patches, patch_size, C]
-    输出: [B*num_patches, patch_size, C]
-    使用可学习的query tokens来查询输入序列，捕捉时序信息
-    """
-    def __init__(self, patch_size, n_channels, dropout=0.1):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_channels = n_channels
-        
-        # 可学习的query tokens: [patch_size, n_channels]
-        self.learnable_query = nn.Parameter(torch.randn(patch_size, n_channels) * 0.02)
-        
-        # 位置编码（patch内的时间位置，用于key/value）
-        self.pos_embedding = nn.Embedding(patch_size, n_channels)
-        
-        # 使用nn.MultiheadAttention，embed_dim = n_channels
-        # 自动调整num_heads以确保embed_dim能被num_heads整除
-        num_heads = 1
-        if n_channels >= 4:
-            # 尝试找到合适的num_heads（不超过4，且能整除n_channels）
-            for h in [4, 2, 1]:
-                if n_channels % h == 0:
-                    num_heads = h
-                    break
-        
-        self.attention = nn.MultiheadAttention(
-            embed_dim=n_channels,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-        
-        # Layer norm
-        self.norm1 = nn.LayerNorm(n_channels)
-        self.norm2 = nn.LayerNorm(n_channels)
-        
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(n_channels, n_channels * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(n_channels * 2, n_channels),
-            nn.Dropout(dropout)
-        )
-    
-    def forward(self, x):
-        """
-        Args:
-            x: [B*num_patches, patch_size, C]
-        Returns:
-            out: [B*num_patches, patch_size, C]
-        """
-        B, T, C = x.shape  # B = B*num_patches, T = patch_size
-        
-        # 保存原始输入用于残差连接
-        residual = x
-        
-        # 位置编码（用于key/value）
-        positions = torch.arange(self.patch_size, device=x.device).unsqueeze(0).expand(B, -1)
-        pos_emb = self.pos_embedding(positions)  # [B, patch_size, C]
-        
-        # 添加位置编码到输入（作为key/value）
-        x_pos = x + pos_emb  # [B, patch_size, C]
-        
-        # 可学习的query: [patch_size, n_channels] -> [B, patch_size, C]
-        learnable_q = self.learnable_query.unsqueeze(0).expand(B, -1, -1)  # [B, patch_size, C]
-        
-        # Cross-attention: query来自可学习参数，key/value来自输入
-        attn_out, _ = self.attention(learnable_q, x_pos, x_pos)  # [B, patch_size, C]
-        
-        # 残差连接和Layer Norm（注意：这里残差连接的是query的输出，而不是原始输入）
-        x_normed = self.norm1(learnable_q + self.dropout(attn_out))  # [B, patch_size, C]
-        
-        # FFN（带残差连接）
-        ffn_out = self.ffn(x_normed)  # [B, patch_size, C]
-        x_out = self.norm2(x_normed + ffn_out)  # [B, patch_size, C]
-        
-        # 整体残差连接：输入 + 处理后的输出
-        out = residual + x_out
-        
-        return out
 
 
 class CausalTransformer(nn.Module):
@@ -720,43 +428,11 @@ class PatchVQVAETransformer(nn.Module):
         # Transformer的hidden_dim（用于Transformer内部维度，默认使用code_dim）
         self.transformer_hidden_dim = config.get('transformer_hidden_dim', None)
         
-        # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
-        self.use_patch_attention = config.get('use_patch_attention', False)
-        patch_attention_type = config.get('patch_attention_type', 'tcn')  # 'tcn', 'attention', 或 'cross_attention'
-        n_channels = config.get('n_channels', None)  # 如果提供了通道数，立即初始化
-        
-        if self.use_patch_attention and n_channels is not None:
-            if patch_attention_type == 'tcn':
-                tcn_num_layers = config.get('tcn_num_layers', 2)
-                tcn_kernel_size = config.get('tcn_kernel_size', 3)
-                tcn_hidden_dim = config.get('tcn_hidden_dim', None)
-                self.patch_attention = PatchTCN(
-                    patch_size=self.patch_size,
-                    n_channels=n_channels,
-                    dropout=self.dropout,
-                    num_layers=tcn_num_layers,
-                    kernel_size=tcn_kernel_size,
-                    hidden_dim=tcn_hidden_dim
-                )
-            elif patch_attention_type == 'cross_attention':
-                self.patch_attention = PatchCrossAttention(
-                    patch_size=self.patch_size,
-                    n_channels=n_channels,
-                    dropout=self.dropout
-                )
-            else:  # 'attention' (self-attention)
-                self.patch_attention = PatchSelfAttention(
-                    patch_size=self.patch_size,
-                    n_channels=n_channels,
-                    dropout=self.dropout
-                )
-        else:
-            self.patch_attention = None
-        
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'uniform')
         use_residual_vq = config.get('use_residual_vq', False)
         residual_vq_layers = config.get('residual_vq_layers', 2)
+        residual_vq_combine_method = config.get('residual_vq_combine_method', 'sum')  # 'sum' 或 'concat'
         
         if use_residual_vq:
             # 使用残差量化（多层码本）
@@ -764,12 +440,14 @@ class PatchVQVAETransformer(nn.Module):
                 self.vq = ResidualVectorQuantizerEMA(
                     self.codebook_size, self.code_dim, self.commitment_cost,
                     decay=self.ema_decay, eps=self.ema_eps,
-                    num_layers=residual_vq_layers, init_method=vq_init_method
+                    num_layers=residual_vq_layers, init_method=vq_init_method,
+                    combine_method=residual_vq_combine_method
                 )
             else:
                 self.vq = ResidualVectorQuantizer(
                     self.codebook_size, self.code_dim, self.commitment_cost,
-                    num_layers=residual_vq_layers, init_method=vq_init_method
+                    num_layers=residual_vq_layers, init_method=vq_init_method,
+                    combine_method=residual_vq_combine_method
                 )
         else:
             # 使用单层量化（原始方式）
@@ -814,92 +492,55 @@ class PatchVQVAETransformer(nn.Module):
             out_channels=1  # 单通道输出
         )
     
-    def encode_to_indices(self, x, return_processed_patches=False):
+    def encode_to_indices(self, x):
         """
         编码为码本索引和量化向量（channel-independent版本）
         
         Args:
             x: [B, T, C]
-            return_processed_patches: 是否返回经过时序建模处理后的patches
         Returns:
-            indices: [B, num_patches, C]
+            indices: [B, num_patches, C, num_layers] 或 [B, num_patches, C] (单层)
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
-            x_patches_processed: [B, num_patches, patch_size, C] (如果return_processed_patches=True)
         """
         B, T, C = x.shape
         
         num_patches = T // self.patch_size
         
-        # 重组为 patches: [B, num_patches, patch_size, C]
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
         
-        # 应用Patch内时序建模（TCN或Attention，如果启用）
-        if self.use_patch_attention:
-            if self.patch_attention is None:
-                raise RuntimeError(
-                    "patch_attention 未初始化。请在创建模型时通过 config['n_channels'] 提供通道数。"
-                )
-            
-            # 对每个patch，在patch_size × C上应用时序建模
-            # [B, num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
-            x_patches_flat = x_patches.reshape(B * num_patches, self.patch_size, C)
-            
-            # 应用时序建模（TCN或Attention）: [B*num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
-            x_out = self.patch_attention(x_patches_flat)
-            
-            # 恢复形状: [B*num_patches, patch_size, C] -> [B, num_patches, patch_size, C]
-            x_patches = x_out.reshape(B, num_patches, self.patch_size, C)
-        
-        # 保存处理后的patches（用于重构损失）
-        x_patches_processed = x_patches if return_processed_patches else None
-        
-        # Channel-independent: 对每个通道独立编码
         indices_list = []
         z_q_list = []
         vq_loss_sum = 0
         
         for c in range(C):
-            # 提取第c个通道的patches: [B, num_patches, patch_size]
-            x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
-            x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
-            x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
+            x_c = x_patches[:, :, :, c]
+            x_c_flat = x_c.reshape(B * num_patches, self.patch_size).unsqueeze(1)
             
-            # VQVAE Encoder (单通道输入)
-            z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
-            z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+            z = self.encoder(x_c_flat, self.compression_factor)
+            z_flat = z.reshape(B * num_patches, -1)
             
-            # VQ（支持单层和残差量化）
             vq_result = self.vq(z_flat)
             if isinstance(vq_result[2], list):
-                # 残差量化：返回多层索引列表
                 vq_loss_c, z_q_flat_c, indices_list_c = vq_result
-                # 将多层索引合并为单个tensor: [num_layers, B*num_patches] -> [B*num_patches, num_layers]
-                indices_c = torch.stack(indices_list_c, dim=0).t()  # [B*num_patches, num_layers]
+                indices_c = torch.stack(indices_list_c, dim=0).t()
             else:
-                # 单层量化：返回单个索引
                 vq_loss_c, z_q_flat_c, indices_c = vq_result
-                # 添加维度以保持一致性: [B*num_patches] -> [B*num_patches, 1]
-                indices_c = indices_c.unsqueeze(1)  # [B*num_patches, 1]
+                indices_c = indices_c.unsqueeze(1)
             
             vq_loss_sum += vq_loss_c
-            
-            # Reshape: [B*num_patches, num_layers] -> [B, num_patches, num_layers]
             num_layers = indices_c.shape[1]
-            indices_c = indices_c.reshape(B, num_patches, num_layers)  # [B, num_patches, num_layers]
-            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+            indices_c = indices_c.reshape(B, num_patches, num_layers)
+            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)
             
             indices_list.append(indices_c)
             z_q_list.append(z_q_c)
         
-        # 合并所有通道: [B, num_patches, C, num_layers] 和 [B, num_patches, C, code_dim]
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, num_layers]
-        z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
-        vq_loss = vq_loss_sum / C  # 平均VQ损失
+        indices = torch.stack(indices_list, dim=2)
+        z_q = torch.stack(z_q_list, dim=2)
+        vq_loss = vq_loss_sum / C
         
-        if return_processed_patches:
-            return indices, vq_loss, z_q, x_patches_processed
         return indices, vq_loss, z_q
     
     def decode_from_indices(self, indices):
@@ -909,7 +550,7 @@ class PatchVQVAETransformer(nn.Module):
         Args:
             indices: [B, num_patches, C, num_layers] 或 [B, num_patches, C] (单层)
         Returns:
-            z_q: [B, num_patches, C, code_dim]
+            z_q: [B, num_patches, C, code_dim] (sum模式) 或 [B, num_patches, C, code_dim * num_layers] (concat模式)
         """
         B, num_patches, C = indices.shape[:3]
         
@@ -931,12 +572,16 @@ class PatchVQVAETransformer(nn.Module):
             if use_residual and hasattr(self.vq, 'get_embedding'):
                 # 残差量化：需要将多层索引转换为列表
                 indices_list_c = [indices_c_flat[:, i] for i in range(num_layers)]
-                z_q_flat_c = self.vq.get_embedding(indices_list_c)  # [B*num_patches, code_dim]
+                z_q_flat_c = self.vq.get_embedding(indices_list_c)
+                # 如果使用concat模式，维度是 [B*num_patches, code_dim * num_layers]
+                # 如果使用sum模式，维度是 [B*num_patches, code_dim]
+                output_dim = z_q_flat_c.shape[1]
             else:
                 # 单层量化：直接使用第一层索引
-                z_q_flat_c = self.vq.get_embedding(indices_c_flat[:, 0])  # [B*num_patches, code_dim]
+                z_q_flat_c = self.vq.get_embedding(indices_c_flat[:, 0])
+                output_dim = self.code_dim
             
-            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+            z_q_c = z_q_flat_c.reshape(B, num_patches, output_dim)
             z_q_list.append(z_q_c)
         
         # 合并所有通道: [B, num_patches, C, code_dim]
@@ -994,14 +639,10 @@ class PatchVQVAETransformer(nn.Module):
         assert C == C_target, "输入和目标序列的通道数必须相同"
         
         # 1. 编码输入序列
-        if self.use_patch_attention:
-            input_indices, vq_loss_input, z_q_input, x_patches_processed = self.encode_to_indices(x, return_processed_patches=True)
-        else:
-            input_indices, vq_loss_input, z_q_input = self.encode_to_indices(x, return_processed_patches=False)
-            x_patches_processed = None
+        input_indices, vq_loss_input, z_q_input = self.encode_to_indices(x)
         
         # 2. 编码目标序列（用于计算损失）
-        target_indices, vq_loss_target, z_q_target = self.encode_to_indices(target, return_processed_patches=False)
+        target_indices, vq_loss_target, z_q_target = self.encode_to_indices(target)
         
         # VQ损失（输入和目标序列的平均）
         vq_loss = (vq_loss_input + vq_loss_target) / 2
@@ -1009,48 +650,27 @@ class PatchVQVAETransformer(nn.Module):
         # 重构损失（仅使用输入序列）
         num_input_patches = input_indices.shape[1]
         x_recon = self.decode_from_codes(z_q_input)  # [B, num_input_patches * patch_size, C]
+        recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
         
-        if self.use_patch_attention and x_patches_processed is not None:
-            x_processed = x_patches_processed.reshape(B, num_input_patches * self.patch_size, C)
-            recon_loss = F.mse_loss(x_recon, x_processed[:, :x_recon.shape[1], :])
-        else:
-            recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
-        
-        # 3. Channel-independent Transformer处理: 批量处理所有通道以加速
-        # z_q_input: [B, num_input_patches, C, code_dim] -> [B*C, num_input_patches, code_dim]
+        # 3. Channel-independent Transformer处理
         B, num_input_patches, C, code_dim = z_q_input.shape
-        z_q_input_flat = z_q_input.permute(0, 2, 1, 3).reshape(B * C, num_input_patches, code_dim)  # [B*C, num_input_patches, code_dim]
+        z_q_input_flat = z_q_input.permute(0, 2, 1, 3).reshape(B * C, num_input_patches, code_dim)
         
-        # 4. 创建占位符用于预测目标序列
-        # target_indices可能是多层索引 [B, num_target_patches, C, num_layers] 或单层 [B, num_target_patches, C]
-        if target_indices.dim() == 4:
-            num_target_patches = target_indices.shape[1]
-        else:
-            num_target_patches = target_indices.shape[1]
+        # 4. 创建占位符并拼接
+        num_target_patches = target_indices.shape[1]
         placeholder = torch.zeros(B * C, num_target_patches, code_dim, device=z_q_input_flat.device, dtype=z_q_input_flat.dtype)
-        
-        # 5. 拼接输入序列和占位符: [B*C, num_input_patches + num_target_patches, code_dim]
         full_sequence = torch.cat([z_q_input_flat, placeholder], dim=1)
         
-        # 6. Transformer处理完整序列（causal mask确保占位符只能看到输入序列）
-        h_full = self.transformer(full_sequence)  # [B*C, num_input_patches + num_target_patches, code_dim]
-        
-        # 7. 只取占位符位置的输出: [B*C, num_target_patches, code_dim]
+        # 5. Transformer处理并预测
+        h_full = self.transformer(full_sequence)
         h_target = h_full[:, num_input_patches:, :]
+        logits_flat = self.output_head(h_target)
+        logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)
         
-        # 8. 输出头: 预测目标序列的索引概率分布
-        logits_flat = self.output_head(h_target)  # [B*C, num_target_patches, codebook_size]
-        
-        # 9. Reshape回通道分离格式: [B*C, num_target_patches, codebook_size] -> [B, num_target_patches, C, codebook_size]
-        logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)  # [B, num_target_patches, C, codebook_size]
-        
-        # 对于残差量化，target_indices是多层索引，需要展平用于损失计算
-        # 这里我们只使用第一层索引作为target（或者可以扩展为多层损失）
+        # 对于残差量化，只使用第一层索引作为target
         if target_indices.dim() == 4:
-            # 多层索引：只使用第一层 [B, num_target_patches, C]
             target_indices_flat = target_indices[:, :, :, 0]
         else:
-            # 单层索引：直接使用
             target_indices_flat = target_indices
         
         return logits, target_indices_flat, vq_loss, recon_loss
@@ -1334,17 +954,6 @@ def get_model_config(args):
         'use_residual_vq': getattr(args, 'use_residual_vq', False),
         'residual_vq_layers': getattr(args, 'residual_vq_layers', 2),
         'vq_init_method': getattr(args, 'vq_init_method', 'uniform'),
+        'residual_vq_combine_method': getattr(args, 'residual_vq_combine_method', 'sum'),  # 'sum' 或 'concat'
     }
-    
-    # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
-    if hasattr(args, 'use_patch_attention'):
-        config['use_patch_attention'] = bool(args.use_patch_attention)
-        config['patch_attention_type'] = getattr(args, 'patch_attention_type', 'tcn')  # 'tcn', 'attention', 或 'cross_attention'
-        config['tcn_num_layers'] = getattr(args, 'tcn_num_layers', 2)
-        config['tcn_kernel_size'] = getattr(args, 'tcn_kernel_size', 3)
-        config['tcn_hidden_dim'] = getattr(args, 'tcn_hidden_dim', None)
-    
-    # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:
-    # config['n_channels'] = dls.vars
-    
     return config

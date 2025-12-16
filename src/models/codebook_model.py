@@ -48,6 +48,7 @@ class CodebookModel(nn.Module):
         init_method = config.get('vq_init_method', 'uniform')
         use_residual_vq = config.get('use_residual_vq', False)
         residual_vq_layers = config.get('residual_vq_layers', 2)
+        residual_vq_combine_method = config.get('residual_vq_combine_method', 'sum')  # 'sum' 或 'concat'
         
         if use_residual_vq:
             # 使用残差量化（多层码本）
@@ -56,12 +57,14 @@ class CodebookModel(nn.Module):
                 self.vq = ResidualVectorQuantizerEMA(
                     self.codebook_size, self.code_dim, self.commitment_cost,
                     decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
-                    num_layers=residual_vq_layers, init_method=init_method
+                    num_layers=residual_vq_layers, init_method=init_method,
+                    combine_method=residual_vq_combine_method
                 )
             else:
                 self.vq = ResidualVectorQuantizer(
                     self.codebook_size, self.code_dim, self.commitment_cost,
-                    num_layers=residual_vq_layers, init_method=init_method
+                    num_layers=residual_vq_layers, init_method=init_method,
+                    combine_method=residual_vq_combine_method
                 )
         else:
             # 使用单层量化（原始方式）
