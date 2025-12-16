@@ -60,6 +60,10 @@ def parse_args():
                        help='码本利用率报告间隔（每N个epoch报告一次）')
     parser.add_argument('--seed', type=int, default=42,
                        help='随机数种子（用于可复现性）')
+    parser.add_argument('--use_residual_vq', type=int, default=0,
+                       help='是否使用残差量化（多层码本，减少量化误差）')
+    parser.add_argument('--residual_vq_layers', type=int, default=2,
+                       help='残差量化层数（建议2-3层）')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -89,6 +93,8 @@ def get_model_config(args):
         'ema_decay': args.ema_decay,
         'ema_eps': args.ema_eps,
         'vq_init_method': args.vq_init_method,
+        'use_residual_vq': bool(args.use_residual_vq),
+        'residual_vq_layers': args.residual_vq_layers,
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,

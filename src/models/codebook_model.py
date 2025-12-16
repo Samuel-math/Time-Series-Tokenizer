@@ -46,17 +46,36 @@ class CodebookModel(nn.Module):
         
         # VQ
         init_method = config.get('vq_init_method', 'uniform')
-        if config.get('codebook_ema', False):
-            self.vq = FlattenedVectorQuantizerEMA(
-                self.codebook_size, self.code_dim, self.commitment_cost,
-                decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
-                init_method=init_method
-            )
+        use_residual_vq = config.get('use_residual_vq', False)
+        residual_vq_layers = config.get('residual_vq_layers', 2)
+        
+        if use_residual_vq:
+            # 使用残差量化（多层码本）
+            from .patch_vqvae_transformer import ResidualVectorQuantizer, ResidualVectorQuantizerEMA
+            if config.get('codebook_ema', False):
+                self.vq = ResidualVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
+                    num_layers=residual_vq_layers, init_method=init_method
+                )
+            else:
+                self.vq = ResidualVectorQuantizer(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    num_layers=residual_vq_layers, init_method=init_method
+                )
         else:
-            self.vq = FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost,
-                init_method=init_method
-            )
+            # 使用单层量化（原始方式）
+            if config.get('codebook_ema', False):
+                self.vq = FlattenedVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
+                    init_method=init_method
+                )
+            else:
+                self.vq = FlattenedVectorQuantizer(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    init_method=init_method
+                )
     
     def init_codebook_from_data(self, dataloader, device, num_samples=10000, method='kmeans', revin=None):
         """
@@ -152,19 +171,31 @@ class CodebookModel(nn.Module):
             z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
             z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
             
-            # VQ
-            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_flat)
+            # VQ（支持单层和残差量化）
+            vq_result = self.vq(z_flat)
+            if isinstance(vq_result[2], list):
+                # 残差量化：返回多层索引列表
+                vq_loss_c, z_q_flat_c, indices_list_c = vq_result
+                # 将多层索引合并为单个tensor: [num_layers, B*num_patches] -> [B*num_patches, num_layers]
+                indices_c = torch.stack(indices_list_c, dim=0).t()  # [B*num_patches, num_layers]
+            else:
+                # 单层量化：返回单个索引
+                vq_loss_c, z_q_flat_c, indices_c = vq_result
+                # 添加维度以保持一致性: [B*num_patches] -> [B*num_patches, 1]
+                indices_c = indices_c.unsqueeze(1)  # [B*num_patches, 1]
+            
             vq_loss_sum += vq_loss_c
             
-            # Reshape: [B*num_patches] -> [B, num_patches]
-            indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
+            # Reshape: [B*num_patches, num_layers] -> [B, num_patches, num_layers]
+            num_layers = indices_c.shape[1]
+            indices_c = indices_c.reshape(B, num_patches, num_layers)  # [B, num_patches, num_layers]
             z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
             
             indices_list.append(indices_c)
             z_q_list.append(z_q_c)
         
-        # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
+        # 合并所有通道: [B, num_patches, C, num_layers] 和 [B, num_patches, C, code_dim]
+        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, num_layers]
         z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C  # 平均VQ损失
         

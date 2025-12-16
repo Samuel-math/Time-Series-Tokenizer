@@ -109,6 +109,145 @@ class FlattenedVectorQuantizer(nn.Module):
         return self.embedding(indices)
 
 
+class ResidualVectorQuantizer(nn.Module):
+    """
+    残差向量量化器（Residual Vector Quantization）
+    使用多层码本来逐步拟合残差，减少量化误差
+    
+    原理：
+    1. 第一层量化：z -> z_q1，残差 r1 = z - z_q1
+    2. 第二层量化：r1 -> r_q1，残差 r2 = r1 - r_q1
+    3. 最终量化：z_q = z_q1 + r_q1
+    4. 可以继续量化r2，形成更多层
+    """
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, num_layers=2, init_method='uniform'):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.code_dim = code_dim
+        self.commitment_cost = commitment_cost
+        self.num_layers = num_layers
+        
+        # 创建多层码本
+        self.codebooks = nn.ModuleList([
+            FlattenedVectorQuantizer(codebook_size, code_dim, commitment_cost, init_method)
+            for _ in range(num_layers)
+        ])
+    
+    def forward(self, z_flat):
+        """
+        Args:
+            z_flat: [N, code_dim] 输入向量
+        Returns:
+            total_loss: 总损失（所有层的损失之和）
+            quantized: [N, code_dim] 最终量化结果
+            indices_list: List[[N]] 每层的码本索引
+        """
+        residual = z_flat
+        total_loss = 0
+        indices_list = []
+        
+        # 逐层量化残差
+        for i, codebook in enumerate(self.codebooks):
+            # 量化当前残差
+            loss, quantized_residual, indices = codebook(residual)
+            total_loss += loss
+            
+            # 更新残差：residual = residual - quantized_residual
+            residual = residual - quantized_residual.detach()
+            
+            indices_list.append(indices)
+        
+        # 最终量化结果：所有层量化结果的和
+        quantized = z_flat - residual  # 等价于 sum(quantized_residuals)
+        
+        return total_loss, quantized, indices_list
+    
+    def get_embedding(self, indices_list):
+        """
+        从多层索引获取量化向量
+        
+        Args:
+            indices_list: List[[N]] 每层的码本索引
+        Returns:
+            quantized: [N, code_dim] 最终量化结果
+        """
+        quantized = None
+        for i, (codebook, indices) in enumerate(zip(self.codebooks, indices_list)):
+            if quantized is None:
+                quantized = codebook.get_embedding(indices)
+            else:
+                quantized = quantized + codebook.get_embedding(indices)
+        return quantized
+
+
+class ResidualVectorQuantizerEMA(nn.Module):
+    """
+    残差向量量化器（EMA版本）
+    使用EMA更新多层码本
+    """
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, 
+                 num_layers=2, init_method='uniform'):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.code_dim = code_dim
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.eps = eps
+        self.num_layers = num_layers
+        
+        # 创建多层EMA码本
+        self.codebooks = nn.ModuleList([
+            FlattenedVectorQuantizerEMA(codebook_size, code_dim, commitment_cost, decay, eps, init_method)
+            for _ in range(num_layers)
+        ])
+    
+    def forward(self, z_flat):
+        """
+        Args:
+            z_flat: [N, code_dim] 输入向量
+        Returns:
+            total_loss: 总损失（所有层的损失之和）
+            quantized: [N, code_dim] 最终量化结果
+            indices_list: List[[N]] 每层的码本索引
+        """
+        residual = z_flat
+        total_loss = 0
+        indices_list = []
+        
+        # 逐层量化残差
+        for i, codebook in enumerate(self.codebooks):
+            # 量化当前残差
+            loss, quantized_residual, indices = codebook(residual)
+            total_loss += loss
+            
+            # 更新残差：residual = residual - quantized_residual
+            residual = residual - quantized_residual.detach()
+            
+            indices_list.append(indices)
+        
+        # 最终量化结果：所有层量化结果的和
+        quantized = z_flat - residual  # 等价于 sum(quantized_residuals)
+        
+        return total_loss, quantized, indices_list
+    
+    def get_embedding(self, indices_list):
+        """
+        从多层索引获取量化向量
+        
+        Args:
+            indices_list: List[[N]] 每层的码本索引
+        Returns:
+            quantized: [N, code_dim] 最终量化结果
+        """
+        quantized = None
+        for i, (codebook, indices) in enumerate(zip(self.codebooks, indices_list)):
+            if quantized is None:
+                quantized = codebook.get_embedding(indices)
+            else:
+                quantized = quantized + codebook.get_embedding(indices)
+        return quantized
+
+
 class FlattenedVectorQuantizerEMA(nn.Module):
     """
     使用 EMA 更新码本的 Vector Quantizer
@@ -616,17 +755,35 @@ class PatchVQVAETransformer(nn.Module):
         
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'uniform')
-        if self.use_codebook_ema:
-            self.vq = FlattenedVectorQuantizerEMA(
-                self.codebook_size, self.code_dim, self.commitment_cost,
-                decay=self.ema_decay, eps=self.ema_eps,
-                init_method=vq_init_method
-            )
+        use_residual_vq = config.get('use_residual_vq', False)
+        residual_vq_layers = config.get('residual_vq_layers', 2)
+        
+        if use_residual_vq:
+            # 使用残差量化（多层码本）
+            if self.use_codebook_ema:
+                self.vq = ResidualVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=self.ema_decay, eps=self.ema_eps,
+                    num_layers=residual_vq_layers, init_method=vq_init_method
+                )
+            else:
+                self.vq = ResidualVectorQuantizer(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    num_layers=residual_vq_layers, init_method=vq_init_method
+                )
         else:
-            self.vq = FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost,
-                init_method=vq_init_method
-            )
+            # 使用单层量化（原始方式）
+            if self.use_codebook_ema:
+                self.vq = FlattenedVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=self.ema_decay, eps=self.ema_eps,
+                    init_method=vq_init_method
+                )
+            else:
+                self.vq = FlattenedVectorQuantizer(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    init_method=vq_init_method
+                )
         
         # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
         self.transformer = CausalTransformer(
@@ -713,25 +870,78 @@ class PatchVQVAETransformer(nn.Module):
             z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
             z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
             
-            # VQ
-            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_flat)
+            # VQ（支持单层和残差量化）
+            vq_result = self.vq(z_flat)
+            if isinstance(vq_result[2], list):
+                # 残差量化：返回多层索引列表
+                vq_loss_c, z_q_flat_c, indices_list_c = vq_result
+                # 将多层索引合并为单个tensor: [num_layers, B*num_patches] -> [B*num_patches, num_layers]
+                indices_c = torch.stack(indices_list_c, dim=0).t()  # [B*num_patches, num_layers]
+            else:
+                # 单层量化：返回单个索引
+                vq_loss_c, z_q_flat_c, indices_c = vq_result
+                # 添加维度以保持一致性: [B*num_patches] -> [B*num_patches, 1]
+                indices_c = indices_c.unsqueeze(1)  # [B*num_patches, 1]
+            
             vq_loss_sum += vq_loss_c
             
-            # Reshape: [B*num_patches] -> [B, num_patches]
-            indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
+            # Reshape: [B*num_patches, num_layers] -> [B, num_patches, num_layers]
+            num_layers = indices_c.shape[1]
+            indices_c = indices_c.reshape(B, num_patches, num_layers)  # [B, num_patches, num_layers]
             z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
             
             indices_list.append(indices_c)
             z_q_list.append(z_q_c)
         
-        # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
+        # 合并所有通道: [B, num_patches, C, num_layers] 和 [B, num_patches, C, code_dim]
+        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, num_layers]
         z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C  # 平均VQ损失
         
         if return_processed_patches:
             return indices, vq_loss, z_q, x_patches_processed
         return indices, vq_loss, z_q
+    
+    def decode_from_indices(self, indices):
+        """
+        从码本索引恢复量化向量（支持单层和残差量化）
+        
+        Args:
+            indices: [B, num_patches, C, num_layers] 或 [B, num_patches, C] (单层)
+        Returns:
+            z_q: [B, num_patches, C, code_dim]
+        """
+        B, num_patches, C = indices.shape[:3]
+        
+        # 检查是否为残差量化（多层索引）
+        if indices.dim() == 4:
+            num_layers = indices.shape[3]
+            use_residual = num_layers > 1
+        else:
+            num_layers = 1
+            use_residual = False
+        
+        z_q_list = []
+        
+        for c in range(C):
+            indices_c = indices[:, :, c, :] if use_residual else indices[:, :, c].unsqueeze(-1)  # [B, num_patches, num_layers]
+            indices_c_flat = indices_c.reshape(B * num_patches, num_layers)  # [B*num_patches, num_layers]
+            
+            # 从多层索引恢复量化向量
+            if use_residual and hasattr(self.vq, 'get_embedding'):
+                # 残差量化：需要将多层索引转换为列表
+                indices_list_c = [indices_c_flat[:, i] for i in range(num_layers)]
+                z_q_flat_c = self.vq.get_embedding(indices_list_c)  # [B*num_patches, code_dim]
+            else:
+                # 单层量化：直接使用第一层索引
+                z_q_flat_c = self.vq.get_embedding(indices_c_flat[:, 0])  # [B*num_patches, code_dim]
+            
+            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+            z_q_list.append(z_q_c)
+        
+        # 合并所有通道: [B, num_patches, C, code_dim]
+        z_q = torch.stack(z_q_list, dim=2)
+        return z_q
     
     def decode_from_codes(self, z_q):
         """
@@ -763,7 +973,7 @@ class PatchVQVAETransformer(nn.Module):
         # 合并所有通道: [B, num_patches, patch_size, C]
         x_recon = torch.stack(x_recon_list, dim=3)  # [B, num_patches, patch_size, C]
         x_recon = x_recon.reshape(B, -1, C)  # [B, num_patches * patch_size, C]
-        
+
         return x_recon
     
     def forward_pretrain(self, x, target):
@@ -812,7 +1022,11 @@ class PatchVQVAETransformer(nn.Module):
         z_q_input_flat = z_q_input.permute(0, 2, 1, 3).reshape(B * C, num_input_patches, code_dim)  # [B*C, num_input_patches, code_dim]
         
         # 4. 创建占位符用于预测目标序列
-        num_target_patches = target_indices.shape[1]
+        # target_indices可能是多层索引 [B, num_target_patches, C, num_layers] 或单层 [B, num_target_patches, C]
+        if target_indices.dim() == 4:
+            num_target_patches = target_indices.shape[1]
+        else:
+            num_target_patches = target_indices.shape[1]
         placeholder = torch.zeros(B * C, num_target_patches, code_dim, device=z_q_input_flat.device, dtype=z_q_input_flat.dtype)
         
         # 5. 拼接输入序列和占位符: [B*C, num_input_patches + num_target_patches, code_dim]
@@ -830,7 +1044,16 @@ class PatchVQVAETransformer(nn.Module):
         # 9. Reshape回通道分离格式: [B*C, num_target_patches, codebook_size] -> [B, num_target_patches, C, codebook_size]
         logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)  # [B, num_target_patches, C, codebook_size]
         
-        return logits, target_indices, vq_loss, recon_loss
+        # 对于残差量化，target_indices是多层索引，需要展平用于损失计算
+        # 这里我们只使用第一层索引作为target（或者可以扩展为多层损失）
+        if target_indices.dim() == 4:
+            # 多层索引：只使用第一层 [B, num_target_patches, C]
+            target_indices_flat = target_indices[:, :, :, 0]
+        else:
+            # 单层索引：直接使用
+            target_indices_flat = target_indices
+        
+        return logits, target_indices_flat, vq_loss, recon_loss
     
     def forward_finetune(self, x, target_len):
         """
@@ -901,7 +1124,10 @@ class PatchVQVAETransformer(nn.Module):
             indices, _, _, _ = result
         else:
             indices, _, _ = result
-        # indices: [B, num_patches, C] (channel-independent)
+        # indices: [B, num_patches, C, num_layers] 或 [B, num_patches, C]
+        # 对于残差量化，只使用第一层索引计算利用率
+        if indices.dim() == 4:
+            indices = indices[:, :, :, 0]  # [B, num_patches, C]
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
@@ -1104,6 +1330,10 @@ def get_model_config(args):
         'num_residual_hiddens': args.num_residual_hiddens,
         # Transformer hidden_dim（可选，默认使用code_dim）
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
+        # 残差量化配置
+        'use_residual_vq': getattr(args, 'use_residual_vq', False),
+        'residual_vq_layers': getattr(args, 'residual_vq_layers', 2),
+        'vq_init_method': getattr(args, 'vq_init_method', 'uniform'),
     }
     
     # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）

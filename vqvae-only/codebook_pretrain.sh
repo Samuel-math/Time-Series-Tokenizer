@@ -60,6 +60,8 @@ python vqvae-only/codebook_pretrain.py \
     --codebook_ema $CODEBOOK_EMA \
     --ema_decay $EMA_DECAY \
     --ema_eps $EMA_EPS \
+    --use_residual_vq $USE_RESIDUAL_VQ \
+    --residual_vq_layers $RESIDUAL_VQ_LAYERS \
     --vq_init_method $VQ_INIT_METHOD \
     --codebook_report_interval $CODEBOOK_REPORT_INTERVAL \
     --seed $SEED \
