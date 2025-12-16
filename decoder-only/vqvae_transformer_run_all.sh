@@ -29,6 +29,8 @@ COMPRESSION_FACTOR=4
 
 # ----- VQVAE 参数（会从码本checkpoint中自动读取，这里作为备用）-----
 EMBEDDING_DIM=32
+# CODEBOOK_SIZE: 仅在不使用残差量化时使用
+# 如果使用残差量化，请使用RESIDUAL_VQ_CODEBOOK_SIZES参数
 CODEBOOK_SIZE=256
 NUM_HIDDENS=64
 NUM_RESIDUAL_LAYERS=2
@@ -68,6 +70,7 @@ TARGET_POINTS_LIST=(96 192 336 720)
 USE_RESIDUAL_VQ=1  # 是否使用残差量化（1启用，0禁用）
 RESIDUAL_VQ_LAYERS=2  # 残差量化层数（建议2-3层）
 RESIDUAL_VQ_COMBINE_METHOD="sum"  # 合并方式：sum（相加）或concat（拼接）
+RESIDUAL_VQ_CODEBOOK_SIZES="256,128"  # 每层codebook大小，用逗号分隔，如 "256,128"。如果为空，所有层使用统一的CODEBOOK_SIZE
 VQ_INIT_METHOD="uniform"  # 码本初始化方法: uniform/normal/xavier/kaiming
 
 # ----- 其他参数 -----
@@ -113,7 +116,14 @@ echo "找到码本模型: ${CODEBOOK_CHECKPOINT}"
 # 计算 code_dim 用于模型命名（会从checkpoint中读取实际值）
 # =====================================================
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
-MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_model${MODEL_ID}"
+# 模型命名：如果使用残差量化且指定了每层大小，使用第一层大小；否则使用CODEBOOK_SIZE
+if [ "${USE_RESIDUAL_VQ}" -eq 1 ] && [ -n "${RESIDUAL_VQ_CODEBOOK_SIZES}" ]; then
+    # 提取第一层codebook大小
+    FIRST_CB_SIZE=$(echo "${RESIDUAL_VQ_CODEBOOK_SIZES}" | cut -d',' -f1)
+    MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${FIRST_CB_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_model${MODEL_ID}"
+else
+    MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_model${MODEL_ID}"
+fi
 
 echo "================================================="
 echo "基于预训练码本模型的Transformer训练"
@@ -150,12 +160,16 @@ PRETRAIN_ARGS=(
     --patch_size ${PATCH_SIZE}
     --embedding_dim ${EMBEDDING_DIM}
     --compression_factor ${COMPRESSION_FACTOR}
-    --codebook_size ${CODEBOOK_SIZE}
     --n_layers ${N_LAYERS}
     --n_heads ${N_HEADS}
     --d_ff ${D_FF}
     --dropout ${DROPOUT}
 )
+
+# 只在未使用残差量化或残差量化未指定每层大小时传递codebook_size
+if [ "${USE_RESIDUAL_VQ}" -eq 0 ] || [ -z "${RESIDUAL_VQ_CODEBOOK_SIZES}" ]; then
+    PRETRAIN_ARGS+=(--codebook_size ${CODEBOOK_SIZE})
+fi
 
 # 只在 TRANSFORMER_HIDDEN_DIM 不为空时添加该参数
 if [ -n "${TRANSFORMER_HIDDEN_DIM}" ]; then
@@ -172,6 +186,7 @@ PRETRAIN_ARGS+=(
     --use_residual_vq ${USE_RESIDUAL_VQ} \
     --residual_vq_layers ${RESIDUAL_VQ_LAYERS} \
     --residual_vq_combine_method ${RESIDUAL_VQ_COMBINE_METHOD} \
+    --residual_vq_codebook_sizes "${RESIDUAL_VQ_CODEBOOK_SIZES}" \
     --vq_init_method ${VQ_INIT_METHOD} \
     --vqvae_checkpoint "${CODEBOOK_CHECKPOINT}" \
     --freeze_vqvae ${FREEZE_VQVAE} \

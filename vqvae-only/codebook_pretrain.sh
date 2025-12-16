@@ -33,6 +33,7 @@ SEED=42  # 随机数种子（用于可复现性）
 USE_RESIDUAL_VQ=1  # 是否使用残差量化（1启用，0禁用）
 RESIDUAL_VQ_LAYERS=2  # 残差量化层数（建议2-3层）
 RESIDUAL_VQ_COMBINE_METHOD="sum"  # 合并方式：sum（相加）或concat（拼接）
+RESIDUAL_VQ_CODEBOOK_SIZES=""  # 每层codebook大小，用逗号分隔，如 "256,128"。如果为空，所有层使用统一的CODEBOOK_SIZE
 
 # 训练参数
 N_EPOCHS=50
@@ -68,6 +69,7 @@ python codebook_pretrain.py \
     --use_residual_vq $USE_RESIDUAL_VQ \
     --residual_vq_layers $RESIDUAL_VQ_LAYERS \
     --residual_vq_combine_method $RESIDUAL_VQ_COMBINE_METHOD \
+    --residual_vq_codebook_sizes "${RESIDUAL_VQ_CODEBOOK_SIZES}" \
     --vq_init_method $VQ_INIT_METHOD \
     --codebook_report_interval $CODEBOOK_REPORT_INTERVAL \
     --seed $SEED \

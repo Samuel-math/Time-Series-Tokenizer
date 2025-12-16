@@ -107,16 +107,25 @@ class ResidualVectorQuantizer(nn.Module):
     """残差向量量化器：使用多层码本逐步拟合残差，减少量化误差"""
     def __init__(self, codebook_size, code_dim, commitment_cost=0.25, num_layers=2, init_method='uniform', combine_method='sum'):
         super().__init__()
-        self.codebook_size = codebook_size
+        # codebook_size可以是整数（所有层相同）或列表（每层不同）
+        if isinstance(codebook_size, (list, tuple)):
+            if len(codebook_size) != num_layers:
+                raise ValueError(f"codebook_size列表长度({len(codebook_size)})必须等于num_layers({num_layers})")
+            self.codebook_sizes = list(codebook_size)
+            self.codebook_size = codebook_size[0]  # 保留第一个作为默认值（用于兼容性）
+        else:
+            self.codebook_sizes = [codebook_size] * num_layers
+            self.codebook_size = codebook_size
+        
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
         self.num_layers = num_layers
         self.combine_method = combine_method  # 'sum' 或 'concat'
         
-        # 创建多层码本
+        # 创建多层码本（每层可以使用不同的大小）
         self.codebooks = nn.ModuleList([
-            FlattenedVectorQuantizer(codebook_size, code_dim, commitment_cost, init_method)
-            for _ in range(num_layers)
+            FlattenedVectorQuantizer(self.codebook_sizes[i], code_dim, commitment_cost, init_method)
+            for i in range(num_layers)
         ])
     
     def forward(self, z_flat):
@@ -168,7 +177,16 @@ class ResidualVectorQuantizerEMA(nn.Module):
     def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, 
                  num_layers=2, init_method='uniform', combine_method='sum'):
         super().__init__()
-        self.codebook_size = codebook_size
+        # codebook_size可以是整数（所有层相同）或列表（每层不同）
+        if isinstance(codebook_size, (list, tuple)):
+            if len(codebook_size) != num_layers:
+                raise ValueError(f"codebook_size列表长度({len(codebook_size)})必须等于num_layers({num_layers})")
+            self.codebook_sizes = list(codebook_size)
+            self.codebook_size = codebook_size[0]  # 保留第一个作为默认值（用于兼容性）
+        else:
+            self.codebook_sizes = [codebook_size] * num_layers
+            self.codebook_size = codebook_size
+        
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
         self.decay = decay
@@ -176,10 +194,10 @@ class ResidualVectorQuantizerEMA(nn.Module):
         self.num_layers = num_layers
         self.combine_method = combine_method  # 'sum' 或 'concat'
         
-        # 创建多层EMA码本
+        # 创建多层EMA码本（每层可以使用不同的大小）
         self.codebooks = nn.ModuleList([
-            FlattenedVectorQuantizerEMA(codebook_size, code_dim, commitment_cost, decay, eps, init_method)
-            for _ in range(num_layers)
+            FlattenedVectorQuantizerEMA(self.codebook_sizes[i], code_dim, commitment_cost, decay, eps, init_method)
+            for i in range(num_layers)
         ])
     
     def forward(self, z_flat):
@@ -433,19 +451,26 @@ class PatchVQVAETransformer(nn.Module):
         use_residual_vq = config.get('use_residual_vq', False)
         residual_vq_layers = config.get('residual_vq_layers', 2)
         residual_vq_combine_method = config.get('residual_vq_combine_method', 'sum')  # 'sum' 或 'concat'
+        # 支持每层不同的codebook大小：可以是整数（所有层相同）或列表（每层不同）
+        residual_vq_codebook_sizes = config.get('residual_vq_codebook_sizes', None)
+        if residual_vq_codebook_sizes is None:
+            residual_vq_codebook_sizes = self.codebook_size  # 默认使用统一的codebook_size
+        elif isinstance(residual_vq_codebook_sizes, str):
+            # 如果是字符串（如 "256,128"），解析为列表
+            residual_vq_codebook_sizes = [int(x.strip()) for x in residual_vq_codebook_sizes.split(',')]
         
         if use_residual_vq:
             # 使用残差量化（多层码本）
             if self.use_codebook_ema:
                 self.vq = ResidualVectorQuantizerEMA(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    residual_vq_codebook_sizes, self.code_dim, self.commitment_cost,
                     decay=self.ema_decay, eps=self.ema_eps,
                     num_layers=residual_vq_layers, init_method=vq_init_method,
                     combine_method=residual_vq_combine_method
                 )
             else:
                 self.vq = ResidualVectorQuantizer(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    residual_vq_codebook_sizes, self.code_dim, self.commitment_cost,
                     num_layers=residual_vq_layers, init_method=vq_init_method,
                     combine_method=residual_vq_combine_method
                 )
@@ -955,5 +980,6 @@ def get_model_config(args):
         'residual_vq_layers': getattr(args, 'residual_vq_layers', 2),
         'vq_init_method': getattr(args, 'vq_init_method', 'uniform'),
         'residual_vq_combine_method': getattr(args, 'residual_vq_combine_method', 'sum'),  # 'sum' 或 'concat'
+        'residual_vq_codebook_sizes': getattr(args, 'residual_vq_codebook_sizes', None),  # 每层codebook大小，如 "256,128"
     }
     return config

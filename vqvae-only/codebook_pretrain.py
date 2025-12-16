@@ -66,6 +66,8 @@ def parse_args():
                        help='残差量化层数（建议2-3层）')
     parser.add_argument('--residual_vq_combine_method', type=str, default='sum', choices=['sum', 'concat'],
                        help='残差量化合并方式：sum（相加）或concat（拼接）')
+    parser.add_argument('--residual_vq_codebook_sizes', type=str, default=None,
+                       help='每层codebook大小，用逗号分隔，如 "256,128"。如果未指定，所有层使用统一的codebook_size')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -98,6 +100,7 @@ def get_model_config(args):
         'use_residual_vq': bool(args.use_residual_vq),
         'residual_vq_layers': args.residual_vq_layers,
         'residual_vq_combine_method': args.residual_vq_combine_method,
+        'residual_vq_codebook_sizes': args.residual_vq_codebook_sizes,
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,

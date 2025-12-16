@@ -49,20 +49,27 @@ class CodebookModel(nn.Module):
         use_residual_vq = config.get('use_residual_vq', False)
         residual_vq_layers = config.get('residual_vq_layers', 2)
         residual_vq_combine_method = config.get('residual_vq_combine_method', 'sum')  # 'sum' 或 'concat'
+        # 支持每层不同的codebook大小：可以是整数（所有层相同）或列表（每层不同）
+        residual_vq_codebook_sizes = config.get('residual_vq_codebook_sizes', None)
+        if residual_vq_codebook_sizes is None:
+            residual_vq_codebook_sizes = self.codebook_size  # 默认使用统一的codebook_size
+        elif isinstance(residual_vq_codebook_sizes, str):
+            # 如果是字符串（如 "256,128"），解析为列表
+            residual_vq_codebook_sizes = [int(x.strip()) for x in residual_vq_codebook_sizes.split(',')]
         
         if use_residual_vq:
             # 使用残差量化（多层码本）
             from .patch_vqvae_transformer import ResidualVectorQuantizer, ResidualVectorQuantizerEMA
             if config.get('codebook_ema', False):
                 self.vq = ResidualVectorQuantizerEMA(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    residual_vq_codebook_sizes, self.code_dim, self.commitment_cost,
                     decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
                     num_layers=residual_vq_layers, init_method=init_method,
                     combine_method=residual_vq_combine_method
                 )
             else:
                 self.vq = ResidualVectorQuantizer(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    residual_vq_codebook_sizes, self.code_dim, self.commitment_cost,
                     num_layers=residual_vq_layers, init_method=init_method,
                     combine_method=residual_vq_combine_method
                 )

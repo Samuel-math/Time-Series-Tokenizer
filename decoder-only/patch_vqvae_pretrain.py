@@ -64,6 +64,8 @@ def parse_args():
     parser.add_argument('--residual_vq_layers', type=int, default=2, help='残差量化层数（建议2-3层）')
     parser.add_argument('--residual_vq_combine_method', type=str, default='sum', choices=['sum', 'concat'],
                        help='残差量化合并方式：sum（相加）或concat（拼接）')
+    parser.add_argument('--residual_vq_codebook_sizes', type=str, default=None,
+                       help='每层codebook大小，用逗号分隔，如 "256,128"。如果未指定，所有层使用统一的codebook_size')
     parser.add_argument('--vq_init_method', type=str, default='uniform', choices=['uniform', 'normal', 'xavier', 'kaiming'],
                        help='码本初始化方法（uniform/normal/xavier/kaiming）')
     

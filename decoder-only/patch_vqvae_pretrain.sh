@@ -8,6 +8,7 @@
 USE_RESIDUAL_VQ=0  # 是否使用残差量化（1启用，0禁用）
 RESIDUAL_VQ_LAYERS=2  # 残差量化层数（建议2-3层）
 RESIDUAL_VQ_COMBINE_METHOD="sum"  # 合并方式：sum（相加）或concat（拼接）
+RESIDUAL_VQ_CODEBOOK_SIZES=""  # 每层codebook大小，用逗号分隔，如 "256,128"。如果为空，所有层使用统一的codebook_size
 VQ_INIT_METHOD="uniform"  # 码本初始化方法: uniform/normal/xavier/kaiming
 
 python patch_vqvae_pretrain.py \
@@ -28,6 +29,7 @@ python patch_vqvae_pretrain.py \
     --use_residual_vq ${USE_RESIDUAL_VQ} \
     --residual_vq_layers ${RESIDUAL_VQ_LAYERS} \
     --residual_vq_combine_method ${RESIDUAL_VQ_COMBINE_METHOD} \
+    --residual_vq_codebook_sizes "${RESIDUAL_VQ_CODEBOOK_SIZES}" \
     --vq_init_method ${VQ_INIT_METHOD} \
     --n_epochs 100 \
     --lr 3e-4 \
