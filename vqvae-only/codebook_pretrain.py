@@ -336,8 +336,9 @@ def main():
     scaler = amp.GradScaler(enabled=bool(args.amp))
     
     # 训练
-    best_val_loss = float('inf')
+    best_val_recon_loss = float('inf')  # 跟踪验证集上最小的recon_loss
     train_losses, valid_losses = [], []
+    train_recon_losses, valid_recon_losses = [], []  # 记录recon_loss历史
     no_improve_count = 0
     early_stop_patience = 10
     model_saved = False
@@ -355,6 +356,8 @@ def main():
         
         train_losses.append(train_metrics['loss'])
         valid_losses.append(val_metrics['loss'])
+        train_recon_losses.append(train_metrics['recon_loss'])
+        valid_recon_losses.append(val_metrics['recon_loss'])
         
         # 打印进度
         train_stats = train_metrics.get('codebook_stats', {})
@@ -384,10 +387,13 @@ def main():
                 top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
                 print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
-        # 保存最佳模型
+        # 基于recon_loss保存最佳模型
         if epoch >= 5:  # 前5个epoch不保存
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
+            current_val_recon_loss = val_metrics['recon_loss']
+            
+            # 如果recon_loss下降，保存模型
+            if current_val_recon_loss < best_val_recon_loss:
+                best_val_recon_loss = current_val_recon_loss
                 no_improve_count = 0
                 model_saved = True
                 
@@ -401,13 +407,16 @@ def main():
                     'epoch': epoch,
                     'train_loss': train_metrics['loss'],
                     'val_loss': val_metrics['loss'],
+                    'train_recon_loss': train_metrics['recon_loss'],
+                    'val_recon_loss': val_metrics['recon_loss'],
                 }
                 torch.save(checkpoint, save_dir / f'{model_name}.pth')
-                print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
-            elif model_saved:
+                print(f"  -> Best model saved (val_recon_loss: {val_metrics['recon_loss']:.4f})")
+            else:
+                # recon_loss不再下降，不再保存模型
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
-                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
+                    print(f"\n>>> 早停: val_recon_loss 连续 {early_stop_patience} 个 epoch 未下降")
                     break
     
     # 保存训练历史
@@ -416,6 +425,8 @@ def main():
         'epoch': range(1, actual_epochs + 1),
         'train_loss': train_losses,
         'valid_loss': valid_losses,
+        'train_recon_loss': train_recon_losses,
+        'valid_recon_loss': valid_recon_losses,
     })
     history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
     
@@ -425,7 +436,7 @@ def main():
     
     print('=' * 80)
     print(f'码本预训练完成！')
-    print(f'最佳验证损失: {best_val_loss:.4f}')
+    print(f'最佳验证重构损失: {best_val_recon_loss:.4f}')
     print(f'模型保存至: {save_dir / model_name}.pth')
 
 
