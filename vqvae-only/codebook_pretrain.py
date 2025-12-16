@@ -336,7 +336,7 @@ def main():
     scaler = amp.GradScaler(enabled=bool(args.amp))
     
     # 训练
-    best_val_recon_loss = float('inf')  # 跟踪验证集上最小的recon_loss
+    best_val_loss = float('inf')  # 跟踪验证集上最小的val_loss
     train_losses, valid_losses = [], []
     train_recon_losses, valid_recon_losses = [], []  # 记录recon_loss历史
     no_improve_count = 0
@@ -387,13 +387,13 @@ def main():
                 top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
                 print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
-        # 基于recon_loss保存最佳模型
+        # 基于val_loss保存最佳模型
         if epoch >= 5:  # 前5个epoch不保存
-            current_val_recon_loss = val_metrics['recon_loss']
+            current_val_loss = val_metrics['loss']
             
-            # 如果recon_loss下降，保存模型
-            if current_val_recon_loss < best_val_recon_loss:
-                best_val_recon_loss = current_val_recon_loss
+            # 如果val_loss下降，保存模型
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
                 no_improve_count = 0
                 model_saved = True
                 
@@ -411,12 +411,12 @@ def main():
                     'val_recon_loss': val_metrics['recon_loss'],
                 }
                 torch.save(checkpoint, save_dir / f'{model_name}.pth')
-                print(f"  -> Best model saved (val_recon_loss: {val_metrics['recon_loss']:.4f})")
+                print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
             else:
-                # recon_loss不再下降，不再保存模型
+                # val_loss不再下降，不再保存模型
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
-                    print(f"\n>>> 早停: val_recon_loss 连续 {early_stop_patience} 个 epoch 未下降")
+                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
                     break
     
     # 保存训练历史
@@ -436,7 +436,7 @@ def main():
     
     print('=' * 80)
     print(f'码本预训练完成！')
-    print(f'最佳验证重构损失: {best_val_recon_loss:.4f}')
+    print(f'最佳验证损失: {best_val_loss:.4f}')
     print(f'模型保存至: {save_dir / model_name}.pth')
 
 
