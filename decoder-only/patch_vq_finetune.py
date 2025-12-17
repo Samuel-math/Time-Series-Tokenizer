@@ -1,6 +1,7 @@
 """
-Patch-based VQVAE + Transformer 微调脚本
+Patch-based VQ + Transformer 微调脚本
 使用 MSE 损失进行时间序列预测
+使用MLM训练的VQ_encoder和codebook
 """
 
 import numpy as np
@@ -28,7 +29,7 @@ from datautils import get_dls
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 微调')
+    parser = argparse.ArgumentParser(description='Patch VQ Transformer 微调')
     
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
@@ -42,6 +43,16 @@ def parse_args():
     # 预训练模型参数
     parser.add_argument('--pretrained_model', type=str, required=True, help='预训练模型路径')
     
+    # MLM codebook和VQ_encoder参数（如果预训练模型未包含）
+    parser.add_argument('--mlm_codebook_path', type=str, default=None, 
+                       help='MLM训练的codebook和VQ_encoder路径(可选，如果预训练模型已包含则不需要)')
+    parser.add_argument('--load_mlm_vq_encoder', type=int, default=0, 
+                       help='是否加载MLM的VQ_encoder(1加载，0不加载)')
+    parser.add_argument('--load_mlm_codebook', type=int, default=0, 
+                       help='是否加载MLM的codebook(1加载，0不加载，如果预训练模型已包含则不需要)')
+    parser.add_argument('--freeze_mlm_components', type=int, default=1, 
+                       help='加载MLM组件后是否冻结(1冻结，0不冻结)')
+    
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
@@ -50,7 +61,7 @@ def parse_args():
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     
     # 保存参数
-    parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
+    parser.add_argument('--save_path', type=str, default='saved_models/patch_vq_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
     
     return parser.parse_args()
@@ -95,9 +106,18 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
-    # 使用模型的方法冻结VQVAE组件
-    model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
+    """冻结VQ层和patch attention（将patch映射成码本前的所有参数）"""
+    # 冻结VQ
+    model.freeze_vqvae(components=['VQ'])
+    
+    # 冻结MLM VQ_encoder（如果已加载）
+    if hasattr(model, '_mlm_vq_encoder') and model._mlm_vq_encoder is not None:
+        for param in model._mlm_vq_encoder.parameters():
+            param.requires_grad = False
+        if hasattr(model, '_mlm_encoder_adapter') and model._mlm_encoder_adapter is not None:
+            for param in model._mlm_encoder_adapter.parameters():
+                param.requires_grad = False
+        print('✓ 已冻结 MLM VQ_encoder')
     
     # 冻结 patch attention（如果存在）
     if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:
@@ -223,7 +243,18 @@ def main():
     # 加载预训练模型（传入通道数以便立即初始化patch_attention）
     model, config = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars)
     
-    # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
+    # 可选：加载MLM训练的codebook和VQ_encoder（如果预训练模型未包含）
+    if args.mlm_codebook_path:
+        print(f'\n加载MLM组件: {args.mlm_codebook_path}')
+        if args.load_mlm_codebook:
+            model.load_mlm_codebook(args.mlm_codebook_path, device)
+            if args.freeze_mlm_components:
+                model.freeze_vqvae(components=['VQ'])
+        
+        if args.load_mlm_vq_encoder:
+            model.load_mlm_vq_encoder(args.mlm_codebook_path, device, freeze=bool(args.freeze_mlm_components))
+    
+    # 冻结 VQ 层和 patch attention（将patch映射成码本前的所有参数）
     patch_attention_loaded = hasattr(model, 'patch_attention') and model.patch_attention is not None
     freeze_encoder_vq(model, freeze_patch_attention=patch_attention_loaded)
     
@@ -241,7 +272,7 @@ def main():
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
     # 模型文件名
-    model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
+    model_name = f'patch_vq_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
     
     # 优化器和调度器
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), 

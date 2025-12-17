@@ -1,6 +1,7 @@
 """
-Patch-based VQVAE + Transformer 预训练脚本
+Patch-based VQ + Transformer 预训练脚本
 基于input的index预测target的index概率分布
+使用MLM训练的VQ_encoder和codebook
 """
 
 import numpy as np
@@ -25,7 +26,7 @@ from datautils import get_dls
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 预训练')
+    parser = argparse.ArgumentParser(description='Patch VQ Transformer 预训练')
     
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
@@ -36,13 +37,11 @@ def parse_args():
     parser.add_argument('--scaler', type=str, default='standard', help='数据缩放方式')
     parser.add_argument('--features', type=str, default='M', help='特征类型')
     
-    # 模型参数 (Transformer输入维度 = embedding_dim * patch_size/compression_factor)
+    # 模型参数 (Transformer输入维度 = d_model from MLM)
     parser.add_argument('--patch_size', type=int, default=16, help='Patch大小')
-    parser.add_argument('--embedding_dim', type=int, default=32, help='VQVAE embedding维度')
-    parser.add_argument('--compression_factor', type=int, default=4, help='压缩因子')
     parser.add_argument('--codebook_size', type=int, default=256, help='码本大小')
     parser.add_argument('--n_layers', type=int, default=4, help='Transformer层数')
-    parser.add_argument('--n_heads', type=int, default=4, help='注意力头数 (需整除 code_dim)')
+    parser.add_argument('--n_heads', type=int, default=4, help='注意力头数')
     parser.add_argument('--d_ff', type=int, default=256, help='FFN维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--transformer_hidden_dim', type=int, default=None, help='Transformer的hidden_dim（默认使用code_dim）')
@@ -51,13 +50,15 @@ def parse_args():
     parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减系数')
     parser.add_argument('--ema_eps', type=float, default=1e-5, help='EMA平滑项')
     
-    # VQVAE Encoder/Decoder 参数 (轻量化)
-    parser.add_argument('--num_hiddens', type=int, default=64, help='VQVAE隐藏层维度')
-    parser.add_argument('--num_residual_layers', type=int, default=2, help='残差层数')
-    parser.add_argument('--num_residual_hiddens', type=int, default=32, help='残差隐藏层维度')
-    parser.add_argument('--vqvae_checkpoint', type=str, default=None, help='预训练VQVAE模型路径(可选)')
-    parser.add_argument('--freeze_vqvae', type=int, default=1, help='加载VQVAE后是否冻结(1冻结, 0不冻结)')
-    parser.add_argument('--load_vq_weights', type=int, default=1, help='是否加载VQ层权重(1加载)')
+    # MLM codebook和VQ_encoder参数（必需）
+    parser.add_argument('--mlm_codebook_path', type=str, required=True, 
+                       help='MLM训练的codebook和VQ_encoder路径(来自mlm_build_codebook)')
+    parser.add_argument('--load_mlm_vq_encoder', type=int, default=1, 
+                       help='是否加载MLM的VQ_encoder(1加载，0不加载，默认加载)')
+    parser.add_argument('--load_mlm_codebook', type=int, default=1, 
+                       help='是否加载MLM的codebook(1加载，0不加载，默认加载)')
+    parser.add_argument('--freeze_mlm_components', type=int, default=1, 
+                       help='加载MLM组件后是否冻结(1冻结，0不冻结)')
     
     # Patch内时序建模参数（支持TCN、Self-Attention和Cross-Attention）
     parser.add_argument('--use_patch_attention', type=int, default=0, help='是否使用patch内时序建模(1启用)')
@@ -75,7 +76,7 @@ def parse_args():
     parser.add_argument('--recon_weight', type=float, default=0.1, help='重构损失权重')
     
     # 保存参数
-    parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae/', help='模型保存路径')
+    parser.add_argument('--save_path', type=str, default='saved_models/patch_vq/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
     
     return parser.parse_args()
@@ -190,13 +191,15 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
+    # 加载MLM codebook信息以获取配置
+    print(f'\n加载MLM codebook信息: {args.mlm_codebook_path}')
+    mlm_checkpoint = torch.load(args.mlm_codebook_path, map_location=device)
+    mlm_config = mlm_checkpoint.get('config', {})
+    mlm_d_model = mlm_config.get('d_model', 128)
+    
     # 创建保存目录
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 模型文件名 (code_dim = embedding_dim * patch_size / compression_factor)
-    code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -204,20 +207,55 @@ def main():
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
     
-    # 创建模型（传入通道数以立即初始化patch_attention）
-    config = get_model_config(args)
-    config['n_channels'] = dls.vars  # 添加通道数到config
+    # 构建模型配置（从MLM codebook获取d_model等信息）
+    code_dim = mlm_d_model  # 使用MLM的d_model作为code_dim
+    
+    # PatchVQVAETransformer仍需要embedding_dim和compression_factor用于decoder
+    # 但这些值不会用于encoder（因为使用MLM VQ_encoder）
+    embedding_dim = mlm_d_model  # 用于decoder
+    compression_factor = 1  # 不使用压缩，decoder直接输出
+    
+    config = {
+        'patch_size': args.patch_size,
+        'embedding_dim': embedding_dim,  # 用于decoder
+        'compression_factor': compression_factor,
+        'codebook_size': args.codebook_size,
+        'n_layers': args.n_layers,
+        'n_heads': args.n_heads,
+        'd_ff': args.d_ff,
+        'dropout': args.dropout,
+        'commitment_cost': args.commitment_cost,
+        'codebook_ema': bool(args.codebook_ema),
+        'ema_decay': args.ema_decay,
+        'ema_eps': args.ema_eps,
+        # Decoder配置（最小化，因为encoder使用MLM VQ_encoder）
+        'num_hiddens': 32,
+        'num_residual_layers': 1,
+        'num_residual_hiddens': 16,
+        'transformer_hidden_dim': args.transformer_hidden_dim,
+        'n_channels': dls.vars,
+    }
+    
+    # Patch内时序建模配置
+    if args.use_patch_attention:
+        config['use_patch_attention'] = True
+        config['patch_attention_type'] = args.patch_attention_type
+        config['tcn_num_layers'] = args.tcn_num_layers
+        config['tcn_kernel_size'] = args.tcn_kernel_size
+        config['tcn_hidden_dim'] = args.tcn_hidden_dim
+    
+    # 创建模型
     model = PatchVQVAETransformer(config).to(device)
     
-    # 可选：加载预训练的 VQVAE 权重
-    if args.vqvae_checkpoint:
-        print(f'\n加载预训练VQVAE: {args.vqvae_checkpoint}')
-        model.load_vqvae_weights(
-            args.vqvae_checkpoint, 
-            device, 
-            load_vq=bool(args.load_vq_weights),
-            freeze=bool(args.freeze_vqvae)
-        )
+    # 加载MLM训练的codebook和VQ_encoder（必需）
+    print(f'\n加载MLM组件: {args.mlm_codebook_path}')
+    if args.load_mlm_codebook:
+        model.load_mlm_codebook(args.mlm_codebook_path, device)
+        if args.freeze_mlm_components:
+            model.freeze_vqvae(components=['VQ'])
+    
+    if args.load_mlm_vq_encoder:
+        model.load_mlm_vq_encoder(args.mlm_codebook_path, device, freeze=bool(args.freeze_mlm_components))
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
@@ -235,6 +273,9 @@ def main():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
+    
+    # 模型文件名
+    model_name = f'patch_vq_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_model{args.model_id}'
     
     # 训练
     best_val_loss = float('inf')
@@ -262,7 +303,7 @@ def main():
               f"VQ: {train_metrics['vq_loss']:.4f}, Recon: {train_metrics['recon_loss']:.4f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f} (Pred: {val_metrics['pred_loss']:.4f})")
         
-        # 保存最佳模型 (前20个epoch不保存也不记录)
+        # 保存最佳模型 (前3个epoch不保存也不记录)
         if epoch >= 3:
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']

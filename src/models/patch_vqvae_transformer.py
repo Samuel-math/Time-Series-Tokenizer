@@ -656,6 +656,11 @@ class PatchVQVAETransformer(nn.Module):
             compression_factor=self.compression_factor,
             out_channels=1  # 单通道输出
         )
+        
+        # MLM VQ_encoder相关（可选）
+        self._use_mlm_vq_encoder = False
+        self._mlm_vq_encoder = None
+        self._mlm_encoder_adapter = None
     
     def encode_to_indices(self, x, return_processed_patches=False):
         """
@@ -703,31 +708,62 @@ class PatchVQVAETransformer(nn.Module):
         z_q_list = []
         vq_loss_sum = 0
         
-        for c in range(C):
-            # 提取第c个通道的patches: [B, num_patches, patch_size]
-            x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
-            x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
-            x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
+        # 检查是否使用MLM VQ_encoder
+        if self._use_mlm_vq_encoder and self._mlm_vq_encoder is not None:
+            # 使用MLM的PatchEmbedding
+            # x_patches: [B, num_patches, patch_size, C] -> [B, num_patches, C, patch_size]
+            x_patches_mlm = x_patches.permute(0, 1, 3, 2)  # [B, num_patches, C, patch_size]
             
-            # VQVAE Encoder (单通道输入)
-            z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
-            z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+            # MLM PatchEmbedding: [B, num_patches, C, patch_size] -> [B, C, num_patches, d_model]
+            embedded_mlm = self._mlm_vq_encoder(x_patches_mlm)  # [B, C, num_patches, d_model]
             
-            # VQ
-            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_flat)
-            vq_loss_sum += vq_loss_c
+            # 适配到code_dim（如果需要）
+            if self._mlm_encoder_adapter is not None:
+                # [B, C, num_patches, d_model] -> [B*C*num_patches, d_model]
+                embedded_flat = embedded_mlm.permute(0, 2, 1, 3).reshape(-1, embedded_mlm.shape[-1])
+                # 适配: [B*C*num_patches, d_model] -> [B*C*num_patches, code_dim]
+                z_flat_all = self._mlm_encoder_adapter(embedded_flat)  # [B*C*num_patches, code_dim]
+            else:
+                # 直接reshape
+                z_flat_all = embedded_mlm.permute(0, 2, 1, 3).reshape(-1, self.code_dim)  # [B*C*num_patches, code_dim]
             
-            # Reshape: [B*num_patches] -> [B, num_patches]
-            indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
-            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+            # VQ量化
+            vq_loss_all, z_q_flat_all, indices_all = self.vq(z_flat_all)
+            vq_loss_sum = vq_loss_all
             
-            indices_list.append(indices_c)
-            z_q_list.append(z_q_c)
-        
-        # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
-        z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
-        vq_loss = vq_loss_sum / C  # 平均VQ损失
+            # Reshape: [B*C*num_patches] -> [B, num_patches, C]
+            indices_all = indices_all.reshape(B, num_patches, C)
+            z_q_all = z_q_flat_all.reshape(B, num_patches, C, self.code_dim)
+            
+            indices = indices_all
+            z_q = z_q_all
+        else:
+            # 使用原始CNN Encoder
+            for c in range(C):
+                # 提取第c个通道的patches: [B, num_patches, patch_size]
+                x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
+                x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
+                x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
+                
+                # VQVAE Encoder (单通道输入)
+                z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
+                z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+                
+                # VQ
+                vq_loss_c, z_q_flat_c, indices_c = self.vq(z_flat)
+                vq_loss_sum += vq_loss_c
+                
+                # Reshape: [B*num_patches] -> [B, num_patches]
+                indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
+                z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+                
+                indices_list.append(indices_c)
+                z_q_list.append(z_q_c)
+            
+            # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
+            indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
+            z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
+            vq_loss = vq_loss_sum / C  # 平均VQ损失
         
         if return_processed_patches:
             return indices, vq_loss, z_q, x_patches_processed
@@ -905,15 +941,16 @@ class PatchVQVAETransformer(nn.Module):
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
-    def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True, freeze=False):
+    def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=False, freeze=False):
         """
-        加载预训练的VQVAE权重（包括encoder、decoder、VQ）
+        加载预训练的VQVAE权重（仅包括encoder、decoder，不包括VQ）
+        注意：VQ codebook应使用MLM训练的codebook（通过load_mlm_codebook加载）
         
         Args:
             checkpoint_path: checkpoint路径
             device: 设备
-            load_vq: 是否加载VQ层权重
-            freeze: 是否在加载后冻结VQVAE组件（encoder、decoder、VQ）
+            load_vq: 已废弃，不再加载VQ（应使用load_mlm_codebook）
+            freeze: 是否在加载后冻结VQVAE组件（encoder、decoder）
         """
         import os
         if not os.path.exists(checkpoint_path):
@@ -964,27 +1001,14 @@ class PatchVQVAETransformer(nn.Module):
                 
                 return False
             
-            # 加载encoder、decoder、VQ
+            # 加载encoder、decoder（不再加载VQ，使用MLM训练的codebook）
             if try_load_module(self.encoder, 'Encoder', 'encoder_state_dict', 'encoder'):
                 loaded_components.append('Encoder')
             
             if try_load_module(self.decoder, 'Decoder', 'decoder_state_dict', 'decoder'):
                 loaded_components.append('Decoder')
             
-            if load_vq:
-                if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
-                    loaded_components.append('VQ')
-                elif state_dict is not None:
-                    # 尝试直接加载embedding权重
-                    for key in state_dict.keys():
-                        if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
-                            if hasattr(self.vq, 'embedding'):
-                                try:
-                                    self.vq.embedding.weight.data.copy_(state_dict[key])
-                                    loaded_components.append('VQ')
-                                    break
-                                except:
-                                    continue
+            # VQ不再从VQVAE checkpoint加载，应使用MLM训练的codebook
             
             if loaded_components:
                 print(f"成功加载: {', '.join(loaded_components)}")
@@ -1035,6 +1059,143 @@ class PatchVQVAETransformer(nn.Module):
             print(f"✓ 已冻结: {', '.join(frozen)}")
         
         return frozen
+    
+    def load_mlm_codebook(self, codebook_path, device='cpu'):
+        """
+        加载MLM训练的codebook（聚类中心）
+        
+        Args:
+            codebook_path: MLM codebook文件路径（包含centroids）
+            device: 设备
+        Returns:
+            bool: 是否成功加载
+        """
+        import os
+        if not os.path.exists(codebook_path):
+            print(f"警告: codebook文件不存在: {codebook_path}")
+            return False
+        
+        try:
+            checkpoint = torch.load(codebook_path, map_location=device)
+            
+            # 获取centroids
+            if 'centroids' in checkpoint:
+                centroids = checkpoint['centroids']  # [codebook_size, d_model]
+            else:
+                print("错误: checkpoint中未找到centroids")
+                return False
+            
+            # 检查维度匹配
+            mlm_d_model = centroids.shape[1]
+            if mlm_d_model != self.code_dim:
+                print(f"警告: MLM codebook维度 ({mlm_d_model}) 与模型code_dim ({self.code_dim}) 不匹配")
+                print(f"尝试使用线性投影适配...")
+                # 创建适配层
+                if not hasattr(self, '_mlm_codebook_adapter'):
+                    self._mlm_codebook_adapter = nn.Linear(mlm_d_model, self.code_dim).to(device)
+                # 适配centroids
+                centroids = self._mlm_codebook_adapter(centroids)
+                print(f"✓ 已创建适配层: {mlm_d_model} -> {self.code_dim}")
+            
+            # 检查codebook_size
+            mlm_codebook_size = centroids.shape[0]
+            if mlm_codebook_size != self.codebook_size:
+                print(f"警告: MLM codebook大小 ({mlm_codebook_size}) 与模型codebook_size ({self.codebook_size}) 不匹配")
+                if mlm_codebook_size > self.codebook_size:
+                    centroids = centroids[:self.codebook_size]
+                    print(f"截取前 {self.codebook_size} 个centroids")
+                else:
+                    print(f"错误: MLM codebook大小小于模型codebook_size")
+                    return False
+            
+            # 加载到VQ
+            self.vq.embedding.weight.data.copy_(centroids)
+            print(f"✓ 成功加载MLM codebook: {centroids.shape}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"加载MLM codebook失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def load_mlm_vq_encoder(self, codebook_path, device='cpu', freeze=True):
+        """
+        加载MLM训练的VQ_encoder（PatchEmbedding）
+        注意：MLM的VQ_encoder是Linear PatchEmbedding，与CNN Encoder架构不同
+        这里创建一个适配层来使用MLM的PatchEmbedding
+        
+        Args:
+            codebook_path: MLM codebook文件路径（包含vq_encoder_state_dict）
+            device: 设备
+            freeze: 是否冻结VQ_encoder
+        Returns:
+            bool: 是否成功加载
+        """
+        import os
+        if not os.path.exists(codebook_path):
+            print(f"警告: codebook文件不存在: {codebook_path}")
+            return False
+        
+        try:
+            checkpoint = torch.load(codebook_path, map_location=device)
+            
+            # 获取VQ_encoder（PatchEmbedding）
+            if 'vq_encoder_state_dict' not in checkpoint:
+                print("警告: checkpoint中未找到vq_encoder_state_dict，跳过VQ_encoder加载")
+                return False
+            
+            vq_encoder_state = checkpoint['vq_encoder_state_dict']
+            
+            # MLM的PatchEmbedding结构: proj (Linear) + dropout
+            # 我们需要创建一个MLM PatchEmbedding模块并加载权重
+            from src.models.mlm_encoder import PatchEmbedding as MLMPatchEmbedding
+            
+            # 从checkpoint获取配置
+            config = checkpoint.get('config', {})
+            mlm_d_model = config.get('d_model', 128)
+            mlm_patch_size = config.get('patch_size', 16)
+            mlm_dropout = config.get('dropout', 0.1)
+            
+            # 检查patch_size是否匹配
+            if mlm_patch_size != self.patch_size:
+                print(f"警告: MLM patch_size ({mlm_patch_size}) 与模型patch_size ({self.patch_size}) 不匹配")
+                return False
+            
+            # 创建MLM PatchEmbedding模块
+            if not hasattr(self, '_mlm_vq_encoder'):
+                self._mlm_vq_encoder = MLMPatchEmbedding(
+                    self.patch_size, mlm_d_model, mlm_dropout
+                ).to(device)
+            
+            # 加载权重
+            self._mlm_vq_encoder.load_state_dict(vq_encoder_state)
+            
+            # 创建适配层（MLM d_model -> code_dim）
+            if mlm_d_model != self.code_dim:
+                if not hasattr(self, '_mlm_encoder_adapter'):
+                    self._mlm_encoder_adapter = nn.Linear(mlm_d_model, self.code_dim).to(device)
+                print(f"✓ 已创建VQ_encoder适配层: {mlm_d_model} -> {self.code_dim}")
+            
+            # 标记使用MLM VQ_encoder
+            self._use_mlm_vq_encoder = True
+            
+            if freeze:
+                for param in self._mlm_vq_encoder.parameters():
+                    param.requires_grad = False
+                if hasattr(self, '_mlm_encoder_adapter'):
+                    for param in self._mlm_encoder_adapter.parameters():
+                        param.requires_grad = False
+            
+            print(f"✓ 成功加载MLM VQ_encoder")
+            return True
+            
+        except Exception as e:
+            print(f"加载MLM VQ_encoder失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     def unfreeze_vqvae(self, components=None):
         """

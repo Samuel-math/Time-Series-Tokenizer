@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Patch VQVAE Transformer 微调脚本
+# Patch VQ Transformer 微调脚本
 
-# 预训练模型路径 (需要先运行 patch_vqvae_pretrain.sh)
-PRETRAINED_MODEL="saved_models/patch_vqvae/ettm1/patch_vqvae_ps16_cb14_cd256_l3_model1.pth"
+# 预训练模型路径 (需要先运行 patch_vq_pretrain.sh)
+PRETRAINED_MODEL="saved_models/patch_vq/ettm1/patch_vq_ps16_cb256_cd128_l4_model1.pth"
 
-python patch_vqvae_finetune.py \
+python patch_vq_finetune.py \
     --dset ettm1 \
     --context_points 512 \
     --target_points 96 \
