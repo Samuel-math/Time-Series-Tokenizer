@@ -38,6 +38,10 @@ AMP=1
 VQ_WEIGHT=1.0
 RECON_WEIGHT=1.0
 
+# 数据采样参数（用于加速大数据集训练）
+TRAIN_SAMPLE_RATIO=1.0  # 训练集采样比例 (0.0-1.0)，例如0.1表示只使用10%的训练数据
+VALID_SAMPLE_RATIO=1.0  # 验证集采样比例 (0.0-1.0)，例如0.1表示只使用10%的验证数据
+
 # 保存参数
 SAVE_PATH="saved_models/vqvae_only/"
 MODEL_ID=1
@@ -70,5 +74,7 @@ python vqvae-only/codebook_pretrain.py \
     --amp $AMP \
     --vq_weight $VQ_WEIGHT \
     --recon_weight $RECON_WEIGHT \
+    --train_sample_ratio $TRAIN_SAMPLE_RATIO \
+    --valid_sample_ratio $VALID_SAMPLE_RATIO \
     --save_path $SAVE_PATH \
     --model_id $MODEL_ID
