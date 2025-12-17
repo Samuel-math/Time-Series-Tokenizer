@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda import amp
+from torch.utils.data import Subset, DataLoader
 import argparse
 from pathlib import Path
 import random
@@ -69,6 +70,12 @@ def parse_args():
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     parser.add_argument('--vq_weight', type=float, default=1.0, help='VQ损失权重')
     parser.add_argument('--recon_weight', type=float, default=1.0, help='重构损失权重')
+    
+    # 数据采样参数（用于加速大数据集训练）
+    parser.add_argument('--train_sample_ratio', type=float, default=1.0, 
+                       help='训练集采样比例 (0.0-1.0)，例如0.1表示只使用10%%的训练数据')
+    parser.add_argument('--valid_sample_ratio', type=float, default=1.0,
+                       help='验证集采样比例 (0.0-1.0)，例如0.1表示只使用10%%的验证数据')
     
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only/', help='模型保存路径')
@@ -313,6 +320,44 @@ def main():
     dls = get_dls(args)
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
+    
+    # 对训练集和验证集进行采样（如果指定了采样比例）
+    if args.train_sample_ratio < 1.0 or args.valid_sample_ratio < 1.0:
+        # 采样训练集
+        if args.train_sample_ratio < 1.0:
+            train_dataset = dls.train.dataset
+            train_size = len(train_dataset)
+            sample_size = int(train_size * args.train_sample_ratio)
+            # 使用全局随机种子（已在set_seed中设置）确保可复现性
+            indices = torch.randperm(train_size)[:sample_size].tolist()
+            train_subset = Subset(train_dataset, indices)
+            dls.train = DataLoader(
+                train_subset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                collate_fn=getattr(dls.train, 'collate_fn', None)
+            )
+            print(f'训练集采样: {sample_size}/{train_size} ({args.train_sample_ratio*100:.1f}%)')
+        
+        # 采样验证集
+        if args.valid_sample_ratio < 1.0:
+            valid_dataset = dls.valid.dataset
+            valid_size = len(valid_dataset)
+            sample_size = int(valid_size * args.valid_sample_ratio)
+            # 使用全局随机种子（已在set_seed中设置）确保可复现性
+            indices = torch.randperm(valid_size)[:sample_size].tolist()
+            valid_subset = Subset(valid_dataset, indices)
+            dls.valid = DataLoader(
+                valid_subset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                collate_fn=getattr(dls.valid, 'collate_fn', None)
+            )
+            print(f'验证集采样: {sample_size}/{valid_size} ({args.valid_sample_ratio*100:.1f}%)')
+        
+        print(f'采样后 - Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
     
     # 创建轻量级码本模型（只包含encoder、vq、decoder）
     config = get_model_config(args)
