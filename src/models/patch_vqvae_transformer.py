@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import math
 
 from .vqvae import Encoder, Decoder
-from .codebook_model import ChannelAttention
+from .channel_attention import ChannelAttention
 
 
 class FlattenedVectorQuantizer(nn.Module):
