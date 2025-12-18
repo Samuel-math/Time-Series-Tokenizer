@@ -38,7 +38,7 @@ VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_c
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
-EMBEDDING_DIM=64
+EMBEDDING_DIM=32
 COMPRESSION_FACTOR=8
 CODEBOOK_SIZE=256
 
