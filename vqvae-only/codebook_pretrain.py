@@ -374,37 +374,32 @@ def main():
     config = get_model_config(args)
     model = CodebookModel(config, dls.vars).to(device)
     
-    # 检查配置冲突：如果使用EMA且没有Channel Attention，VQ的embedding会被冻结
-    if args.codebook_ema and not args.use_channel_attention:
-        print("警告: 使用EMA时，VQ的embedding权重会被冻结（EMA自动更新）。")
-        print("      如果没有启用Channel Attention，将没有可训练参数！")
-        print("      建议：启用Channel Attention或禁用EMA。")
-    
-    # 冻结encoder和decoder，只训练channel_attention和VQ
-    for param in model.encoder.parameters():
-        param.requires_grad = False
-    for param in model.decoder.parameters():
-        param.requires_grad = False
-    
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     
-    # 检查VQ层的可训练参数
+    # 检查各层的可训练参数
+    encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    encoder_total = sum(p.numel() for p in model.encoder.parameters())
+    decoder_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
+    decoder_total = sum(p.numel() for p in model.decoder.parameters())
     vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
     vq_total = sum(p.numel() for p in model.vq.parameters())
     
     print(f'\n码本模型参数统计:')
     print(f'  总参数: {total_params:,}')
-    print(f'  可训练参数: {trainable_params:,} (Channel Attention + VQ)')
-    print(f'  冻结参数: {frozen_params:,} (Encoder + Decoder)')
-    print(f'  VQ层参数: {vq_total:,} (可训练: {vq_trainable:,})')
+    print(f'  可训练参数: {trainable_params:,}')
+    print(f'  冻结参数: {frozen_params:,}')
+    print(f'  Encoder: {encoder_total:,} (可训练: {encoder_trainable:,})')
+    print(f'  Decoder: {decoder_total:,} (可训练: {decoder_trainable:,})')
+    print(f'  VQ层: {vq_total:,} (可训练: {vq_trainable:,})')
     print(f'  码本初始化方法: {args.vq_init_method}')
     print(f'  使用EMA: {bool(args.codebook_ema)}')
     if args.use_channel_attention:
         ca_trainable = sum(p.numel() for p in model.channel_attention.parameters() if p.requires_grad)
-        print(f'  ✓ Channel Attention已启用 (可训练参数: {ca_trainable:,})')
+        ca_total = sum(p.numel() for p in model.channel_attention.parameters())
+        print(f'  ✓ Channel Attention已启用 (参数: {ca_total:,}, 可训练: {ca_trainable:,})')
     
     # 检查是否有可训练参数
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
@@ -424,7 +419,7 @@ def main():
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
-    # 优化器和调度器（只优化可训练参数）
+    # 优化器和调度器（优化所有可训练参数）
     optimizer = AdamW(trainable_params_list, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
