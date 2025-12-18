@@ -15,7 +15,7 @@
 # 配置参数
 # =====================================================
 
-DSET="ettm1"
+DSET=$1
 MODEL_ID=1
 
 # ----- 码本模型路径（相对于decoder-only目录）-----
@@ -25,7 +25,7 @@ CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps16
 
 # ----- Patch 参数（会从码本checkpoint中自动读取，这里作为备用）-----
 PATCH_SIZE=16
-COMPRESSION_FACTOR=4
+COMPRESSION_FACTOR=8
 
 # ----- VQVAE 参数（会从码本checkpoint中自动读取，这里作为备用）-----
 EMBEDDING_DIM=32
@@ -40,7 +40,7 @@ NUM_RESIDUAL_HIDDENS=32
 N_LAYERS=4
 N_HEADS=4
 D_FF=256
-DROPOUT=0.1
+DROPOUT=0.3
 CODEBOOK_EMA=1
 EMA_DECAY=0.99
 EMA_EPS=1e-5
@@ -49,8 +49,8 @@ EMA_EPS=1e-5
 TRANSFORMER_HIDDEN_DIM=""  # 留空表示使用默认值（code_dim），可根据需要设置
 
 # ----- 预训练参数 -----
-PRETRAIN_CONTEXT_POINTS=512
-PRETRAIN_TARGET_POINTS=96  # 预训练时target序列的长度
+PRETRAIN_CONTEXT_POINTS=$2
+PRETRAIN_TARGET_POINTS=$3  # 预训练时target序列的长度
 PRETRAIN_EPOCHS=100
 PRETRAIN_BATCH_SIZE=128
 PRETRAIN_LR=3e-4

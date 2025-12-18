@@ -50,7 +50,7 @@ CHANNEL_ATTENTION_DROPOUT=0.1  # Channel Attention的dropout率
 SAVE_PATH="saved_models/vqvae_only/"
 MODEL_ID=1
 
-python vqvae-only/codebook_pretrain.py \
+python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
     --batch_size $BATCH_SIZE \
