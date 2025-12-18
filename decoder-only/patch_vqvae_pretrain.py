@@ -225,8 +225,8 @@ def main():
             freeze=bool(args.freeze_vqvae)
         )
     
-    # 冻结Channel Attention（如果启用）
-    if args.use_channel_attention and model.channel_attention is not None:
+    # 冻结Channel Attention（如果存在，无论是否从checkpoint加载）
+    if hasattr(model, 'channel_attention') and model.channel_attention is not None:
         for param in model.channel_attention.parameters():
             param.requires_grad = False
         print('✓ 已冻结 Channel Attention')
@@ -235,12 +235,22 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
+    
+    # 检查Channel Attention状态
+    has_channel_attention = hasattr(model, 'channel_attention') and model.channel_attention is not None
+    if has_channel_attention:
+        ca_total = sum(p.numel() for p in model.channel_attention.parameters())
+        ca_trainable = sum(p.numel() for p in model.channel_attention.parameters() if p.requires_grad)
+        ca_frozen = ca_total - ca_trainable
+    
     print(f'\n模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  可训练参数: {trainable_params:,}')
     print(f'  冻结参数: {frozen_params:,}')
-    if args.use_channel_attention:
-        print(f'  ✓ Channel Attention已启用（已冻结）')
+    if has_channel_attention:
+        print(f'  Channel Attention: {ca_total:,} 参数 (可训练: {ca_trainable:,}, 冻结: {ca_frozen:,})')
+        if ca_frozen == ca_total:
+            print(f'  ✓ Channel Attention已冻结')
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None

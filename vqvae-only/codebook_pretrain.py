@@ -70,6 +70,7 @@ def parse_args():
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     parser.add_argument('--vq_weight', type=float, default=1.0, help='VQ损失权重')
     parser.add_argument('--recon_weight', type=float, default=1.0, help='重构损失权重')
+    parser.add_argument('--codebook_diversity_weight', type=float, default=0.1, help='码本多样性损失权重（提升码本利用率）')
     
     # 数据采样参数（用于加速大数据集训练）
     parser.add_argument('--train_sample_ratio', type=float, default=1.0, 
@@ -144,12 +145,67 @@ def compute_codebook_usage_stats(indices, codebook_size):
     }
 
 
+def compute_codebook_diversity_loss(model, indices, codebook_size, device):
+    """
+    计算码本多样性损失，提升码本利用率
+    
+    包括：
+    1. Entropy Loss: 鼓励均匀使用码本（最大化熵）
+    2. Unused Penalty: 惩罚未使用的码本向量
+    
+    Args:
+        model: CodebookModel
+        indices: [B, num_patches, C] 码本索引
+        codebook_size: 码本大小
+        device: 设备
+    Returns:
+        diversity_loss: 多样性损失（标量）
+        usage_stats: 使用统计信息
+    """
+    indices_flat = indices.reshape(-1)  # [N]
+    total_tokens = indices_flat.shape[0]
+    
+    # 计算每个码本元素的使用频率
+    counts = torch.bincount(indices_flat, minlength=codebook_size).float()  # [codebook_size]
+    probs = counts / (total_tokens + 1e-8)  # [codebook_size] 归一化为概率
+    
+    # 1. Entropy Loss: 鼓励均匀分布（最大化熵）
+    # 理想情况下，每个码本向量被使用的概率应该是 1/codebook_size
+    # 熵 = -sum(p * log(p))，当分布均匀时熵最大
+    probs_safe = probs + 1e-8  # 避免log(0)
+    entropy = -torch.sum(probs_safe * torch.log(probs_safe))
+    max_entropy = torch.log(torch.tensor(float(codebook_size), device=device))
+    entropy_loss = 1.0 - (entropy / max_entropy)  # 归一化到[0, 1]，越小越好
+    
+    # 2. Unused Penalty: 惩罚未使用的码本向量
+    unused_mask = (counts == 0).float()  # [codebook_size]
+    unused_ratio = unused_mask.sum() / codebook_size
+    unused_penalty = unused_ratio  # 未使用比例，越小越好
+    
+    # 3. 组合损失
+    diversity_loss = entropy_loss + unused_penalty
+    
+    # 统计信息
+    num_used = (counts > 0).sum().item()
+    usage_rate = num_used / codebook_size
+    
+    return diversity_loss, {
+        'entropy_loss': entropy_loss.item(),
+        'unused_penalty': unused_penalty.item(),
+        'entropy': entropy.item(),
+        'max_entropy': max_entropy.item(),
+        'num_used': num_used,
+        'usage_rate': usage_rate,
+    }
+
+
 def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     """训练一个epoch"""
     model.train()
     total_loss = 0
     total_vq_loss = 0
     total_recon_loss = 0
+    total_diversity_loss = 0
     total_perplexity = 0
     n_batches = 0
     
@@ -172,8 +228,15 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         recon_len = num_patches * model.patch_size
         recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
         
+        # 计算码本多样性损失（提升码本利用率）
+        diversity_loss, diversity_stats = compute_codebook_diversity_loss(
+            model, indices, args.codebook_size, device
+        )
+        
         # 总损失
-        loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+        loss = (args.recon_weight * recon_loss + 
+                args.vq_weight * vq_loss +
+                args.codebook_diversity_weight * diversity_loss)
         
         # 反向传播（只对可训练参数）
         optimizer.zero_grad()
@@ -200,6 +263,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         total_loss += loss.item()
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
+        total_diversity_loss += diversity_loss.item()
         total_perplexity += perplexity
         n_batches += 1
     
@@ -211,6 +275,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
+        'diversity_loss': total_diversity_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
     }
@@ -222,6 +287,7 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_loss = 0
     total_vq_loss = 0
     total_recon_loss = 0
+    total_diversity_loss = 0
     total_perplexity = 0
     n_batches = 0
     
@@ -245,8 +311,15 @@ def validate_epoch(model, dataloader, revin, args, device):
             recon_len = num_patches * model.patch_size
             recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
             
+            # 计算码本多样性损失（仅用于统计，不参与梯度）
+            diversity_loss, _ = compute_codebook_diversity_loss(
+                model, indices, args.codebook_size, device
+            )
+            
             # 总损失
-            loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+            loss = (args.recon_weight * recon_loss + 
+                    args.vq_weight * vq_loss +
+                    args.codebook_diversity_weight * diversity_loss)
             
             # 计算perplexity
             unique_indices = torch.unique(indices.reshape(-1))
@@ -258,6 +331,7 @@ def validate_epoch(model, dataloader, revin, args, device):
             total_loss += loss.item()
             total_vq_loss += vq_loss.item()
             total_recon_loss += recon_loss.item()
+            total_diversity_loss += diversity_loss.item()
             total_perplexity += perplexity
             n_batches += 1
     
@@ -269,6 +343,7 @@ def validate_epoch(model, dataloader, revin, args, device):
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
+        'diversity_loss': total_diversity_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
     }
@@ -456,7 +531,8 @@ def main():
         
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
-              f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
+              f"VQ: {train_metrics['vq_loss']:.4f}, Diversity: {train_metrics.get('diversity_loss', 0.0):.4f}, "
+              f"Perplexity: {train_metrics['perplexity']:.3f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
               f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
         

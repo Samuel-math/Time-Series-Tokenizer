@@ -244,7 +244,23 @@ def main():
     # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f'可训练参数: {trainable_params:,} / {total_params:,}')
+    frozen_params = total_params - trainable_params
+    
+    # 检查Channel Attention状态
+    has_channel_attention = hasattr(model, 'channel_attention') and model.channel_attention is not None
+    if has_channel_attention:
+        ca_total = sum(p.numel() for p in model.channel_attention.parameters())
+        ca_trainable = sum(p.numel() for p in model.channel_attention.parameters() if p.requires_grad)
+        ca_frozen = ca_total - ca_trainable
+    
+    print(f'\n模型参数统计:')
+    print(f'  总参数: {total_params:,}')
+    print(f'  可训练参数: {trainable_params:,}')
+    print(f'  冻结参数: {frozen_params:,}')
+    if has_channel_attention:
+        print(f'  Channel Attention: {ca_total:,} 参数 (可训练: {ca_trainable:,}, 冻结: {ca_frozen:,})')
+        if ca_frozen == ca_total:
+            print(f'  ✓ Channel Attention已冻结')
     
     # AMP
     use_amp = bool(args.amp) and device.type == 'cuda'
