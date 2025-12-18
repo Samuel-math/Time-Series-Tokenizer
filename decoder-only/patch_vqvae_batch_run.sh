@@ -33,8 +33,8 @@ MODEL_ID=1
 # ----- 码本模型路径（可选）-----
 # 如果为空，脚本会自动查找，或手动指定完整路径
 # VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
-# 路径模板支持占位符：${DSET}（数据集名）、${CA_SUFFIX}（channel_attention后缀，_ca1或空）
-VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps16_cb256_cd64${CA_SUFFIX}_model1.pth"
+# 路径模板支持占位符：__DSET__（数据集名，会在循环中被替换）、__CA_SUFFIX__（channel_attention后缀，_ca1或空）
+VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_cb256_cd64__CA_SUFFIX__model1.pth"
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
@@ -221,8 +221,8 @@ for DSET in "${DATASETS[@]}"; do
                 CA_SUFFIX_FOR_PATH="_ca1"
             fi
             
-            # 如果VQVAE_CHECKPOINT包含${DSET}和${CA_SUFFIX}占位符，替换它们
-            DSET_VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/\${DSET}/${DSET}/g" | sed "s/\${CA_SUFFIX}/${CA_SUFFIX_FOR_PATH}/g")
+            # 如果VQVAE_CHECKPOINT包含__DSET__和__CA_SUFFIX__占位符，替换它们
+            DSET_VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/__DSET__/${DSET}/g" | sed "s/__CA_SUFFIX__/${CA_SUFFIX_FOR_PATH}/g")
             
             # 处理相对路径
             if [[ ! "${DSET_VQVAE_CHECKPOINT}" = /* ]]; then
@@ -266,14 +266,10 @@ for DSET in "${DATASETS[@]}"; do
             # 运行codebook训练脚本
             cd "${VQVAE_ONLY_DIR}"
             
-            # 如果未启用Channel Attention，则禁用EMA（因为EMA会冻结VQ的embedding）
-            # 否则没有可训练参数
-            ACTUAL_CODEBOOK_EMA=${CODEBOOK_EMA}
-            if [ "${USE_CHANNEL_ATTENTION}" -eq 0 ] && [ "${CODEBOOK_EMA}" -eq 1 ]; then
-                echo "警告: USE_CHANNEL_ATTENTION=0 且 CODEBOOK_EMA=1 会导致没有可训练参数"
-                echo "      自动禁用EMA以确保VQ层可训练"
-                ACTUAL_CODEBOOK_EMA=0
-            fi
+            # 注意：使用EMA时，VQ的embedding会被冻结（EMA自动更新）
+            # 但由于Encoder和Decoder是可训练的，所以仍然有可训练参数
+            # 如果USE_CHANNEL_ATTENTION=0，只有Encoder和Decoder可训练
+            # 如果USE_CHANNEL_ATTENTION=1，Encoder、Decoder和Channel Attention都可训练
             
             python codebook_pretrain.py \
                 --dset ${DSET} \
@@ -287,7 +283,7 @@ for DSET in "${DATASETS[@]}"; do
                 --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
                 --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
                 --commitment_cost ${COMMITMENT_COST} \
-                --codebook_ema ${ACTUAL_CODEBOOK_EMA} \
+                --codebook_ema ${CODEBOOK_EMA} \
                 --ema_decay ${EMA_DECAY} \
                 --ema_eps ${EMA_EPS} \
                 --use_channel_attention ${USE_CHANNEL_ATTENTION} \
