@@ -321,9 +321,10 @@ def main():
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 模型文件名
+    # 模型文件名（如果有channel_attention，添加_ca1后缀）
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_model{args.model_id}'
+    ca_suffix = "_ca1" if args.use_channel_attention else ""
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{ca_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
