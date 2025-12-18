@@ -255,6 +255,15 @@ for DSET in "${DATASETS[@]}"; do
             # 运行codebook训练脚本
             cd "${VQVAE_ONLY_DIR}"
             
+            # 如果未启用Channel Attention，则禁用EMA（因为EMA会冻结VQ的embedding）
+            # 否则没有可训练参数
+            ACTUAL_CODEBOOK_EMA=${CODEBOOK_EMA}
+            if [ "${USE_CHANNEL_ATTENTION}" -eq 0 ] && [ "${CODEBOOK_EMA}" -eq 1 ]; then
+                echo "警告: USE_CHANNEL_ATTENTION=0 且 CODEBOOK_EMA=1 会导致没有可训练参数"
+                echo "      自动禁用EMA以确保VQ层可训练"
+                ACTUAL_CODEBOOK_EMA=0
+            fi
+            
             python codebook_pretrain.py \
                 --dset ${DSET} \
                 --context_points 512 \
@@ -267,7 +276,7 @@ for DSET in "${DATASETS[@]}"; do
                 --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
                 --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
                 --commitment_cost ${COMMITMENT_COST} \
-                --codebook_ema ${CODEBOOK_EMA} \
+                --codebook_ema ${ACTUAL_CODEBOOK_EMA} \
                 --ema_decay ${EMA_DECAY} \
                 --ema_eps ${EMA_EPS} \
                 --use_channel_attention ${USE_CHANNEL_ATTENTION} \
