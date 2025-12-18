@@ -393,6 +393,9 @@ def main():
     if args.use_channel_attention:
         print(f'  ✓ Channel Attention已启用')
     
+    # RevIN
+    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    
     # 优化器和调度器（只优化可训练参数）
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params_list, lr=args.lr, weight_decay=args.weight_decay)
