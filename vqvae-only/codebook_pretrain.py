@@ -77,6 +77,12 @@ def parse_args():
     parser.add_argument('--valid_sample_ratio', type=float, default=1.0,
                        help='验证集采样比例 (0.0-1.0)，例如0.1表示只使用10%%的验证数据')
     
+    # Channel Attention参数
+    parser.add_argument('--use_channel_attention', type=int, default=0,
+                       help='是否使用Channel Attention模块(1启用，0禁用)')
+    parser.add_argument('--channel_attention_dropout', type=float, default=0.1,
+                       help='Channel Attention的dropout率')
+    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -100,6 +106,8 @@ def get_model_config(args):
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
         'use_patch_attention': False,  # 码本预训练不使用patch attention
+        'use_channel_attention': bool(args.use_channel_attention),
+        'channel_attention_dropout': args.channel_attention_dropout,
     }
     return config
 
@@ -167,17 +175,19 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         # 总损失
         loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
         
-        # 反向传播
+        # 反向传播（只对可训练参数）
         optimizer.zero_grad()
         if scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
         
         # 计算perplexity（码本使用率）
@@ -363,18 +373,28 @@ def main():
     config = get_model_config(args)
     model = CodebookModel(config, dls.vars).to(device)
     
-    # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    # 冻结encoder和decoder，只训练channel_attention和VQ
+    for param in model.encoder.parameters():
+        param.requires_grad = False
+    for param in model.decoder.parameters():
+        param.requires_grad = False
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    
     print(f'\n码本模型参数统计:')
     print(f'  总参数: {total_params:,}')
-    print(f'  所有参数均可训练')
+    print(f'  可训练参数: {trainable_params:,} (Channel Attention + VQ)')
+    print(f'  冻结参数: {frozen_params:,} (Encoder + Decoder)')
     print(f'  码本初始化方法: {args.vq_init_method}')
+    if args.use_channel_attention:
+        print(f'  ✓ Channel Attention已启用')
     
-    # 优化器和调度器
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 优化器和调度器（只优化可训练参数）
+    trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params_list, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
     # AMP

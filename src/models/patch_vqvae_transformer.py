@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import math
 
 from .vqvae import Encoder, Decoder
+from .codebook_model import ChannelAttention
 
 
 class FlattenedVectorQuantizer(nn.Module):
@@ -656,6 +657,17 @@ class PatchVQVAETransformer(nn.Module):
             compression_factor=self.compression_factor,
             out_channels=1  # 单通道输出
         )
+        
+        # Channel Attention模块（在VQ之前，可选）
+        self.use_channel_attention = config.get('use_channel_attention', False)
+        if self.use_channel_attention and n_channels is not None:
+            self.channel_attention = ChannelAttention(
+                code_dim=self.code_dim,
+                n_channels=n_channels,
+                dropout=config.get('channel_attention_dropout', 0.1)
+            )
+        else:
+            self.channel_attention = None
     
     def encode_to_indices(self, x, return_processed_patches=False):
         """
@@ -699,9 +711,7 @@ class PatchVQVAETransformer(nn.Module):
         x_patches_processed = x_patches if return_processed_patches else None
         
         # Channel-independent: 对每个通道独立编码
-        indices_list = []
-        z_q_list = []
-        vq_loss_sum = 0
+        z_list = []
         
         for c in range(C):
             # 提取第c个通道的patches: [B, num_patches, patch_size]
@@ -712,9 +722,28 @@ class PatchVQVAETransformer(nn.Module):
             # VQVAE Encoder (单通道输入)
             z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
             z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
+            z_c = z_flat.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
+            
+            z_list.append(z_c)
+        
+        # 合并所有通道: [B, num_patches, C, code_dim]
+        z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
+        
+        # Channel Attention（如果启用）
+        if self.use_channel_attention and self.channel_attention is not None:
+            z_all = self.channel_attention(z_all)  # [B, num_patches, C, code_dim]
+        
+        # VQ量化（对每个通道独立进行）
+        indices_list = []
+        z_q_list = []
+        vq_loss_sum = 0
+        
+        for c in range(C):
+            z_c = z_all[:, :, c, :]  # [B, num_patches, code_dim]
+            z_c_flat = z_c.reshape(B * num_patches, self.code_dim)  # [B*num_patches, code_dim]
             
             # VQ
-            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_flat)
+            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_c_flat)
             vq_loss_sum += vq_loss_c
             
             # Reshape: [B*num_patches] -> [B, num_patches]
@@ -1113,6 +1142,11 @@ def get_model_config(args):
         config['tcn_num_layers'] = getattr(args, 'tcn_num_layers', 2)
         config['tcn_kernel_size'] = getattr(args, 'tcn_kernel_size', 3)
         config['tcn_hidden_dim'] = getattr(args, 'tcn_hidden_dim', None)
+    
+    # Channel Attention配置
+    if hasattr(args, 'use_channel_attention'):
+        config['use_channel_attention'] = bool(args.use_channel_attention)
+        config['channel_attention_dropout'] = getattr(args, 'channel_attention_dropout', 0.1)
     
     # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:
     # config['n_channels'] = dls.vars

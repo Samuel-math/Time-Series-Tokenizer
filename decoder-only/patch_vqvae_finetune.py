@@ -78,11 +78,19 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
         print('检测到checkpoint中有patch_attention权重，强制启用use_patch_attention')
         config['use_patch_attention'] = True
     
-    # 如果启用patch_attention且提供了通道数，添加到config中以便立即初始化
-    if config.get('use_patch_attention', False) and n_channels is not None:
+    # 检查checkpoint中是否有channel_attention权重
+    has_channel_attention = any('channel_attention' in k for k in state_dict.keys())
+    
+    # 如果checkpoint有channel_attention权重但config未开启，强制开启
+    if has_channel_attention and not config.get('use_channel_attention', False):
+        print('检测到checkpoint中有channel_attention权重，强制启用use_channel_attention')
+        config['use_channel_attention'] = True
+    
+    # 如果启用patch_attention或channel_attention且提供了通道数，添加到config中以便立即初始化
+    if (config.get('use_patch_attention', False) or config.get('use_channel_attention', False)) and n_channels is not None:
         config['n_channels'] = n_channels
     
-    # 创建模型（如果use_patch_attention=True且n_channels存在，会自动初始化patch_attention）
+    # 创建模型（如果use_patch_attention=True或use_channel_attention=True且n_channels存在，会自动初始化）
     model = PatchVQVAETransformer(config).to(device)
     
     # 直接加载所有权重（包括patch_attention），使用strict=False允许架构差异
@@ -95,9 +103,15 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
+    """冻结encoder、decoder、VQ层、channel attention和patch attention（将patch映射成码本前的所有参数）"""
     # 使用模型的方法冻结VQVAE组件
     model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
+    
+    # 冻结 channel attention（如果存在）
+    if hasattr(model, 'channel_attention') and model.channel_attention is not None:
+        for param in model.channel_attention.parameters():
+            param.requires_grad = False
+        print('✓ 已冻结 Channel Attention')
     
     # 冻结 patch attention（如果存在）
     if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:

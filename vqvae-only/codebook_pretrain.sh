@@ -42,6 +42,10 @@ RECON_WEIGHT=1.0
 TRAIN_SAMPLE_RATIO=1.0  # 训练集采样比例 (0.0-1.0)，例如0.1表示只使用10%的训练数据
 VALID_SAMPLE_RATIO=1.0  # 验证集采样比例 (0.0-1.0)，例如0.1表示只使用10%的验证数据
 
+# Channel Attention参数
+USE_CHANNEL_ATTENTION=1  # 是否使用Channel Attention模块(1启用，0禁用)
+CHANNEL_ATTENTION_DROPOUT=0.1  # Channel Attention的dropout率
+
 # 保存参数
 SAVE_PATH="saved_models/vqvae_only/"
 MODEL_ID=1
@@ -76,5 +80,7 @@ python vqvae-only/codebook_pretrain.py \
     --recon_weight $RECON_WEIGHT \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
+    --use_channel_attention $USE_CHANNEL_ATTENTION \
+    --channel_attention_dropout $CHANNEL_ATTENTION_DROPOUT \
     --save_path $SAVE_PATH \
     --model_id $MODEL_ID

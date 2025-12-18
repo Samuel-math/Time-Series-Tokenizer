@@ -66,6 +66,10 @@ def parse_args():
     parser.add_argument('--tcn_kernel_size', type=int, default=3, help='TCN卷积核大小')
     parser.add_argument('--tcn_hidden_dim', type=int, default=None, help='TCN隐藏层维度(默认等于n_channels)')
     
+    # Channel Attention参数
+    parser.add_argument('--use_channel_attention', type=int, default=0, help='是否使用Channel Attention模块(1启用，0禁用)')
+    parser.add_argument('--channel_attention_dropout', type=float, default=0.1, help='Channel Attention的dropout率')
+    
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
@@ -204,7 +208,7 @@ def main():
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
     
-    # 创建模型（传入通道数以立即初始化patch_attention）
+    # 创建模型（传入通道数以立即初始化patch_attention和channel_attention）
     config = get_model_config(args)
     config['n_channels'] = dls.vars  # 添加通道数到config
     model = PatchVQVAETransformer(config).to(device)
@@ -219,6 +223,12 @@ def main():
             freeze=bool(args.freeze_vqvae)
         )
     
+    # 冻结Channel Attention（如果启用）
+    if args.use_channel_attention and model.channel_attention is not None:
+        for param in model.channel_attention.parameters():
+            param.requires_grad = False
+        print('✓ 已冻结 Channel Attention')
+    
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -227,6 +237,8 @@ def main():
     print(f'  总参数: {total_params:,}')
     print(f'  可训练参数: {trainable_params:,}')
     print(f'  冻结参数: {frozen_params:,}')
+    if args.use_channel_attention:
+        print(f'  ✓ Channel Attention已启用（已冻结）')
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
