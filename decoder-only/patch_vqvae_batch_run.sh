@@ -33,14 +33,12 @@ MODEL_ID=1
 # ----- 码本模型路径（可选）-----
 # 如果为空，脚本会自动查找，或手动指定完整路径
 # VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
-# 路径模板支持占位符：__DSET__（数据集名，会在循环中被替换）、__CA_SUFFIX__（channel_attention后缀，_ca1或空）
-# 注意：__CA_SUFFIX__ 的值是 "_ca1" 或 ""（空字符串）
+# 路径模板支持占位符：__DSET__（数据集名，会在循环中被替换）、__CA_SUFFIX__（channel_attention后缀）
+# 注意：__CA_SUFFIX__ 会被替换为 "_ca1"（使用CA）或 "_"（不使用CA，用于连接cd64和model1）
 # 格式：codebook_ps16_cb256_cd64__CA_SUFFIX__model1.pth
-# 当 __CA_SUFFIX__ 为空时：codebook_ps16_cb256_cd64_model1.pth（cd64 和 model1 之间需要下划线）
-# 当 __CA_SUFFIX__ 为 _ca1 时：codebook_ps16_cb256_cd64_ca1_model1.pth
-# 所以在 cd64 和 __CA_SUFFIX__ 之间需要下划线，但 __CA_SUFFIX__ 本身已经包含下划线前缀
-# 解决方案：在 cd64 后面加下划线，__CA_SUFFIX__ 为空时保留，为 _ca1 时会有两个下划线但可以处理
-VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_cb256_cd64___CA_SUFFIX__model${MODEL_ID}.pth"
+# 当不使用 CA 时：codebook_ps16_cb256_cd64_model1.pth
+# 当使用 CA 时：codebook_ps16_cb256_cd64_ca1_model1.pth
+VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_cb256_cd64__CA_SUFFIX__model${MODEL_ID}.pth"
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
@@ -222,9 +220,20 @@ for DSET in "${DATASETS[@]}"; do
         DSET_VQVAE_CHECKPOINT=""
         if [ -n "${VQVAE_CHECKPOINT}" ]; then
             # 构建CA_SUFFIX（用于路径替换）
+            # 注意：codebook_pretrain.py 中的命名格式是 cd64{ca_suffix}_model1
+            # 其中 ca_suffix 是 "_ca1" 或 ""（空字符串）
+            # 所以：
+            # - 不使用 CA: cd64 + "" + _model1 = cd64_model1
+            # - 使用 CA: cd64 + _ca1 + _model1 = cd64_ca1_model1
+            # 路径模板是 cd64__CA_SUFFIX__model1，所以：
+            # - 不使用 CA: __CA_SUFFIX__ 替换为 _ → cd64_model1 ✓
+            # - 使用 CA: __CA_SUFFIX__ 替换为 _ca1_ → cd64_ca1_model1 ✓
             CA_SUFFIX_FOR_PATH=""
             if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
-                CA_SUFFIX_FOR_PATH="_ca1"
+                CA_SUFFIX_FOR_PATH="_ca1_"
+            else
+                # 当不使用 CA 时，需要下划线来连接 cd64 和 model1
+                CA_SUFFIX_FOR_PATH="_"
             fi
             
             # 如果VQVAE_CHECKPOINT包含__DSET__和__CA_SUFFIX__占位符，替换它们
