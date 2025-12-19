@@ -202,7 +202,8 @@ def main():
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
     # 添加 channel_attention 标识
     ca_suffix = "_ca1" if args.use_channel_attention else "_ca0"
-    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}{ca_suffix}_model{args.model_id}'
+    # 添加 input_size 和 target_size 到模型名称（用于批量训练时区分不同配置）
+    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_tg{args.target_points}{ca_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
