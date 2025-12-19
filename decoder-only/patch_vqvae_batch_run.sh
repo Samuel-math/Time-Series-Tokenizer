@@ -34,7 +34,13 @@ MODEL_ID=1
 # 如果为空，脚本会自动查找，或手动指定完整路径
 # VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
 # 路径模板支持占位符：__DSET__（数据集名，会在循环中被替换）、__CA_SUFFIX__（channel_attention后缀，_ca1或空）
-VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_cb256_cd64__CA_SUFFIX__model1.pth"
+# 注意：__CA_SUFFIX__ 的值是 "_ca1" 或 ""（空字符串）
+# 格式：codebook_ps16_cb256_cd64__CA_SUFFIX__model1.pth
+# 当 __CA_SUFFIX__ 为空时：codebook_ps16_cb256_cd64_model1.pth（cd64 和 model1 之间需要下划线）
+# 当 __CA_SUFFIX__ 为 _ca1 时：codebook_ps16_cb256_cd64_ca1_model1.pth
+# 所以在 cd64 和 __CA_SUFFIX__ 之间需要下划线，但 __CA_SUFFIX__ 本身已经包含下划线前缀
+# 解决方案：在 cd64 后面加下划线，__CA_SUFFIX__ 为空时保留，为 _ca1 时会有两个下划线但可以处理
+VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_cb256_cd64___CA_SUFFIX__model${MODEL_ID}.pth"
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
