@@ -292,6 +292,15 @@ for DSET in "${DATASETS[@]}"; do
             # 如果USE_CHANNEL_ATTENTION=0，只有Encoder和Decoder可训练
             # 如果USE_CHANNEL_ATTENTION=1，Encoder、Decoder和Channel Attention都可训练
             
+            # 根据数据集设置采样参数（electricity 使用 0.3，其他数据集使用 1.0）
+            if [ "${DSET}" = "electricity" ]; then
+                TRAIN_SAMPLE_RATIO=0.3
+                VALID_SAMPLE_RATIO=0.3
+            else
+                TRAIN_SAMPLE_RATIO=1.0
+                VALID_SAMPLE_RATIO=1.0
+            fi
+            
             python codebook_pretrain.py \
                 --dset ${DSET} \
                 --context_points 512 \
@@ -315,7 +324,8 @@ for DSET in "${DATASETS[@]}"; do
                 --revin ${REVIN} \
                 --vq_weight 1.0 \
                 --recon_weight 1.0 \
-                --codebook_diversity_weight 0.1 \
+                --train_sample_ratio ${TRAIN_SAMPLE_RATIO} \
+                --valid_sample_ratio ${VALID_SAMPLE_RATIO} \
                 --model_id ${MODEL_ID}
             
             CODEBOOK_TRAIN_EXIT_CODE=$?

@@ -37,7 +37,6 @@ REVIN=1
 AMP=1
 VQ_WEIGHT=1.0
 RECON_WEIGHT=1.0
-CODEBOOK_DIVERSITY_WEIGHT=0.1  # 码本多样性损失权重（提升码本利用率）
 
 # 数据采样参数（用于加速大数据集训练）
 TRAIN_SAMPLE_RATIO=1.0  # 训练集采样比例 (0.0-1.0)，例如0.1表示只使用10%的训练数据
@@ -79,7 +78,6 @@ python codebook_pretrain.py \
     --amp $AMP \
     --vq_weight $VQ_WEIGHT \
     --recon_weight $RECON_WEIGHT \
-    --codebook_diversity_weight $CODEBOOK_DIVERSITY_WEIGHT \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
     --use_channel_attention $USE_CHANNEL_ATTENTION \
