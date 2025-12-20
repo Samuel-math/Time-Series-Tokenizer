@@ -31,12 +31,15 @@ MODEL_ID=1
 # ----- 码本模型路径（可选）-----
 # 如果为空，脚本会自动查找，或手动指定完整路径
 # VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
-# 路径模板支持占位符：__DSET__（数据集名，会在循环中被替换）、__CA_SUFFIX__（channel_attention后缀）
-# 注意：__CA_SUFFIX__ 会被替换为 "_ca1"（使用CA）或 "_"（不使用CA，用于连接cd64和model1）
-# 格式：codebook_ps16_cb256_cd64__CA_SUFFIX__model1.pth
+# 路径模板支持占位符：
+#   __DSET__（数据集名，会在循环中被替换）
+#   __CODE_DIM__（code_dim，会根据EMBEDDING_DIM和COMPRESSION_FACTOR自动计算）
+#   __CA_SUFFIX__（channel_attention后缀，会被替换为 "_ca1" 或 "_"）
+# 格式：codebook_ps16_cb256_cd__CODE_DIM____CA_SUFFIX__model1.pth
 # 当不使用 CA 时：codebook_ps16_cb256_cd64_model1.pth
 # 当使用 CA 时：codebook_ps16_cb256_cd64_ca1_model1.pth
-VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps16_cb256_cd64__CA_SUFFIX__model${MODEL_ID}.pth"
+# 注意：CODE_DIM 会在后面计算，所以这里使用占位符
+VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd__CODE_DIM____CA_SUFFIX__model${MODEL_ID}.pth"
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
@@ -158,6 +161,11 @@ LOAD_VQ_WEIGHTS=1
 # 计算 code_dim 用于模型命名
 # =====================================================
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
+
+# 更新 VQVAE_CHECKPOINT 路径模板中的 CODE_DIM 占位符
+if [ -n "${VQVAE_CHECKPOINT}" ]; then
+    VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/__CODE_DIM__/${CODE_DIM}/g")
+fi
 
 echo "================================================="
 echo "Patch VQVAE Transformer 批量训练"
