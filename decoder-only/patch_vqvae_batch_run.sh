@@ -22,8 +22,6 @@ echo "================================================="
 
 # 数据集列表（将遍历所有数据集）
 DATASETS=(
-    "ettm1"
-    "etth1"
     "weather"
     "electricity"
 )
@@ -63,7 +61,7 @@ DROPOUT=0.3
 
 # ----- Channel Attention 参数 -----
 # 遍历是否使用channel_attention（0=不使用，1=使用）
-CHANNEL_ATTENTION_LIST=(0 1)
+CHANNEL_ATTENTION_LIST=(0)
 CHANNEL_ATTENTION_DROPOUT=0.1
 
 # ----- 批量训练配置 -----
