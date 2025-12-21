@@ -33,13 +33,15 @@ MODEL_ID=1
 # VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
 # 路径模板支持占位符：
 #   __DSET__（数据集名，会在循环中被替换）
+#   __PATCH_SIZE__（patch_size，会在后面替换）
+#   __CODEBOOK_SIZE__（codebook_size，会在后面替换）
 #   __CODE_DIM__（code_dim，会根据EMBEDDING_DIM和COMPRESSION_FACTOR自动计算）
 #   __CA_SUFFIX__（channel_attention后缀，会被替换为 "_ca1" 或 "_"）
-# 格式：codebook_ps16_cb256_cd__CODE_DIM____CA_SUFFIX__model1.pth
+# 格式：codebook_ps__PATCH_SIZE___cb__CODEBOOK_SIZE___cd__CODE_DIM____CA_SUFFIX__model1.pth
 # 当不使用 CA 时：codebook_ps16_cb256_cd64_model1.pth
 # 当使用 CA 时：codebook_ps16_cb256_cd64_ca1_model1.pth
-# 注意：CODE_DIM 会在后面计算，所以这里使用占位符
-VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd__CODE_DIM____CA_SUFFIX__model${MODEL_ID}.pth"
+# 注意：这些变量会在后面定义和替换
+VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps__PATCH_SIZE___cb__CODEBOOK_SIZE___cd__CODE_DIM____CA_SUFFIX__model${MODEL_ID}.pth"
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
@@ -162,9 +164,9 @@ LOAD_VQ_WEIGHTS=1
 # =====================================================
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
 
-# 更新 VQVAE_CHECKPOINT 路径模板中的 CODE_DIM 占位符
+# 更新 VQVAE_CHECKPOINT 路径模板中的占位符
 if [ -n "${VQVAE_CHECKPOINT}" ]; then
-    VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/__CODE_DIM__/${CODE_DIM}/g")
+    VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/__PATCH_SIZE__/${PATCH_SIZE}/g" | sed "s/__CODEBOOK_SIZE__/${CODEBOOK_SIZE}/g" | sed "s/__CODE_DIM__/${CODE_DIM}/g")
 fi
 
 echo "================================================="
