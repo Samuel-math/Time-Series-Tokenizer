@@ -199,6 +199,10 @@ def test_model(model, dataloader, revin, args, device, use_amp):
             with amp.autocast(enabled=use_amp):
                 pred, _ = model.forward_finetune(batch_x, args.target_points)
             
+            # 验证预测长度与目标长度一致
+            assert pred.shape[1] == batch_y.shape[1] == args.target_points, \
+                f"预测长度 {pred.shape[1]} 与目标长度 {batch_y.shape[1]} 或 args.target_points {args.target_points} 不匹配"
+            
             if revin:
                 pred = revin(pred, 'denorm')
             

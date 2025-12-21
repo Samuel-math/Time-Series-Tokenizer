@@ -384,7 +384,7 @@ class TwoStagePretrainModel(nn.Module):
         
         # NTP Head: [B*C, num_pred_patches, codebook_size]
         logits = self.ntp_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
-        
+                
         # 使用 softmax + 加权求和 替代 argmax，保持可微分
         weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
         codebook = self.codebook.embedding.weight  # [codebook_size, d_model]

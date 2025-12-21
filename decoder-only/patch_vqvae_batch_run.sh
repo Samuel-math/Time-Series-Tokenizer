@@ -31,17 +31,7 @@ MODEL_ID=1
 # ----- 码本模型路径（可选）-----
 # 如果为空，脚本会自动查找，或手动指定完整路径
 # VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
-# 路径模板支持占位符：
-#   __DSET__（数据集名，会在循环中被替换）
-#   __PATCH_SIZE__（patch_size，会在后面替换）
-#   __CODEBOOK_SIZE__（codebook_size，会在后面替换）
-#   __CODE_DIM__（code_dim，会根据EMBEDDING_DIM和COMPRESSION_FACTOR自动计算）
-#   __CA_SUFFIX__（channel_attention后缀，会被替换为 "_ca1" 或 "_"）
-# 格式：codebook_ps__PATCH_SIZE___cb__CODEBOOK_SIZE___cd__CODE_DIM____CA_SUFFIX__model1.pth
-# 当不使用 CA 时：codebook_ps16_cb256_cd64_model1.pth
-# 当使用 CA 时：codebook_ps16_cb256_cd64_ca1_model1.pth
-# 注意：这些变量会在后面定义和替换
-VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/__DSET__/codebook_ps__PATCH_SIZE___cb__CODEBOOK_SIZE___cd__CODE_DIM____CA_SUFFIX__model${MODEL_ID}.pth"
+# 注意：路径会在循环中根据数据集和CA设置动态构建
 
 # ----- Patch 参数 -----
 PATCH_SIZE=16
@@ -164,11 +154,6 @@ LOAD_VQ_WEIGHTS=1
 # =====================================================
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
 
-# 更新 VQVAE_CHECKPOINT 路径模板中的占位符
-if [ -n "${VQVAE_CHECKPOINT}" ]; then
-    VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/__PATCH_SIZE__/${PATCH_SIZE}/g" | sed "s/__CODEBOOK_SIZE__/${CODEBOOK_SIZE}/g" | sed "s/__CODE_DIM__/${CODE_DIM}/g")
-fi
-
 echo "================================================="
 echo "Patch VQVAE Transformer 批量训练"
 echo "================================================="
@@ -225,44 +210,38 @@ for DSET in "${DATASETS[@]}"; do
         CODEBOOK_MODEL_NAME="codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${CA_SUFFIX}_model${MODEL_ID}"
         
         # 为当前数据集和channel_attention设置构建VQVAE checkpoint路径
-        DSET_VQVAE_CHECKPOINT=""
-        if [ -n "${VQVAE_CHECKPOINT}" ]; then
-            # 构建CA_SUFFIX（用于路径替换）
-            # 注意：codebook_pretrain.py 中的命名格式是 cd64{ca_suffix}_model1
-            # 其中 ca_suffix 是 "_ca1" 或 ""（空字符串）
-            # 所以：
-            # - 不使用 CA: cd64 + "" + _model1 = cd64_model1
-            # - 使用 CA: cd64 + _ca1 + _model1 = cd64_ca1_model1
-            # 路径模板是 cd64__CA_SUFFIX__model1，所以：
-            # - 不使用 CA: __CA_SUFFIX__ 替换为 _ → cd64_model1 ✓
-            # - 使用 CA: __CA_SUFFIX__ 替换为 _ca1_ → cd64_ca1_model1 ✓
+        # 构建CA_SUFFIX（用于路径）
+        # 注意：codebook_pretrain.py 中的命名格式是 cd64{ca_suffix}_model1
+        # 其中 ca_suffix 是 "_ca1" 或 ""（空字符串）
+        # 所以：
+        # - 不使用 CA: cd64 + "" + _model1 = cd64_model1
+        # - 使用 CA: cd64 + _ca1 + _model1 = cd64_ca1_model1
+        CA_SUFFIX_FOR_PATH=""
+        if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
+            CA_SUFFIX_FOR_PATH="_ca1"
+        else
+            # 当不使用 CA 时，ca_suffix 是空字符串
             CA_SUFFIX_FOR_PATH=""
-            if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
-                CA_SUFFIX_FOR_PATH="_ca1_"
-            else
-                # 当不使用 CA 时，需要下划线来连接 cd64 和 model1
-                CA_SUFFIX_FOR_PATH="_"
-            fi
-            
-            # 如果VQVAE_CHECKPOINT包含__DSET__和__CA_SUFFIX__占位符，替换它们
-            DSET_VQVAE_CHECKPOINT=$(echo "${VQVAE_CHECKPOINT}" | sed "s/__DSET__/${DSET}/g" | sed "s/__CA_SUFFIX__/${CA_SUFFIX_FOR_PATH}/g")
-            
-            # 处理相对路径
-            if [[ ! "${DSET_VQVAE_CHECKPOINT}" = /* ]]; then
-                SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-                DSET_VQVAE_CHECKPOINT="${SCRIPT_DIR}/${DSET_VQVAE_CHECKPOINT}"
-            fi
-            
-            # 规范化路径
-            DSET_VQVAE_CHECKPOINT=$(readlink -f "${DSET_VQVAE_CHECKPOINT}" 2>/dev/null || realpath "${DSET_VQVAE_CHECKPOINT}" 2>/dev/null || echo "${DSET_VQVAE_CHECKPOINT}")
-            
-            if [ ! -f "${DSET_VQVAE_CHECKPOINT}" ]; then
-                echo "警告: VQVAE模型文件不存在: ${DSET_VQVAE_CHECKPOINT}"
-                echo "尝试自动训练codebook..."
-                DSET_VQVAE_CHECKPOINT=""
-            else
-                echo "找到VQVAE模型: ${DSET_VQVAE_CHECKPOINT}"
-            fi
+        fi
+        
+        # 直接构建完整的路径，不使用占位符
+        DSET_VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${CA_SUFFIX_FOR_PATH}_model${MODEL_ID}.pth"
+        
+        # 处理相对路径
+        if [[ ! "${DSET_VQVAE_CHECKPOINT}" = /* ]]; then
+            SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+            DSET_VQVAE_CHECKPOINT="${SCRIPT_DIR}/${DSET_VQVAE_CHECKPOINT}"
+        fi
+        
+        # 规范化路径
+        DSET_VQVAE_CHECKPOINT=$(readlink -f "${DSET_VQVAE_CHECKPOINT}" 2>/dev/null || realpath "${DSET_VQVAE_CHECKPOINT}" 2>/dev/null || echo "${DSET_VQVAE_CHECKPOINT}")
+        
+        if [ ! -f "${DSET_VQVAE_CHECKPOINT}" ]; then
+            echo "警告: VQVAE模型文件不存在: ${DSET_VQVAE_CHECKPOINT}"
+            echo "尝试自动训练codebook..."
+            DSET_VQVAE_CHECKPOINT=""
+        else
+            echo "找到VQVAE模型: ${DSET_VQVAE_CHECKPOINT}"
         fi
         
         # 如果没有找到codebook，自动训练一个
@@ -443,9 +422,30 @@ for DSET in "${DATASETS[@]}"; do
             # =====================================================
             PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
             
+            echo "调试: MODEL_NAME = ${MODEL_NAME}"
+            echo "调试: 构建的PRETRAINED_MODEL = ${PRETRAINED_MODEL}"
+            
+            # 处理相对路径
+            if [[ ! "${PRETRAINED_MODEL}" = /* ]]; then
+                SCRIPT_DIR_PRETRAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+                PRETRAINED_MODEL="${SCRIPT_DIR_PRETRAIN}/${PRETRAINED_MODEL}"
+                echo "调试: 转换为绝对路径后 = ${PRETRAINED_MODEL}"
+            fi
+            
+            # 规范化路径
+            PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${PRETRAINED_MODEL}" 2>/dev/null || echo "${PRETRAINED_MODEL}")
+            echo "调试: 规范化后的路径 = ${PRETRAINED_MODEL}"
+            
             # 检查预训练模型是否存在
             if [ ! -f "${PRETRAINED_MODEL}" ]; then
                 echo "警告: 预训练模型不存在: ${PRETRAINED_MODEL}"
+                echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${INPUT_SIZE}_tg${TARGET_SIZE}${CA_SUFFIX}_model${MODEL_ID}.pth"
+                echo "实际 MODEL_NAME: ${MODEL_NAME}"
+                echo "检查目录是否存在: $(dirname "${PRETRAINED_MODEL}")"
+                if [ -d "$(dirname "${PRETRAINED_MODEL}")" ]; then
+                    echo "目录中的文件列表:"
+                    ls -la "$(dirname "${PRETRAINED_MODEL}")" | head -20 || echo "无法列出目录内容"
+                fi
                 echo "跳过微调任务"
                 continue
             fi

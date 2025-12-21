@@ -911,6 +911,9 @@ class PatchVQVAETransformer(nn.Module):
         pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
         pred = pred[:, :target_len, :]  # [B, target_len, C]
         
+        # 确保输出长度与目标长度一致
+        assert pred.shape[1] == target_len, f"预测长度 {pred.shape[1]} 与目标长度 {target_len} 不匹配"
+        
         return pred, vq_loss
     
     def forward(self, x, target=None, target_len=None, mode='pretrain'):
