@@ -139,6 +139,7 @@ VQ_WEIGHT=0.5
 RECON_WEIGHT=0.1
 
 # ----- 微调参数 -----
+FINETUNE_CONTEXT_POINTS=512  # 微调时固定的 context_points（输入长度）
 FINETUNE_EPOCHS=50
 FINETUNE_BATCH_SIZE=64
 FINETUNE_LR=1e-4
@@ -163,6 +164,7 @@ echo "模型ID: ${MODEL_ID}"
 echo "Code Dim: ${CODE_DIM}"
 echo "Channel Attention设置: ${CHANNEL_ATTENTION_LIST[@]}"
 echo "输入-目标组合数: ${#INPUT_TARGET_PAIRS[@]}"
+echo "微调固定 Context Points: ${FINETUNE_CONTEXT_POINTS}"
 echo "微调目标长度数: ${#TARGET_POINTS_LIST[@]}"
 echo "每个数据集每个CA设置的任务数: $(( ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
@@ -455,7 +457,7 @@ for DSET in "${DATASETS[@]}"; do
             echo "阶段 2: 微调"
             echo "-------------------------------------------------"
             echo "预训练模型: ${PRETRAINED_MODEL}"
-            echo "Context Points: ${INPUT_SIZE}"
+            echo "Context Points: ${FINETUNE_CONTEXT_POINTS} (固定)"
             echo "Target Points: ${TARGET_POINTS_LIST[@]}"
             echo "-------------------------------------------------"
             
@@ -465,7 +467,7 @@ for DSET in "${DATASETS[@]}"; do
                 
                 python patch_vqvae_finetune.py \
                     --dset ${DSET} \
-                    --context_points ${INPUT_SIZE} \
+                    --context_points ${FINETUNE_CONTEXT_POINTS} \
                     --target_points ${FINETUNE_TARGET} \
                     --batch_size ${FINETUNE_BATCH_SIZE} \
                     --pretrained_model "${PRETRAINED_MODEL}" \
