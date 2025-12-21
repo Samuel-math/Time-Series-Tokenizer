@@ -169,7 +169,7 @@ class Encoder(nn.Module):
 
         elif compression_factor == 8:
             if inputs.dim() == 2:
-            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+                x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
             else:
                 x = inputs
 
@@ -189,7 +189,7 @@ class Encoder(nn.Module):
 
         elif compression_factor == 12:
             if inputs.dim() == 2:
-            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+                x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
             else:
                 x = inputs
 
@@ -209,7 +209,7 @@ class Encoder(nn.Module):
 
         elif compression_factor == 16:
             if inputs.dim() == 2:
-            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+                x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
             else:
                 x = inputs
 
@@ -353,7 +353,7 @@ class Decoder(nn.Module):
 
             # 如果out_channels=1，squeeze以保持向后兼容；否则返回多通道
             if self.out_channels == 1:
-            return torch.squeeze(x)
+                return torch.squeeze(x)
             else:
                 return x
 
@@ -371,7 +371,7 @@ class Decoder(nn.Module):
             x = self._conv_trans_2(x)
 
             if self.out_channels == 1:
-            return torch.squeeze(x)
+                return torch.squeeze(x)
             else:
                 return x
 
@@ -388,7 +388,7 @@ class Decoder(nn.Module):
             x = self._conv_trans_4(x)
 
             if self.out_channels == 1:
-            return torch.squeeze(x)
+                return torch.squeeze(x)
             else:
                 return x
 
@@ -409,7 +409,7 @@ class Decoder(nn.Module):
             x = self._conv_trans_2(x)
 
             if self.out_channels == 1:
-            return torch.squeeze(x)
+                return torch.squeeze(x)
             else:
                 return x
 
