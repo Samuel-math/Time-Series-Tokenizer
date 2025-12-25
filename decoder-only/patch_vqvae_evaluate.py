@@ -76,24 +76,10 @@ def evaluate_model(model, dataloader, revin, args, device, use_amp):
     mae = np.mean(np.abs(preds - targets))
     rmse = np.sqrt(mse)
     
-    # 计算每个通道的指标
-    n_channels = targets.shape[-1]
-    channel_metrics = {}
-    for c in range(n_channels):
-        channel_mse = np.mean((preds[:, :, c] - targets[:, :, c]) ** 2)
-        channel_mae = np.mean(np.abs(preds[:, :, c] - targets[:, :, c]))
-        channel_rmse = np.sqrt(channel_mse)
-        channel_metrics[f'channel_{c}'] = {
-            'MSE': channel_mse,
-            'MAE': channel_mae,
-            'RMSE': channel_rmse
-        }
-    
     return {
         'MSE': mse,
         'MAE': mae,
         'RMSE': rmse,
-        'channel_metrics': channel_metrics,
         'preds': preds,
         'targets': targets
     }
@@ -161,16 +147,8 @@ def main():
     print(f'MSE:  {results["MSE"]:.6f}')
     print(f'MAE:  {results["MAE"]:.6f}')
     print(f'RMSE: {results["RMSE"]:.6f}')
-    print('\n各通道指标:')
-    for channel_name, metrics in results['channel_metrics'].items():
-        print(f'  {channel_name}:')
-        print(f'    MSE:  {metrics["MSE"]:.6f}')
-        print(f'    MAE:  {metrics["MAE"]:.6f}')
-        print(f'    RMSE: {metrics["RMSE"]:.6f}')
-    
-    print('\n' + '=' * 80)
-    print('评估完成！')
     print('=' * 80)
+    print('评估完成！')
 
 
 if __name__ == '__main__':

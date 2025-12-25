@@ -388,8 +388,8 @@ def main():
     print('测试最佳模型...')
     
     # 加载最佳模型
-            # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
-            best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device, weights_only=False)
+    # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
+    best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device, weights_only=False)
     model.load_state_dict(best_checkpoint['model_state_dict'])
     
     mse, mae, preds, targets = test_model(model, dls.test, revin, args, device, use_amp)
