@@ -496,6 +496,17 @@ class CausalTransformer(nn.Module):
     """轻量级 Causal Transformer，支持独立的 hidden_dim 参数"""
     def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_dim=None):
         super().__init__()
+        
+        # PyTorch 2.7+ 兼容性修复：禁用 flash attention 和 memory-efficient attention
+        # 当使用 mask 时，这些优化可能导致 CUDA 错误
+        # 强制使用标准的数学实现
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(True)
+        
         self.code_dim = code_dim
         # 如果未指定 hidden_dim，默认使用 code_dim
         self.hidden_dim = hidden_dim if hidden_dim is not None else code_dim
@@ -536,8 +547,10 @@ class CausalTransformer(nn.Module):
         x = x + self.pos_embedding(positions)
         x = self.drop(x)
         
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        x = self.transformer(x, mask=mask, is_causal=True)
+        # 创建 causal mask（上三角矩阵，对角线以上为 True）
+        # 只使用 mask 参数，避免 is_causal=True 在某些 PyTorch 版本中的兼容性问题
+        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        x = self.transformer(x, mask=mask)
         x = self.norm(x)  # [B, T, hidden_dim]
         
         # 输出投影（如果需要）
@@ -826,6 +839,10 @@ class PatchVQVAETransformer(nn.Module):
         vq_loss = (vq_loss_input + vq_loss_target) / 2
         
         # 重构损失（仅使用输入序列）
+        # 注意：即使 encoder/decoder 被冻结，如果使用 EMA codebook，codebook 会在训练过程中更新，
+        # 导致量化结果 z_q_input 发生变化，进而影响 recon_loss。这是正常的，因为 codebook 的更新
+        # 会改变量化表示，从而影响重构质量。
+        # 如果希望 recon_loss 保持稳定，可以在预训练时设置 --disable_ema_update 1 来禁用 EMA 更新。
         num_input_patches = input_indices.shape[1]
         x_recon = self.decode_from_codes(z_q_input)  # [B, num_input_patches * patch_size, C]
         
@@ -953,7 +970,8 @@ class PatchVQVAETransformer(nn.Module):
             return False
         
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             
             # 提取state_dict
             if isinstance(checkpoint, dict):

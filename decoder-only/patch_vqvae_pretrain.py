@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument('--transformer_hidden_dim', type=int, default=None, help='Transformer的hidden_dim（默认使用code_dim）')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
     parser.add_argument('--codebook_ema', type=int, default=1, help='码本使用EMA更新(1启用)')
+    parser.add_argument('--disable_ema_update', type=int, default=1, help='禁用EMA更新(1禁用, 0启用, 用于稳定recon_loss)')
     parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减系数')
     parser.add_argument('--ema_eps', type=float, default=1e-5, help='EMA平滑项')
     
@@ -190,6 +191,17 @@ def main():
     args = parse_args()
     print('Args:', args)
     
+    # PyTorch 2.7+ 兼容性修复：禁用 flash attention 和 memory-efficient attention
+    # 当使用 mask 时，这些优化可能导致 CUDA 错误
+    if torch.cuda.is_available():
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(True)
+        print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容性修复）')
+    
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -231,6 +243,13 @@ def main():
         for param in model.channel_attention.parameters():
             param.requires_grad = False
         print('✓ 已冻结 Channel Attention')
+    
+    # 可选：禁用EMA更新（用于稳定recon_loss）
+    if args.disable_ema_update:
+        from src.models.patch_vqvae_transformer import FlattenedVectorQuantizerEMA
+        if hasattr(model, 'vq') and isinstance(model.vq, FlattenedVectorQuantizerEMA):
+            model.vq._disable_ema_update = True
+            print('✓ 已禁用 EMA codebook 更新（recon_loss将保持稳定）')
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())

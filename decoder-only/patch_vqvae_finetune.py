@@ -65,7 +65,8 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
         n_channels: 通道数（如果提供且启用patch_attention，会在创建模型时立即初始化）
     """
     print(f'加载预训练模型: {checkpoint_path}')
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     config = checkpoint['config']
     state_dict = checkpoint['model_state_dict']
@@ -222,6 +223,17 @@ def main():
     args = parse_args()
     print('Args:', args)
     
+    # PyTorch 2.7+ 兼容性修复：禁用 flash attention 和 memory-efficient attention
+    # 当使用 mask 时，这些优化可能导致 CUDA 错误
+    if torch.cuda.is_available():
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(True)
+        print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容性修复）')
+    
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -376,7 +388,8 @@ def main():
     print('测试最佳模型...')
     
     # 加载最佳模型
-    best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device)
+            # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
+            best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device, weights_only=False)
     model.load_state_dict(best_checkpoint['model_state_dict'])
     
     mse, mae, preds, targets = test_model(model, dls.test, revin, args, device, use_amp)

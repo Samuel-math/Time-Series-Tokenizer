@@ -310,6 +310,17 @@ def main():
     args = parse_args()
     print('Args:', args)
     
+    # PyTorch 2.7+ 兼容性修复：禁用 flash attention 和 memory-efficient attention
+    # 当使用 mask 时，这些优化可能导致 CUDA 错误
+    if torch.cuda.is_available():
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(True)
+        print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容性修复）')
+    
     # 设置随机数种子
     set_seed(args.seed)
     
