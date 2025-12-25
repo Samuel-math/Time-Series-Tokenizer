@@ -4,7 +4,6 @@ Patch-based VQVAE + Transformer 模型评估脚本
 """
 
 import numpy as np
-import pandas as pd
 import os
 import sys
 import torch
@@ -12,7 +11,6 @@ from torch import nn
 import torch.nn.functional as F
 from torch.cuda import amp
 import argparse
-from pathlib import Path
 
 # 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -169,33 +167,6 @@ def main():
         print(f'    MSE:  {metrics["MSE"]:.6f}')
         print(f'    MAE:  {metrics["MAE"]:.6f}')
         print(f'    RMSE: {metrics["RMSE"]:.6f}')
-    
-    # 保存结果
-    model_dir = Path(args.model_path).parent
-    model_name = Path(args.model_path).stem
-    
-    # 保存总体指标
-    results_df = pd.DataFrame({
-        'metric': ['MSE', 'MAE', 'RMSE'],
-        'value': [results['MSE'], results['MAE'], results['RMSE']]
-    })
-    results_path = model_dir / f'{model_name}_evaluation.csv'
-    results_df.to_csv(results_path, index=False)
-    print(f'\n✓ 评估结果已保存至: {results_path}')
-    
-    # 保存各通道指标
-    channel_results = []
-    for channel_name, metrics in results['channel_metrics'].items():
-        channel_results.append({
-            'channel': channel_name,
-            'MSE': metrics['MSE'],
-            'MAE': metrics['MAE'],
-            'RMSE': metrics['RMSE']
-        })
-    channel_df = pd.DataFrame(channel_results)
-    channel_results_path = model_dir / f'{model_name}_evaluation_channels.csv'
-    channel_df.to_csv(channel_results_path, index=False)
-    print(f'✓ 通道指标已保存至: {channel_results_path}')
     
     print('\n' + '=' * 80)
     print('评估完成！')
