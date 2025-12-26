@@ -621,6 +621,8 @@ class PatchVQVAETransformer(nn.Module):
         # 注意：Transformer输出始终是code_dim（通过输出投影），所以output_head输入维度是code_dim
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
 
+        # 获取通道数（从config中获取，如果不存在则为None，稍后通过load_vqvae_weights或直接设置）
+        n_channels = config.get('n_channels', None)
         self._n_channels = n_channels
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.encoder = Encoder(
