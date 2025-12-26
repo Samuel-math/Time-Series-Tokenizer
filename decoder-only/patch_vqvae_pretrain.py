@@ -31,6 +31,8 @@ def parse_args():
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
     parser.add_argument('--context_points', type=int, default=512, help='输入序列长度')
     parser.add_argument('--target_points', type=int, default=96, help='目标序列长度（用于预训练时分割input和target）')
+    parser.add_argument('--progressive_step_size', type=int, default=None, help='渐进式预训练的步长（patches数），如果为None则使用target_points对应的patches数')
+    parser.add_argument('--progressive_max_stages', type=int, default=None, help='渐进式预训练的最大阶段数，如果为None则使用所有可能的阶段')
     parser.add_argument('--batch_size', type=int, default=64, help='批次大小')
     parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
     parser.add_argument('--scaler', type=str, default='standard', help='数据缩放方式')
@@ -60,17 +62,6 @@ def parse_args():
     parser.add_argument('--freeze_vqvae', type=int, default=1, help='加载VQVAE后是否冻结(1冻结, 0不冻结)')
     parser.add_argument('--load_vq_weights', type=int, default=1, help='是否加载VQ层权重(1加载)')
     
-    # Patch内时序建模参数（支持TCN、Self-Attention和Cross-Attention）
-    parser.add_argument('--use_patch_attention', type=int, default=0, help='是否使用patch内时序建模(1启用)')
-    parser.add_argument('--patch_attention_type', type=str, default='tcn', choices=['tcn', 'attention', 'cross_attention'], help='时序建模类型: tcn、attention或cross_attention')
-    parser.add_argument('--tcn_num_layers', type=int, default=2, help='TCN层数')
-    parser.add_argument('--tcn_kernel_size', type=int, default=3, help='TCN卷积核大小')
-    parser.add_argument('--tcn_hidden_dim', type=int, default=None, help='TCN隐藏层维度(默认等于n_channels)')
-    
-    # Channel Attention参数
-    parser.add_argument('--use_channel_attention', type=int, default=0, help='是否使用Channel Attention模块(1启用，0禁用)')
-    parser.add_argument('--channel_attention_dropout', type=float, default=0.1, help='Channel Attention的dropout率')
-    
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
@@ -99,6 +90,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     if trainable_params is None:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     
+    # 计算渐进式预训练的步长（以patches为单位）
+    if args.progressive_step_size is None:
+        # 默认使用target_points对应的patches数
+        step_size = (args.target_points + model.patch_size - 1) // model.patch_size
+    else:
+        step_size = args.progressive_step_size
+    
     for batch_x, batch_y in dataloader:
         batch_x = batch_x.to(device)  # [B, input_len, C]
         batch_y = batch_y.to(device)  # [B, target_len, C]
@@ -108,16 +106,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
             batch_x = revin(batch_x, 'norm')
             batch_y = revin(batch_y, 'norm')
         
-        # 前向传播：基于input的index预测target的index概率分布
-        logits, target_indices, vq_loss, recon_loss = model.forward_pretrain(batch_x, batch_y)
-        # logits: [B, num_target_patches, C, codebook_size] (channel-independent)
-        # target_indices: [B, num_target_patches, C]
+        # 渐进式预训练：拼接输入和目标，使用完整序列
+        batch_full = torch.cat([batch_x, batch_y], dim=1)  # [B, input_len + target_len, C]
         
-        # 预测损失 (CrossEntropy)
-        B, num_target_patches, C, codebook_size = logits.shape
-        logits_flat = logits.reshape(-1, codebook_size)  # [B*num_target_patches*C, codebook_size]
-        target_indices_flat = target_indices.reshape(-1)  # [B*num_target_patches*C]
-        pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
+        # 前向传播：渐进式预测
+        all_logits, all_target_indices, vq_loss, recon_loss = model.forward_progressive_pretrain(
+            batch_full, step_size=step_size, max_stages=args.progressive_max_stages
+        )
+        
+        # 计算所有阶段的预测损失
+        pred_losses = []
+        for logits_stage, target_indices_stage in zip(all_logits, all_target_indices):
+            B_stage, num_target_patches_stage, C_stage, codebook_size_stage = logits_stage.shape
+            logits_flat_stage = logits_stage.reshape(-1, codebook_size_stage)
+            target_indices_flat_stage = target_indices_stage.reshape(-1)
+            pred_loss_stage = F.cross_entropy(logits_flat_stage, target_indices_flat_stage)
+            pred_losses.append(pred_loss_stage)
+        
+        # 平均所有阶段的预测损失
+        pred_loss = sum(pred_losses) / len(pred_losses)
         
         # 总损失
         loss = pred_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
@@ -153,6 +160,13 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_recon_loss = 0
     n_batches = 0
     
+    # 计算渐进式预训练的步长（以patches为单位）
+    if args.progressive_step_size is None:
+        # 默认使用target_points对应的patches数
+        step_size = (args.target_points + model.patch_size - 1) // model.patch_size
+    else:
+        step_size = args.progressive_step_size
+    
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x = batch_x.to(device)  # [B, input_len, C]
@@ -162,14 +176,25 @@ def validate_epoch(model, dataloader, revin, args, device):
                 batch_x = revin(batch_x, 'norm')
                 batch_y = revin(batch_y, 'norm')
             
-            logits, target_indices, vq_loss, recon_loss = model.forward_pretrain(batch_x, batch_y)
+            # 渐进式预训练：拼接输入和目标，使用完整序列
+            batch_full = torch.cat([batch_x, batch_y], dim=1)  # [B, input_len + target_len, C]
             
-            # logits: [B, num_target_patches, C, codebook_size] (channel-independent)
-            # target_indices: [B, num_target_patches, C]
-            B, num_target_patches, C, codebook_size = logits.shape
-            logits_flat = logits.reshape(-1, codebook_size)  # [B*num_target_patches*C, codebook_size]
-            target_indices_flat = target_indices.reshape(-1)  # [B*num_target_patches*C]
-            pred_loss = F.cross_entropy(logits_flat, target_indices_flat)
+            # 前向传播：渐进式预测
+            all_logits, all_target_indices, vq_loss, recon_loss = model.forward_progressive_pretrain(
+                batch_full, step_size=step_size, max_stages=args.progressive_max_stages
+            )
+            
+            # 计算所有阶段的预测损失
+            pred_losses = []
+            for logits_stage, target_indices_stage in zip(all_logits, all_target_indices):
+                B_stage, num_target_patches_stage, C_stage, codebook_size_stage = logits_stage.shape
+                logits_flat_stage = logits_stage.reshape(-1, codebook_size_stage)
+                target_indices_flat_stage = target_indices_stage.reshape(-1)
+                pred_loss_stage = F.cross_entropy(logits_flat_stage, target_indices_flat_stage)
+                pred_losses.append(pred_loss_stage)
+            
+            # 平均所有阶段的预测损失
+            pred_loss = sum(pred_losses) / len(pred_losses)
             
             loss = pred_loss + args.vq_weight * vq_loss + args.recon_weight * recon_loss
             
@@ -212,10 +237,8 @@ def main():
     
     # 模型文件名 (code_dim = embedding_dim * patch_size / compression_factor)
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    # 添加 channel_attention 标识
-    ca_suffix = "_ca1" if args.use_channel_attention else "_ca0"
     # 添加 input_size 和 target_size 到模型名称（用于批量训练时区分不同配置）
-    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_tg{args.target_points}{ca_suffix}_model{args.model_id}'
+    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_tg{args.target_points}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -223,7 +246,7 @@ def main():
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
     
-    # 创建模型（传入通道数以立即初始化patch_attention和channel_attention）
+    # 创建模型
     config = get_model_config(args)
     config['n_channels'] = dls.vars  # 添加通道数到config
     model = PatchVQVAETransformer(config).to(device)
@@ -238,12 +261,6 @@ def main():
             freeze=bool(args.freeze_vqvae)
         )
     
-    # 冻结Channel Attention（如果存在，无论是否从checkpoint加载）
-    if hasattr(model, 'channel_attention') and model.channel_attention is not None:
-        for param in model.channel_attention.parameters():
-            param.requires_grad = False
-        print('✓ 已冻结 Channel Attention')
-    
     # 可选：禁用EMA更新（用于稳定recon_loss）
     if args.disable_ema_update:
         from src.models.patch_vqvae_transformer import FlattenedVectorQuantizerEMA
@@ -256,21 +273,10 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     
-    # 检查Channel Attention状态
-    has_channel_attention = hasattr(model, 'channel_attention') and model.channel_attention is not None
-    if has_channel_attention:
-        ca_total = sum(p.numel() for p in model.channel_attention.parameters())
-        ca_trainable = sum(p.numel() for p in model.channel_attention.parameters() if p.requires_grad)
-        ca_frozen = ca_total - ca_trainable
-    
     print(f'\n模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  可训练参数: {trainable_params:,}')
     print(f'  冻结参数: {frozen_params:,}')
-    if has_channel_attention:
-        print(f'  Channel Attention: {ca_total:,} 参数 (可训练: {ca_trainable:,}, 冻结: {ca_frozen:,})')
-        if ca_frozen == ca_total:
-            print(f'  ✓ Channel Attention已冻结')
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None

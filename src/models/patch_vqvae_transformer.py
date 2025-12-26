@@ -596,37 +596,7 @@ class PatchVQVAETransformer(nn.Module):
         self.transformer_hidden_dim = config.get('transformer_hidden_dim', None)
         
         # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
-        self.use_patch_attention = config.get('use_patch_attention', False)
-        patch_attention_type = config.get('patch_attention_type', 'tcn')  # 'tcn', 'attention', 或 'cross_attention'
-        n_channels = config.get('n_channels', None)  # 如果提供了通道数，立即初始化
-        
-        if self.use_patch_attention and n_channels is not None:
-            if patch_attention_type == 'tcn':
-                tcn_num_layers = config.get('tcn_num_layers', 2)
-                tcn_kernel_size = config.get('tcn_kernel_size', 3)
-                tcn_hidden_dim = config.get('tcn_hidden_dim', None)
-                self.patch_attention = PatchTCN(
-                    patch_size=self.patch_size,
-                    n_channels=n_channels,
-                    dropout=self.dropout,
-                    num_layers=tcn_num_layers,
-                    kernel_size=tcn_kernel_size,
-                    hidden_dim=tcn_hidden_dim
-                )
-            elif patch_attention_type == 'cross_attention':
-                self.patch_attention = PatchCrossAttention(
-                    patch_size=self.patch_size,
-                    n_channels=n_channels,
-                    dropout=self.dropout
-                )
-            else:  # 'attention' (self-attention)
-                self.patch_attention = PatchSelfAttention(
-                    patch_size=self.patch_size,
-                    n_channels=n_channels,
-                    dropout=self.dropout
-                )
-        else:
-            self.patch_attention = None
+        # Patch attention 已移除
         
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'uniform')
@@ -671,29 +641,18 @@ class PatchVQVAETransformer(nn.Module):
             out_channels=1  # 单通道输出
         )
         
-        # Channel Attention模块（在VQ之前，可选）
-        self.use_channel_attention = config.get('use_channel_attention', False)
-        if self.use_channel_attention and n_channels is not None:
-            self.channel_attention = ChannelAttention(
-                code_dim=self.code_dim,
-                n_channels=n_channels,
-                dropout=config.get('channel_attention_dropout', 0.1)
-            )
-        else:
-            self.channel_attention = None
+        # Channel Attention 已移除
     
-    def encode_to_indices(self, x, return_processed_patches=False):
+    def encode_to_indices(self, x):
         """
         编码为码本索引和量化向量（channel-independent版本）
         
         Args:
-            x: [B, T, C]
-            return_processed_patches: 是否返回经过时序建模处理后的patches
+            x: [B, T, C] 输入序列
         Returns:
             indices: [B, num_patches, C]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
-            x_patches_processed: [B, num_patches, patch_size, C] (如果return_processed_patches=True)
         """
         B, T, C = x.shape
         
@@ -702,26 +661,6 @@ class PatchVQVAETransformer(nn.Module):
         # 重组为 patches: [B, num_patches, patch_size, C]
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
-        
-        # 应用Patch内时序建模（TCN或Attention，如果启用）
-        if self.use_patch_attention:
-            if self.patch_attention is None:
-                raise RuntimeError(
-                    "patch_attention 未初始化。请在创建模型时通过 config['n_channels'] 提供通道数。"
-                )
-            
-            # 对每个patch，在patch_size × C上应用时序建模
-            # [B, num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
-            x_patches_flat = x_patches.reshape(B * num_patches, self.patch_size, C)
-            
-            # 应用时序建模（TCN或Attention）: [B*num_patches, patch_size, C] -> [B*num_patches, patch_size, C]
-            x_out = self.patch_attention(x_patches_flat)
-            
-            # 恢复形状: [B*num_patches, patch_size, C] -> [B, num_patches, patch_size, C]
-            x_patches = x_out.reshape(B, num_patches, self.patch_size, C)
-        
-        # 保存处理后的patches（用于重构损失）
-        x_patches_processed = x_patches if return_processed_patches else None
         
         # Channel-independent: 对每个通道独立编码
         z_list = []
@@ -741,10 +680,6 @@ class PatchVQVAETransformer(nn.Module):
         
         # 合并所有通道: [B, num_patches, C, code_dim]
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
-        
-        # Channel Attention（如果启用）
-        if self.use_channel_attention and self.channel_attention is not None:
-            z_all = self.channel_attention(z_all)  # [B, num_patches, C, code_dim]
         
         # VQ量化（对每个通道独立进行）
         indices_list = []
@@ -771,8 +706,6 @@ class PatchVQVAETransformer(nn.Module):
         z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C  # 平均VQ损失
         
-        if return_processed_patches:
-            return indices, vq_loss, z_q, x_patches_processed
         return indices, vq_loss, z_q
     
     def decode_from_codes(self, z_q):
@@ -808,75 +741,118 @@ class PatchVQVAETransformer(nn.Module):
         
         return x_recon
     
-    def forward_pretrain(self, x, target):
+    def forward_progressive_pretrain(self, x_full, step_size, max_stages=None):
         """
-        预训练: 基于input的index预测target的index概率分布 (channel-independent版本)
+        渐进式预训练: 使用不同长度的上下文预测固定长度的未来tokens
+        
+        例如，如果 step_size=a，max_stages=3：
+        - 阶段1: 使用前 a 个tokens 预测接下来的 a 个tokens
+        - 阶段2: 使用前 2a 个tokens 预测接下来的 a 个tokens (从位置 a 开始)
+        - 阶段3: 使用前 3a 个tokens 预测接下来的 a 个tokens (从位置 2a 开始)
         
         Args:
-            x: [B, input_len, C] 输入序列
-            target: [B, target_len, C] 目标序列
+            x_full: [B, total_len, C] 完整序列
+            step_size: int, 每个阶段的步长（以patches为单位）
+            max_stages: int, 最大阶段数。如果为None，则使用所有可能的阶段
+        
         Returns:
-            logits: [B, num_target_patches, C, codebook_size] 目标序列的索引概率分布
-            target_indices: [B, num_target_patches, C] 目标序列的真实索引
-            vq_loss: VQ损失
-            recon_loss: 重构损失
+            all_logits: List of [B, num_target_patches, C, codebook_size] 每个阶段的预测logits
+            all_target_indices: List of [B, num_target_patches, C] 每个阶段的目标索引
+            vq_loss: VQ损失（所有阶段的平均）
+            recon_loss: 重构损失（所有阶段的平均）
         """
-        B, input_len, C = x.shape
-        _, target_len, C_target = target.shape
-        assert C == C_target, "输入和目标序列的通道数必须相同"
+        B, total_len, C = x_full.shape
         
-        # 1. 编码输入序列
-        if self.use_patch_attention:
-            input_indices, vq_loss_input, z_q_input, x_patches_processed = self.encode_to_indices(x, return_processed_patches=True)
+        # 编码完整序列
+        full_indices, vq_loss_full, z_q_full = self.encode_to_indices(
+            x_full, return_processed_patches=False
+        )
+        
+        num_total_patches = full_indices.shape[1]
+        
+        # 计算最大阶段数
+        if max_stages is None:
+            max_stages = (num_total_patches - step_size) // step_size
         else:
-            input_indices, vq_loss_input, z_q_input = self.encode_to_indices(x, return_processed_patches=False)
-            x_patches_processed = None
+            max_stages = min(max_stages, (num_total_patches - step_size) // step_size)
         
-        # 2. 编码目标序列（用于计算损失）
-        target_indices, vq_loss_target, z_q_target = self.encode_to_indices(target, return_processed_patches=False)
+        if max_stages <= 0:
+            raise ValueError(f"序列长度不足：总patches={num_total_patches}, step_size={step_size}, 无法创建任何阶段")
         
-        # VQ损失（输入和目标序列的平均）
-        vq_loss = (vq_loss_input + vq_loss_target) / 2
+        all_logits = []
+        all_target_indices = []
+        all_vq_losses = []
+        all_recon_losses = []
         
-        # 重构损失（仅使用输入序列）
-        # 注意：即使 encoder/decoder 被冻结，如果使用 EMA codebook，codebook 会在训练过程中更新，
-        # 导致量化结果 z_q_input 发生变化，进而影响 recon_loss。这是正常的，因为 codebook 的更新
-        # 会改变量化表示，从而影响重构质量。
-        # 如果希望 recon_loss 保持稳定，可以在预训练时设置 --disable_ema_update 1 来禁用 EMA 更新。
-        num_input_patches = input_indices.shape[1]
-        x_recon = self.decode_from_codes(z_q_input)  # [B, num_input_patches * patch_size, C]
+        # Channel-independent处理: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
+        B, num_patches, C, code_dim = z_q_full.shape
+        z_q_full_flat = z_q_full.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
         
-        if self.use_patch_attention and x_patches_processed is not None:
-            x_processed = x_patches_processed.reshape(B, num_input_patches * self.patch_size, C)
-            recon_loss = F.mse_loss(x_recon, x_processed[:, :x_recon.shape[1], :])
-        else:
-            recon_loss = F.mse_loss(x_recon, x[:, :x_recon.shape[1], :])
+        # 遍历每个阶段
+        for stage in range(1, max_stages + 1):
+            context_size = stage * step_size  # 当前阶段的上下文长度
+            target_start = (stage - 1) * step_size  # 目标序列的起始位置
+            target_end = stage * step_size  # 目标序列的结束位置
+            
+            if target_end > num_patches:
+                break
+            
+            # 提取当前阶段的上下文和目标（直接使用已编码的完整序列）
+            z_q_context = z_q_full_flat[:, :context_size, :]  # [B*C, context_size, code_dim]
+            target_indices_stage = full_indices[:, target_start:target_end, :]  # [B, step_size, C]
+            
+            # 重构损失（仅使用上下文序列）
+            # 从已编码的完整序列中提取上下文部分，避免重复编码
+            z_q_context_for_recon = z_q_full[:, :context_size, :, :]  # [B, context_size, C, code_dim]
+            x_recon_context = self.decode_from_codes(z_q_context_for_recon)
+            
+            # 计算上下文对应的原始序列长度
+            context_len = context_size * self.patch_size
+            x_context = x_full[:, :context_len, :]  # [B, context_len, C]
+            
+            # 重构损失
+            recon_loss_stage = F.mse_loss(
+                x_recon_context, 
+                x_context[:, :x_recon_context.shape[1], :]
+            )
+            
+            # VQ损失（使用完整序列的VQ损失，简化处理）
+            vq_loss_context = vq_loss_full
+            
+            # 创建占位符用于预测目标序列
+            num_target_patches = step_size
+            placeholder = torch.zeros(
+                B * C, num_target_patches, code_dim,
+                device=z_q_context.device, dtype=z_q_context.dtype
+            )
+            
+            # 拼接上下文和占位符
+            full_sequence_stage = torch.cat([z_q_context, placeholder], dim=1)
+            
+            # Transformer处理完整序列
+            h_full_stage = self.transformer(full_sequence_stage)
+            
+            # 只取占位符位置的输出
+            h_target_stage = h_full_stage[:, context_size:, :]
+            
+            # 输出头: 预测目标序列的索引概率分布
+            logits_flat_stage = self.output_head(h_target_stage)  # [B*C, num_target_patches, codebook_size]
+            
+            # Reshape回通道分离格式
+            logits_stage = logits_flat_stage.reshape(B, C, num_target_patches, -1).permute(
+                0, 2, 1, 3
+            )  # [B, num_target_patches, C, codebook_size]
+            
+            all_logits.append(logits_stage)
+            all_target_indices.append(target_indices_stage)
+            all_vq_losses.append(vq_loss_context)
+            all_recon_losses.append(recon_loss_stage)
         
-        # 3. Channel-independent Transformer处理: 批量处理所有通道以加速
-        # z_q_input: [B, num_input_patches, C, code_dim] -> [B*C, num_input_patches, code_dim]
-        B, num_input_patches, C, code_dim = z_q_input.shape
-        z_q_input_flat = z_q_input.permute(0, 2, 1, 3).reshape(B * C, num_input_patches, code_dim)  # [B*C, num_input_patches, code_dim]
+        # 计算平均损失
+        vq_loss = sum(all_vq_losses) / len(all_vq_losses)
+        recon_loss = sum(all_recon_losses) / len(all_recon_losses)
         
-        # 4. 创建占位符用于预测目标序列
-        num_target_patches = target_indices.shape[1]
-        placeholder = torch.zeros(B * C, num_target_patches, code_dim, device=z_q_input_flat.device, dtype=z_q_input_flat.dtype)
-        
-        # 5. 拼接输入序列和占位符: [B*C, num_input_patches + num_target_patches, code_dim]
-        full_sequence = torch.cat([z_q_input_flat, placeholder], dim=1)
-        
-        # 6. Transformer处理完整序列（causal mask确保占位符只能看到输入序列）
-        h_full = self.transformer(full_sequence)  # [B*C, num_input_patches + num_target_patches, code_dim]
-        
-        # 7. 只取占位符位置的输出: [B*C, num_target_patches, code_dim]
-        h_target = h_full[:, num_input_patches:, :]
-        
-        # 8. 输出头: 预测目标序列的索引概率分布
-        logits_flat = self.output_head(h_target)  # [B*C, num_target_patches, codebook_size]
-        
-        # 9. Reshape回通道分离格式: [B*C, num_target_patches, codebook_size] -> [B, num_target_patches, C, codebook_size]
-        logits = logits_flat.reshape(B, C, num_target_patches, -1).permute(0, 2, 1, 3)  # [B, num_target_patches, C, codebook_size]
-        
-        return logits, target_indices, vq_loss, recon_loss
+        return all_logits, all_target_indices, vq_loss, recon_loss
     
     def forward_finetune(self, x, target_len):
         """
@@ -945,11 +921,7 @@ class PatchVQVAETransformer(nn.Module):
     
     @torch.no_grad()
     def get_codebook_usage(self, x):
-        result = self.encode_to_indices(x, return_processed_patches=False)
-        if isinstance(result, tuple) and len(result) == 4:
-            indices, _, _, _ = result
-        else:
-            indices, _, _ = result
+        indices, _, _ = self.encode_to_indices(x)
         # indices: [B, num_patches, C] (channel-independent)
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
@@ -1156,18 +1128,9 @@ def get_model_config(args):
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
     }
     
-    # Patch内时序建模配置（支持TCN、Self-Attention和Cross-Attention）
-    if hasattr(args, 'use_patch_attention'):
-        config['use_patch_attention'] = bool(args.use_patch_attention)
-        config['patch_attention_type'] = getattr(args, 'patch_attention_type', 'tcn')  # 'tcn', 'attention', 或 'cross_attention'
-        config['tcn_num_layers'] = getattr(args, 'tcn_num_layers', 2)
-        config['tcn_kernel_size'] = getattr(args, 'tcn_kernel_size', 3)
-        config['tcn_hidden_dim'] = getattr(args, 'tcn_hidden_dim', None)
+    # Patch attention 已移除
     
-    # Channel Attention配置
-    if hasattr(args, 'use_channel_attention'):
-        config['use_channel_attention'] = bool(args.use_channel_attention)
-        config['channel_attention_dropout'] = getattr(args, 'channel_attention_dropout', 0.1)
+    # Channel Attention 已移除
     
     # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:
     # config['n_channels'] = dls.vars
