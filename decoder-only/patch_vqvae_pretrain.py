@@ -30,8 +30,7 @@ def parse_args():
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
     parser.add_argument('--context_points', type=int, default=512, help='输入序列长度')
-    parser.add_argument('--target_points', type=int, default=96, help='目标序列长度（用于预训练时分割input和target）')
-    parser.add_argument('--progressive_step_size', type=int, default=None, help='渐进式预训练的步长（patches数），如果为None则使用target_points对应的patches数')
+    parser.add_argument('--progressive_step_size', type=int, required=True, help='渐进式预训练的步长（patches数）')
     parser.add_argument('--progressive_max_stages', type=int, default=None, help='渐进式预训练的最大阶段数，如果为None则使用所有可能的阶段')
     parser.add_argument('--batch_size', type=int, default=64, help='批次大小')
     parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
@@ -90,12 +89,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     if trainable_params is None:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    # 计算渐进式预训练的步长（以patches为单位）
-    if args.progressive_step_size is None:
-        # 默认使用target_points对应的patches数
-        step_size = (args.target_points + model.patch_size - 1) // model.patch_size
-    else:
-        step_size = args.progressive_step_size
+    # 渐进式预训练的步长（以patches为单位）
+    step_size = args.progressive_step_size
     
     for batch_x, batch_y in dataloader:
         batch_x = batch_x.to(device)  # [B, input_len, C]
@@ -160,12 +155,8 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_recon_loss = 0
     n_batches = 0
     
-    # 计算渐进式预训练的步长（以patches为单位）
-    if args.progressive_step_size is None:
-        # 默认使用target_points对应的patches数
-        step_size = (args.target_points + model.patch_size - 1) // model.patch_size
-    else:
-        step_size = args.progressive_step_size
+    # 渐进式预训练的步长（以patches为单位）
+    step_size = args.progressive_step_size
     
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
@@ -237,8 +228,10 @@ def main():
     
     # 模型文件名 (code_dim = embedding_dim * patch_size / compression_factor)
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    # 添加 input_size 和 target_size 到模型名称（用于批量训练时区分不同配置）
-    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_tg{args.target_points}_model{args.model_id}'
+    # 渐进式预训练的步长（以patches为单位）
+    step_size = args.progressive_step_size
+    # 添加 input_size 和 step_size 到模型名称（用于批量训练时区分不同配置）
+    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_step{step_size}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset

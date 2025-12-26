@@ -7,8 +7,12 @@
 # 
 # 架构说明:
 # 1. 加载预训练的码本模型（encoder、decoder、VQ，冻结所有参数）
-# 2. 在码本基础上训练Transformer进行NTP预训练
+# 2. 在码本基础上训练Transformer进行渐进式预训练
 # 3. 微调Transformer进行时间序列预测
+# 
+# 使用方法:
+# bash vqvae_transformer_run_all.sh <dataset> <context_points> <progressive_step_size>
+# 例如: bash vqvae_transformer_run_all.sh etth1 512 6
 # =====================================================
 
 # =====================================================
@@ -50,7 +54,7 @@ TRANSFORMER_HIDDEN_DIM=""  # 留空表示使用默认值（code_dim），可根�
 
 # ----- 预训练参数 -----
 PRETRAIN_CONTEXT_POINTS=$2
-PRETRAIN_TARGET_POINTS=$3  # 预训练时target序列的长度
+PROGRESSIVE_STEP_SIZE=$3  # 渐进式预训练的步长（patches数）
 PRETRAIN_EPOCHS=100
 PRETRAIN_BATCH_SIZE=128
 PRETRAIN_LR=3e-4
@@ -114,9 +118,8 @@ echo "找到码本模型: ${CODEBOOK_CHECKPOINT}"
 # =====================================================
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
 # 注意：模型名称格式需要与 patch_vqvae_pretrain.py 中保存的格式一致
-# 格式：patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_tg{args.target_points}{ca_suffix}_model{args.model_id}
-# 由于 vqvae_transformer_run_all.sh 不使用 channel_attention，ca_suffix 为空字符串
-MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_tg${PRETRAIN_TARGET_POINTS}_ca0_model${MODEL_ID}"
+# 格式：patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_step{step_size}_model{args.model_id}
+MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}"
 
 echo "================================================="
 echo "基于预训练码本模型的Transformer训练"
@@ -124,6 +127,7 @@ echo "================================================="
 echo "数据集: ${DSET}"
 echo "码本模型: ${CODEBOOK_CHECKPOINT}"
 echo "模型名称: ${MODEL_NAME}"
+echo "渐进式预训练步长: ${PROGRESSIVE_STEP_SIZE} patches"
 echo "Transformer 输入维度 (code_dim): ${CODE_DIM} (实际值从checkpoint读取)"
 if [ "${FREEZE_VQVAE}" -eq 1 ]; then
     echo "冻结VQVAE: 是（Encoder + Decoder + VQ）"
@@ -145,9 +149,10 @@ echo "================================================="
 # =====================================================
 echo ""
 echo "================================================="
-echo "阶段 1: NTP预训练（冻结码本：Encoder + Decoder + VQ）"
+echo "阶段 1: 渐进式预训练（冻结码本：Encoder + Decoder + VQ）"
 echo "================================================="
 echo "Context Points: ${PRETRAIN_CONTEXT_POINTS}"
+echo "Progressive Step Size: ${PROGRESSIVE_STEP_SIZE} patches"
 echo "Epochs: ${PRETRAIN_EPOCHS}"
 echo "Batch Size: ${PRETRAIN_BATCH_SIZE}"
 echo "================================================="
@@ -156,7 +161,7 @@ echo "================================================="
 PRETRAIN_ARGS=(
     --dset ${DSET}
     --context_points ${PRETRAIN_CONTEXT_POINTS}
-    --target_points ${PRETRAIN_TARGET_POINTS}
+    --progressive_step_size ${PROGRESSIVE_STEP_SIZE}
     --batch_size ${PRETRAIN_BATCH_SIZE}
     --patch_size ${PATCH_SIZE}
     --embedding_dim ${EMBEDDING_DIM}
@@ -220,7 +225,7 @@ PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${
 # 检查预训练模型是否存在
 if [ ! -f "${PRETRAINED_MODEL}" ]; then
     echo "错误: 预训练模型不存在: ${PRETRAINED_MODEL}"
-    echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_tg${PRETRAIN_TARGET_POINTS}_ca0_model${MODEL_ID}.pth"
+    echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}.pth"
     echo "实际 MODEL_NAME: ${MODEL_NAME}"
     echo "检查目录是否存在: $(dirname "${PRETRAINED_MODEL}")"
     if [ -d "$(dirname "${PRETRAINED_MODEL}")" ]; then
