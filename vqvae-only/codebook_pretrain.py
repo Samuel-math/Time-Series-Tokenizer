@@ -59,6 +59,8 @@ def parse_args():
                        help='码本初始化方法（uniform/normal/xavier/kaiming）')
     parser.add_argument('--codebook_report_interval', type=int, default=5,
                        help='码本利用率报告间隔（每N个epoch报告一次）')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='随机数种子（用于训练可复现性，但不影响码本初始化）')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -272,15 +274,37 @@ def validate_epoch(model, dataloader, revin, args, device):
     }
 
 
+def set_seed(seed):
+    """
+    设置随机数种子以确保训练可复现性
+    注意：此种子不影响码本初始化（init_from_data），码本初始化保持随机性
+    
+    Args:
+        seed: 随机数种子
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 确保CUDA操作的确定性（可能影响性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 设置Python的hash随机化（用于字典等）
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"✓ 随机数种子已设置为: {seed}（不影响码本初始化）")
+
+
 def worker_init_fn(worker_id):
     """
-    数据加载器worker的初始化函数（已移除种子设置，允许随机性）
+    数据加载器worker的初始化函数
     
     Args:
         worker_id: worker的ID
     """
-    # 不设置种子，允许随机性
-    pass
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def main():
@@ -297,6 +321,9 @@ def main():
         if hasattr(torch.backends.cuda, 'enable_math_sdp'):
             torch.backends.cuda.enable_math_sdp(True)
         print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容性修复）')
+    
+    # 设置随机数种子（用于训练可复现性，但不影响码本初始化）
+    set_seed(args.seed)
     
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

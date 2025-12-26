@@ -25,8 +25,8 @@ EMA_DECAY=0.99
 EMA_EPS=1e-5
 
 # 码本初始化参数
-VQ_INIT_METHOD="uniform"  # 初始化方法: uniform/normal/xavier/kaiming
 CODEBOOK_REPORT_INTERVAL=5  # 码本利用率报告间隔（每N个epoch报告一次）
+SEED=42  # 随机数种子（用于训练可复现性，但不影响码本初始化）
 
 # 训练参数
 N_EPOCHS=100
@@ -67,8 +67,8 @@ python codebook_pretrain.py \
     --codebook_ema $CODEBOOK_EMA \
     --ema_decay $EMA_DECAY \
     --ema_eps $EMA_EPS \
-    --vq_init_method $VQ_INIT_METHOD \
     --codebook_report_interval $CODEBOOK_REPORT_INTERVAL \
+    --seed $SEED \
     --n_epochs $N_EPOCHS \
     --lr $LR \
     --weight_decay $WEIGHT_DECAY \
