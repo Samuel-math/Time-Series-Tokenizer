@@ -47,20 +47,19 @@ class FlattenedVectorQuantizer(nn.Module):
             # 默认uniform
             self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
     
-    def init_from_data(self, z_samples, method='kmeans', random_state=42):
+    def init_from_data(self, z_samples, method='kmeans'):
         """
         从数据初始化码本（数据驱动初始化）
         
         Args:
             z_samples: [N, code_dim] encoder输出的样本
             method: 'kmeans' 或 'random_sample'
-            random_state: 随机种子
         """
         if method == 'kmeans':
             try:
                 from sklearn.cluster import KMeans
                 z_np = z_samples.detach().cpu().numpy()
-                kmeans = KMeans(n_clusters=self.codebook_size, random_state=random_state, n_init=10, max_iter=300)
+                kmeans = KMeans(n_clusters=self.codebook_size, n_init=10, max_iter=300)
                 kmeans.fit(z_np)
                 centroids = torch.tensor(kmeans.cluster_centers_, dtype=z_samples.dtype, device=z_samples.device)
                 self.embedding.weight.data.copy_(centroids)
@@ -70,14 +69,14 @@ class FlattenedVectorQuantizer(nn.Module):
                 method = 'random_sample'
         
         if method == 'random_sample':
-            # 随机采样N个样本作为码本中心
+            # 随机采样N个样本作为码本中心（不使用种子，允许随机性）
             N = z_samples.size(0)
             if N >= self.codebook_size:
-                perm = torch.randperm(N, generator=torch.Generator().manual_seed(random_state))[:self.codebook_size]
+                perm = torch.randperm(N)[:self.codebook_size]
                 centroids = z_samples[perm]
             else:
                 # 如果样本数不足，使用重复采样
-                indices = torch.randint(0, N, (self.codebook_size,), generator=torch.Generator().manual_seed(random_state))
+                indices = torch.randint(0, N, (self.codebook_size,))
                 centroids = z_samples[indices]
             self.embedding.weight.data.copy_(centroids)
             print(f"✓ 码本已从随机采样初始化 (codebook_size={self.codebook_size}, 样本数={N})")
@@ -149,20 +148,19 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         # 标志：是否禁用EMA更新（当VQ被冻结时）
         self._disable_ema_update = False
     
-    def init_from_data(self, z_samples, method='kmeans', random_state=42):
+    def init_from_data(self, z_samples, method='kmeans'):
         """
         从数据初始化码本（数据驱动初始化）
         
         Args:
             z_samples: [N, code_dim] encoder输出的样本
             method: 'kmeans' 或 'random_sample'
-            random_state: 随机种子
         """
         if method == 'kmeans':
             try:
                 from sklearn.cluster import KMeans
                 z_np = z_samples.detach().cpu().numpy()
-                kmeans = KMeans(n_clusters=self.codebook_size, random_state=random_state, n_init=10, max_iter=300)
+                kmeans = KMeans(n_clusters=self.codebook_size, n_init=10, max_iter=300)
                 kmeans.fit(z_np)
                 centroids = torch.tensor(kmeans.cluster_centers_, dtype=z_samples.dtype, device=z_samples.device)
                 self.embedding.weight.data.copy_(centroids)
@@ -173,14 +171,14 @@ class FlattenedVectorQuantizerEMA(nn.Module):
                 method = 'random_sample'
         
         if method == 'random_sample':
-            # 随机采样N个样本作为码本中心
+            # 随机采样N个样本作为码本中心（不使用种子，允许随机性）
             N = z_samples.size(0)
             if N >= self.codebook_size:
-                perm = torch.randperm(N, generator=torch.Generator().manual_seed(random_state))[:self.codebook_size]
+                perm = torch.randperm(N)[:self.codebook_size]
                 centroids = z_samples[perm]
             else:
                 # 如果样本数不足，使用重复采样
-                indices = torch.randint(0, N, (self.codebook_size,), generator=torch.Generator().manual_seed(random_state))
+                indices = torch.randint(0, N, (self.codebook_size,))
                 centroids = z_samples[indices]
             self.embedding.weight.data.copy_(centroids)
             self.ema_w.data.copy_(centroids)

@@ -59,8 +59,6 @@ def parse_args():
                        help='码本初始化方法（uniform/normal/xavier/kaiming）')
     parser.add_argument('--codebook_report_interval', type=int, default=5,
                        help='码本利用率报告间隔（每N个epoch报告一次）')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='随机数种子（用于可复现性）')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
@@ -274,36 +272,15 @@ def validate_epoch(model, dataloader, revin, args, device):
     }
 
 
-def set_seed(seed):
-    """
-    设置随机数种子以确保可复现性
-    
-    Args:
-        seed: 随机数种子
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # 确保CUDA操作的确定性（可能影响性能）
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # 设置Python的hash随机化（用于字典等）
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"✓ 随机数种子已设置为: {seed}")
-
-
 def worker_init_fn(worker_id):
     """
-    数据加载器worker的初始化函数，确保每个worker的随机性也是可复现的
+    数据加载器worker的初始化函数（已移除种子设置，允许随机性）
     
     Args:
         worker_id: worker的ID
     """
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+    # 不设置种子，允许随机性
+    pass
 
 
 def main():
@@ -320,9 +297,6 @@ def main():
         if hasattr(torch.backends.cuda, 'enable_math_sdp'):
             torch.backends.cuda.enable_math_sdp(True)
         print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容性修复）')
-    
-    # 设置随机数种子
-    set_seed(args.seed)
     
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -350,7 +324,7 @@ def main():
             train_dataset = dls.train.dataset
             train_size = len(train_dataset)
             sample_size = int(train_size * args.train_sample_ratio)
-            # 使用全局随机种子（已在set_seed中设置）确保可复现性
+            # 随机采样
             indices = torch.randperm(train_size)[:sample_size].tolist()
             train_subset = Subset(train_dataset, indices)
             dls.train = DataLoader(
@@ -367,7 +341,7 @@ def main():
             valid_dataset = dls.valid.dataset
             valid_size = len(valid_dataset)
             sample_size = int(valid_size * args.valid_sample_ratio)
-            # 使用全局随机种子（已在set_seed中设置）确保可复现性
+            # 随机采样
             indices = torch.randperm(valid_size)[:sample_size].tolist()
             valid_subset = Subset(valid_dataset, indices)
             dls.valid = DataLoader(
