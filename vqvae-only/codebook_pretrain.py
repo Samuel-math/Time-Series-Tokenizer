@@ -54,9 +54,9 @@ def parse_args():
     parser.add_argument('--ema_eps', type=float, default=1e-5, help='EMA epsilon')
     
     # 码本初始化参数
-    parser.add_argument('--vq_init_method', type=str, default='uniform', 
-                       choices=['uniform', 'normal', 'xavier', 'kaiming'],
-                       help='码本初始化方法（uniform/normal/xavier/kaiming）')
+    parser.add_argument('--vq_init_method', type=str, default='random', 
+                       choices=['random', 'normal', 'xavier', 'kaiming'],
+                       help='码本初始化方法（random/normal/xavier/kaiming），random为完全随机初始化')
     parser.add_argument('--codebook_report_interval', type=int, default=5,
                        help='码本利用率报告间隔（每N个epoch报告一次）')
     parser.add_argument('--seed', type=int, default=42,

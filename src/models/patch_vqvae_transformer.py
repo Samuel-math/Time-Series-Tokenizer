@@ -24,7 +24,7 @@ class FlattenedVectorQuantizer(nn.Module):
     展平的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
     """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, init_method='uniform'):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, init_method='random'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
@@ -35,8 +35,9 @@ class FlattenedVectorQuantizer(nn.Module):
         self.embedding = nn.Embedding(codebook_size, code_dim)
         
         # 初始化方法
-        if init_method == 'uniform':
-            self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        if init_method == 'random':
+            # 完全随机初始化
+            nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0)
         elif init_method == 'normal':
             nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
         elif init_method == 'xavier':
@@ -44,8 +45,8 @@ class FlattenedVectorQuantizer(nn.Module):
         elif init_method == 'kaiming':
             nn.init.kaiming_uniform_(self.embedding.weight)
         else:
-            # 默认uniform
-            self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+            # 默认完全随机
+            nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0)
     
     def init_from_data(self, z_samples, method='kmeans'):
         """
@@ -114,7 +115,7 @@ class FlattenedVectorQuantizerEMA(nn.Module):
     使用 EMA 更新码本的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
     """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, init_method='uniform'):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, init_method='random'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
@@ -124,9 +125,9 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         self.init_method = init_method
         
         # 码本权重与EMA状态
-        if init_method == 'uniform':
+        if init_method == 'random':
+            # 完全随机初始化
             embed = torch.randn(codebook_size, code_dim)
-            embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
         elif init_method == 'normal':
             embed = torch.randn(codebook_size, code_dim) * 0.02
         elif init_method == 'xavier':
@@ -136,8 +137,8 @@ class FlattenedVectorQuantizerEMA(nn.Module):
             embed = torch.empty(codebook_size, code_dim)
             nn.init.kaiming_uniform_(embed)
         else:
+            # 默认完全随机
             embed = torch.randn(codebook_size, code_dim)
-            embed.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
         
         self.embedding = nn.Embedding(codebook_size, code_dim)
         self.embedding.weight.data.copy_(embed)
@@ -597,7 +598,7 @@ class PatchVQVAETransformer(nn.Module):
         # Patch attention 已移除
         
         # VQ (码本维度 = code_dim)
-        vq_init_method = config.get('vq_init_method', 'uniform')
+        vq_init_method = config.get('vq_init_method', 'random')
         if self.use_codebook_ema:
             self.vq = FlattenedVectorQuantizerEMA(
                 self.codebook_size, self.code_dim, self.commitment_cost,

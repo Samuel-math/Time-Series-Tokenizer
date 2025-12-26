@@ -58,7 +58,7 @@ class CodebookModel(nn.Module):
             self.channel_attention = None
         
         # VQ
-        init_method = config.get('vq_init_method', 'uniform')
+        init_method = config.get('vq_init_method', 'random')
         if config.get('codebook_ema', False):
             self.vq = FlattenedVectorQuantizerEMA(
                 self.codebook_size, self.code_dim, self.commitment_cost,
