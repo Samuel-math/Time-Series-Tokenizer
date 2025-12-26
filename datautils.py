@@ -26,6 +26,17 @@ def get_dls(params):
     root_path = _DATASETS_ROOT + '/'
 
     # 通用参数
+    # 如果没有 target_points，使用默认值（基于 context_points 或 progressive_step_size）
+    if not hasattr(params, 'target_points') or params.target_points is None:
+        # 如果有 progressive_step_size，使用它来计算 target_points
+        if hasattr(params, 'progressive_step_size') and params.progressive_step_size is not None:
+            # 假设 patch_size 存在，如果没有则使用默认值
+            patch_size = getattr(params, 'patch_size', 16)
+            params.target_points = params.progressive_step_size * patch_size
+        else:
+            # 默认使用 context_points 的一部分
+            params.target_points = params.context_points // 4
+    
     size = [params.context_points, 0, params.target_points]
     
     # 数据集配置映射
