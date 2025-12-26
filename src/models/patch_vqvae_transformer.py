@@ -765,9 +765,7 @@ class PatchVQVAETransformer(nn.Module):
         B, total_len, C = x_full.shape
         
         # 编码完整序列
-        full_indices, vq_loss_full, z_q_full = self.encode_to_indices(
-            x_full, return_processed_patches=False
-        )
+        full_indices, vq_loss_full, z_q_full = self.encode_to_indices(x_full)
         
         num_total_patches = full_indices.shape[1]
         
