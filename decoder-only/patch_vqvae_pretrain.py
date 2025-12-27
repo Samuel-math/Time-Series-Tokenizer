@@ -72,6 +72,7 @@ def parse_args():
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
+    parser.add_argument('--run_id', type=int, default=None, help='运行ID（用于多次运行同一参数组合）')
     
     return parser.parse_args()
 
@@ -231,7 +232,11 @@ def main():
     # 渐进式预训练的步长（以patches为单位）
     step_size = args.progressive_step_size
     # 添加 input_size 和 step_size 到模型名称（用于批量训练时区分不同配置）
-    model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_step{step_size}_model{args.model_id}'
+    # 如果提供了 run_id，则添加到模型名称中
+    if args.run_id is not None:
+        model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_step{step_size}_run{args.run_id}_model{args.model_id}'
+    else:
+        model_name = f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_l{args.n_layers}_in{args.context_points}_step{step_size}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset

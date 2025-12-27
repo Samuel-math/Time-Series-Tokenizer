@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
+    parser.add_argument('--run_id', type=int, default=None, help='运行ID（用于多次运行同一参数组合）')
     
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
@@ -287,7 +288,20 @@ def main():
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
     
     # 模型文件名
-    model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
+    # 如果提供了 run_id，则使用它；否则尝试从预训练模型路径中提取
+    run_id = args.run_id
+    if run_id is None:
+        # 尝试从预训练模型路径中提取 run_id
+        import re
+        pretrained_model_name = Path(args.pretrained_model).stem
+        match = re.search(r'_run(\d+)_', pretrained_model_name)
+        if match:
+            run_id = int(match.group(1))
+    
+    if run_id is not None:
+        model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_run{run_id}_model{args.model_id}'
+    else:
+        model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
     
     # 优化器和调度器
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
