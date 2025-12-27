@@ -67,9 +67,6 @@ PROGRESSIVE_STEP_SIZE_LIST=(6 3 1 9 12 15 18)
 # 微调时的 target_points 列表（对每个预训练模型都会运行这些微调）
 TARGET_POINTS_LIST=(96 192 336 720)
 
-# 每个参数组合的重复运行次数
-NUM_RUNS=3
-
 # ----- 预训练参数 -----
 PRETRAIN_EPOCHS=100
 PRETRAIN_BATCH_SIZE=64
@@ -106,9 +103,8 @@ echo "Progressive Step Size列表: ${PROGRESSIVE_STEP_SIZE_LIST[@]}"
 echo "Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
 echo "微调固定 Context Points: ${FINETUNE_CONTEXT_POINTS}"
 echo "微调目标长度数: ${#TARGET_POINTS_LIST[@]}"
-echo "每个参数组合重复运行次数: ${NUM_RUNS}"
-echo "每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * NUM_RUNS * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * NUM_RUNS * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo "================================================="
 
 # =====================================================
@@ -288,139 +284,137 @@ for DSET in "${DATASETS[@]}"; do
             echo ""
             echo "================================================="
             echo "任务 ${CURRENT_TASK}/${TOTAL_TASKS}: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
-            echo "将重复运行 ${NUM_RUNS} 次"
             echo "================================================="
             
-            # =====================================================
-            # 重复运行循环（对每个参数组合运行NUM_RUNS次）
-            # =====================================================
-            for RUN_ID in $(seq 1 ${NUM_RUNS}); do
-                echo ""
-                echo "-------------------------------------------------"
-                echo "运行 ${RUN_ID}/${NUM_RUNS}: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
-                echo "-------------------------------------------------"
-                
-                # 构建模型名称（包含 context_points、step_size 和 run_id）
-                MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_run${RUN_ID}_model${MODEL_ID}"
+            # 构建模型名称（包含 context_points 和 step_size）
+            MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}"
             
-                # =====================================================
-                # 阶段 1: 预训练
-                # =====================================================
-                echo ""
-                echo "  阶段 1: 预训练 (运行 ${RUN_ID}/${NUM_RUNS})"
-                echo "  Context Points: ${PRETRAIN_CONTEXT_POINTS}"
-                echo "  Progressive Step Size: ${PROGRESSIVE_STEP_SIZE}"
-                echo "  Epochs: ${PRETRAIN_EPOCHS}"
-                echo "  Batch Size: ${PRETRAIN_BATCH_SIZE}"
-                echo ""
-                
-                # 构建预训练命令参数
-                PRETRAIN_ARGS=(
-                    --dset ${DSET}
-                    --context_points ${PRETRAIN_CONTEXT_POINTS}
-                    --progressive_step_size ${PROGRESSIVE_STEP_SIZE}
-                    --batch_size ${PRETRAIN_BATCH_SIZE}
-                    --patch_size ${PATCH_SIZE}
-                    --embedding_dim ${EMBEDDING_DIM}
-                    --compression_factor ${COMPRESSION_FACTOR}
-                    --codebook_size ${CODEBOOK_SIZE}
-                    --n_layers ${N_LAYERS}
-                    --n_heads ${N_HEADS}
-                    --d_ff ${D_FF}
-                    --dropout ${DROPOUT}
-                    --num_hiddens ${NUM_HIDDENS}
-                    --num_residual_layers ${NUM_RESIDUAL_LAYERS}
-                    --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS}
-                    --commitment_cost ${COMMITMENT_COST}
-                    --codebook_ema ${CODEBOOK_EMA}
-                    --ema_decay ${EMA_DECAY}
-                    --ema_eps ${EMA_EPS}
-                    --n_epochs ${PRETRAIN_EPOCHS}
-                    --lr ${PRETRAIN_LR}
-                    --weight_decay ${WEIGHT_DECAY}
-                    --revin ${REVIN}
-                    --vq_weight ${VQ_WEIGHT}
-                    --recon_weight ${RECON_WEIGHT}
-                    --model_id ${MODEL_ID}
-                    --run_id ${RUN_ID}
+            # =====================================================
+            # 阶段 1: 预训练
+            # =====================================================
+            echo ""
+            echo "-------------------------------------------------"
+            echo "阶段 1: 预训练"
+            echo "-------------------------------------------------"
+            echo "Context Points: ${PRETRAIN_CONTEXT_POINTS}"
+            echo "Progressive Step Size: ${PROGRESSIVE_STEP_SIZE}"
+            echo "Epochs: ${PRETRAIN_EPOCHS}"
+            echo "Batch Size: ${PRETRAIN_BATCH_SIZE}"
+            echo "-------------------------------------------------"
+            
+            # 构建预训练命令参数
+            PRETRAIN_ARGS=(
+                --dset ${DSET}
+                --context_points ${PRETRAIN_CONTEXT_POINTS}
+                --progressive_step_size ${PROGRESSIVE_STEP_SIZE}
+                --batch_size ${PRETRAIN_BATCH_SIZE}
+                --patch_size ${PATCH_SIZE}
+                --embedding_dim ${EMBEDDING_DIM}
+                --compression_factor ${COMPRESSION_FACTOR}
+                --codebook_size ${CODEBOOK_SIZE}
+                --n_layers ${N_LAYERS}
+                --n_heads ${N_HEADS}
+                --d_ff ${D_FF}
+                --dropout ${DROPOUT}
+                --num_hiddens ${NUM_HIDDENS}
+                --num_residual_layers ${NUM_RESIDUAL_LAYERS}
+                --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS}
+                --commitment_cost ${COMMITMENT_COST}
+                --codebook_ema ${CODEBOOK_EMA}
+                --ema_decay ${EMA_DECAY}
+                --ema_eps ${EMA_EPS}
+                --n_epochs ${PRETRAIN_EPOCHS}
+                --lr ${PRETRAIN_LR}
+                --weight_decay ${WEIGHT_DECAY}
+                --revin ${REVIN}
+                --vq_weight ${VQ_WEIGHT}
+                --recon_weight ${RECON_WEIGHT}
+                --model_id ${MODEL_ID}
+            )
+            
+            # 如果指定了VQVAE checkpoint，添加相关参数
+            if [ -n "${DSET_VQVAE_CHECKPOINT}" ]; then
+                PRETRAIN_ARGS+=(
+                    --vqvae_checkpoint "${DSET_VQVAE_CHECKPOINT}"
+                    --freeze_vqvae ${FREEZE_VQVAE}
+                    --load_vq_weights ${LOAD_VQ_WEIGHTS}
                 )
-                
-                # 如果指定了VQVAE checkpoint，添加相关参数
-                if [ -n "${DSET_VQVAE_CHECKPOINT}" ]; then
-                    PRETRAIN_ARGS+=(
-                        --vqvae_checkpoint "${DSET_VQVAE_CHECKPOINT}"
-                        --freeze_vqvae ${FREEZE_VQVAE}
-                        --load_vq_weights ${LOAD_VQ_WEIGHTS}
-                    )
-                fi
-                
-                # 运行预训练
-                python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
-                
-                PRETRAIN_EXIT_CODE=$?
-                if [ ${PRETRAIN_EXIT_CODE} -ne 0 ]; then
-                    echo "    错误: 预训练失败 (运行 ${RUN_ID}/${NUM_RUNS}, Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS})"
-                    echo "    跳过该运行的微调任务"
-                    continue
-                fi
+            fi
             
-                # =====================================================
-                # 阶段 2: 微调（多个预测长度）
-                # =====================================================
-                PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
-                
-                # 处理相对路径
-                if [[ ! "${PRETRAINED_MODEL}" = /* ]]; then
-                    SCRIPT_DIR_PRETRAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-                    PRETRAINED_MODEL="${SCRIPT_DIR_PRETRAIN}/${PRETRAINED_MODEL}"
+            # 运行预训练
+            python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
+            
+            if [ $? -ne 0 ]; then
+                echo "错误: 预训练失败 (Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS})"
+                echo "跳过该组合的微调任务"
+                continue
+            fi
+            
+            # =====================================================
+            # 阶段 2: 微调（多个预测长度）
+            # =====================================================
+            PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
+            
+            echo "调试: MODEL_NAME = ${MODEL_NAME}"
+            echo "调试: 构建的PRETRAINED_MODEL = ${PRETRAINED_MODEL}"
+            
+            # 处理相对路径
+            if [[ ! "${PRETRAINED_MODEL}" = /* ]]; then
+                SCRIPT_DIR_PRETRAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+                PRETRAINED_MODEL="${SCRIPT_DIR_PRETRAIN}/${PRETRAINED_MODEL}"
+                echo "调试: 转换为绝对路径后 = ${PRETRAINED_MODEL}"
+            fi
+            
+            # 规范化路径
+            PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${PRETRAINED_MODEL}" 2>/dev/null || echo "${PRETRAINED_MODEL}")
+            echo "调试: 规范化后的路径 = ${PRETRAINED_MODEL}"
+            
+            # 检查预训练模型是否存在
+            if [ ! -f "${PRETRAINED_MODEL}" ]; then
+                echo "警告: 预训练模型不存在: ${PRETRAINED_MODEL}"
+                echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}.pth"
+                echo "实际 MODEL_NAME: ${MODEL_NAME}"
+                echo "检查目录是否存在: $(dirname "${PRETRAINED_MODEL}")"
+                if [ -d "$(dirname "${PRETRAINED_MODEL}")" ]; then
+                    echo "目录中的文件列表:"
+                    ls -la "$(dirname "${PRETRAINED_MODEL}")" | head -20 || echo "无法列出目录内容"
                 fi
+                echo "跳过微调任务"
+                continue
+            fi
+            
+            echo ""
+            echo "-------------------------------------------------"
+            echo "阶段 2: 微调"
+            echo "-------------------------------------------------"
+            echo "预训练模型: ${PRETRAINED_MODEL}"
+            echo "Context Points: ${FINETUNE_CONTEXT_POINTS} (固定)"
+            echo "Target Points: ${TARGET_POINTS_LIST[@]}"
+            echo "-------------------------------------------------"
+            
+            for FINETUNE_TARGET in ${TARGET_POINTS_LIST[@]}; do
+                echo ""
+                echo "  └─ 微调: Target Points = ${FINETUNE_TARGET}"
                 
-                # 规范化路径
-                PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${PRETRAINED_MODEL}" 2>/dev/null || echo "${PRETRAINED_MODEL}")
+                python patch_vqvae_finetune.py \
+                    --dset ${DSET} \
+                    --context_points ${FINETUNE_CONTEXT_POINTS} \
+                    --target_points ${FINETUNE_TARGET} \
+                    --batch_size ${FINETUNE_BATCH_SIZE} \
+                    --pretrained_model "${PRETRAINED_MODEL}" \
+                    --n_epochs ${FINETUNE_EPOCHS} \
+                    --lr ${FINETUNE_LR} \
+                    --weight_decay ${WEIGHT_DECAY} \
+                    --revin ${REVIN} \
+                    --model_id ${MODEL_ID}
                 
-                # 检查预训练模型是否存在
-                if [ ! -f "${PRETRAINED_MODEL}" ]; then
-                    echo "    警告: 预训练模型不存在: ${PRETRAINED_MODEL}"
-                    echo "    期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_run${RUN_ID}_model${MODEL_ID}.pth"
-                    echo "    实际 MODEL_NAME: ${MODEL_NAME}"
-                    echo "    跳过该运行的微调任务"
-                    continue
+                if [ $? -ne 0 ]; then
+                    echo "    警告: 微调失败 (Target=${FINETUNE_TARGET})"
                 fi
-                
-                echo ""
-                echo "  阶段 2: 微调 (运行 ${RUN_ID}/${NUM_RUNS})"
-                echo "  预训练模型: ${PRETRAINED_MODEL}"
-                echo "  Context Points: ${FINETUNE_CONTEXT_POINTS} (固定)"
-                echo "  Target Points: ${TARGET_POINTS_LIST[@]}"
-                echo ""
-                
-                for FINETUNE_TARGET in ${TARGET_POINTS_LIST[@]}; do
-                    echo "    └─ 微调: Target Points = ${FINETUNE_TARGET} (运行 ${RUN_ID}/${NUM_RUNS})"
-                    
-                    python patch_vqvae_finetune.py \
-                        --dset ${DSET} \
-                        --context_points ${FINETUNE_CONTEXT_POINTS} \
-                        --target_points ${FINETUNE_TARGET} \
-                        --batch_size ${FINETUNE_BATCH_SIZE} \
-                        --pretrained_model "${PRETRAINED_MODEL}" \
-                        --n_epochs ${FINETUNE_EPOCHS} \
-                        --lr ${FINETUNE_LR} \
-                        --weight_decay ${WEIGHT_DECAY} \
-                        --revin ${REVIN} \
-                        --model_id ${MODEL_ID} \
-                        --run_id ${RUN_ID}
-                    
-                    if [ $? -ne 0 ]; then
-                        echo "      警告: 微调失败 (运行 ${RUN_ID}/${NUM_RUNS}, Target=${FINETUNE_TARGET})"
-                    fi
-                done
-                
-                echo ""
-                echo "  ✓ 完成运行 ${RUN_ID}/${NUM_RUNS}: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
             done
             
             echo ""
-            echo "✓ 完成所有运行: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
+            echo "✓ 完成: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
         done
     
     echo ""
@@ -451,11 +445,10 @@ echo "训练统计:"
 echo "  数据集数量: ${TOTAL_DATASETS}"
 echo "  Channel Attention设置数: ${#CHANNEL_ATTENTION_LIST[@]}"
 echo "  Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
-echo "  每个参数组合重复运行次数: ${NUM_RUNS}"
 echo "  每个Progressive Step Size的微调任务数: ${#TARGET_POINTS_LIST[@]}"
-echo "  每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * NUM_RUNS * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "  每个数据集的总任务数: $(( ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * NUM_RUNS * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * NUM_RUNS * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  每个数据集的总任务数: $(( ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo ""
 echo "结果保存位置:"
 for DSET in "${DATASETS[@]}"; do
