@@ -2,7 +2,8 @@
 
 # =====================================================
 # Patch VQVAE Transformer 批量训练脚本
-# 批量运行多个 input_size 和 target_size 组合的预训练和微调
+# 批量运行多个 progressive_step_size 的预训练和微调
+# PRETRAIN_CONTEXT_POINTS = 12 * PROGRESSIVE_STEP_SIZE * PATCH_SIZE
 # =====================================================
 
 # 输出日志文件
@@ -60,73 +61,8 @@ CHANNEL_ATTENTION_LIST=(0)
 CHANNEL_ATTENTION_DROPOUT=0.1
 
 # ----- 批量训练配置 -----
-# 定义多个 input_size (context_points) 和 target_size (target_points) 组合
-# 格式: "input_size:target_size"
-# 预训练时使用这些组合，微调时使用 TARGET_POINTS_LIST
-INPUT_TARGET_PAIRS=(
-    # 96 作为 input_size
-    "96:96"
-    "96:128"
-    "96:256"
-    "96:336"
-    "96:512"
-    "96:720"
-    "96:1024"
-    
-    # 128 作为 input_size
-    "128:96"
-    "128:128"
-    "128:256"
-    "128:336"
-    "128:512"
-    "128:720"
-    "128:1024"
-    
-    # 256 作为 input_size
-    "256:96"
-    "256:128"
-    "256:256"
-    "256:336"
-    "256:512"
-    "256:720"
-    "256:1024"
-    
-    # 336 作为 input_size
-    "336:96"
-    "336:128"
-    "336:256"
-    "336:336"
-    "336:512"
-    "336:720"
-    "336:1024"
-    
-    # 512 作为 input_size
-    "512:96"
-    "512:128"
-    "512:256"
-    "512:336"
-    "512:512"
-    "512:720"
-    "512:1024"
-    
-    # 720 作为 input_size
-    "720:96"
-    "720:128"
-    "720:256"
-    "720:336"
-    "720:512"
-    "720:720"
-    "720:1024"
-    
-    # 1024 作为 input_size
-    "1024:96"
-    "1024:128"
-    "1024:256"
-    "1024:336"
-    "1024:512"
-    "1024:720"
-    "1024:1024"
-)
+# 渐进式预训练的步长列表（patches数）
+PROGRESSIVE_STEP_SIZE_LIST=(1 3 6 9 12 15 18)
 
 # 微调时的 target_points 列表（对每个预训练模型都会运行这些微调）
 TARGET_POINTS_LIST=(96 192 336 720)
@@ -163,11 +99,12 @@ echo "数据集数量: ${#DATASETS[@]}"
 echo "模型ID: ${MODEL_ID}"
 echo "Code Dim: ${CODE_DIM}"
 echo "Channel Attention设置: ${CHANNEL_ATTENTION_LIST[@]}"
-echo "输入-目标组合数: ${#INPUT_TARGET_PAIRS[@]}"
+echo "Progressive Step Size列表: ${PROGRESSIVE_STEP_SIZE_LIST[@]}"
+echo "Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
 echo "微调固定 Context Points: ${FINETUNE_CONTEXT_POINTS}"
 echo "微调目标长度数: ${#TARGET_POINTS_LIST[@]}"
-echo "每个数据集每个CA设置的任务数: $(( ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo "================================================="
 
 # =====================================================
@@ -335,26 +272,22 @@ for DSET in "${DATASETS[@]}"; do
         # 批量训练循环（针对当前数据集和CA设置）
         # =====================================================
         
-        TOTAL_TASKS=${#INPUT_TARGET_PAIRS[@]}
+        TOTAL_TASKS=${#PROGRESSIVE_STEP_SIZE_LIST[@]}
         CURRENT_TASK=0
         
-        for PAIR in "${INPUT_TARGET_PAIRS[@]}"; do
+        for PROGRESSIVE_STEP_SIZE in "${PROGRESSIVE_STEP_SIZE_LIST[@]}"; do
             CURRENT_TASK=$((CURRENT_TASK + 1))
             
-            # 解析 input_size 和 target_size
-            IFS=':' read -r INPUT_SIZE TARGET_SIZE <<< "${PAIR}"
+            # 计算预训练的 context_points: 12 * PROGRESSIVE_STEP_SIZE * patch_size
+            PRETRAIN_CONTEXT_POINTS=$((12 * PROGRESSIVE_STEP_SIZE * PATCH_SIZE))
             
             echo ""
             echo "================================================="
-            echo "任务 ${CURRENT_TASK}/${TOTAL_TASKS}: Input=${INPUT_SIZE}, Target=${TARGET_SIZE}"
+            echo "任务 ${CURRENT_TASK}/${TOTAL_TASKS}: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
             echo "================================================="
             
-            # 构建模型名称（包含 input_size、target_size 和 channel_attention）
-            CA_SUFFIX="_ca1"
-            if [ "${USE_CHANNEL_ATTENTION}" -eq 0 ]; then
-                CA_SUFFIX="_ca0"
-            fi
-            MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${INPUT_SIZE}_tg${TARGET_SIZE}${CA_SUFFIX}_model${MODEL_ID}"
+            # 构建模型名称（包含 context_points 和 step_size）
+            MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}"
             
             # =====================================================
             # 阶段 1: 预训练
@@ -363,8 +296,8 @@ for DSET in "${DATASETS[@]}"; do
             echo "-------------------------------------------------"
             echo "阶段 1: 预训练"
             echo "-------------------------------------------------"
-            echo "Context Points: ${INPUT_SIZE}"
-            echo "Target Points: ${TARGET_SIZE}"
+            echo "Context Points: ${PRETRAIN_CONTEXT_POINTS}"
+            echo "Progressive Step Size: ${PROGRESSIVE_STEP_SIZE}"
             echo "Epochs: ${PRETRAIN_EPOCHS}"
             echo "Batch Size: ${PRETRAIN_BATCH_SIZE}"
             echo "-------------------------------------------------"
@@ -372,8 +305,8 @@ for DSET in "${DATASETS[@]}"; do
             # 构建预训练命令参数
             PRETRAIN_ARGS=(
                 --dset ${DSET}
-                --context_points ${INPUT_SIZE}
-                --target_points ${TARGET_SIZE}
+                --context_points ${PRETRAIN_CONTEXT_POINTS}
+                --progressive_step_size ${PROGRESSIVE_STEP_SIZE}
                 --batch_size ${PRETRAIN_BATCH_SIZE}
                 --patch_size ${PATCH_SIZE}
                 --embedding_dim ${EMBEDDING_DIM}
@@ -390,8 +323,6 @@ for DSET in "${DATASETS[@]}"; do
                 --codebook_ema ${CODEBOOK_EMA}
                 --ema_decay ${EMA_DECAY}
                 --ema_eps ${EMA_EPS}
-                --use_channel_attention ${USE_CHANNEL_ATTENTION}
-                --channel_attention_dropout ${CHANNEL_ATTENTION_DROPOUT}
                 --n_epochs ${PRETRAIN_EPOCHS}
                 --lr ${PRETRAIN_LR}
                 --weight_decay ${WEIGHT_DECAY}
@@ -414,7 +345,7 @@ for DSET in "${DATASETS[@]}"; do
             python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
             
             if [ $? -ne 0 ]; then
-                echo "错误: 预训练失败 (Input=${INPUT_SIZE}, Target=${TARGET_SIZE})"
+                echo "错误: 预训练失败 (Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS})"
                 echo "跳过该组合的微调任务"
                 continue
             fi
@@ -441,7 +372,7 @@ for DSET in "${DATASETS[@]}"; do
             # 检查预训练模型是否存在
             if [ ! -f "${PRETRAINED_MODEL}" ]; then
                 echo "警告: 预训练模型不存在: ${PRETRAINED_MODEL}"
-                echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${INPUT_SIZE}_tg${TARGET_SIZE}${CA_SUFFIX}_model${MODEL_ID}.pth"
+                echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}.pth"
                 echo "实际 MODEL_NAME: ${MODEL_NAME}"
                 echo "检查目录是否存在: $(dirname "${PRETRAINED_MODEL}")"
                 if [ -d "$(dirname "${PRETRAINED_MODEL}")" ]; then
@@ -483,7 +414,7 @@ for DSET in "${DATASETS[@]}"; do
             done
             
             echo ""
-            echo "✓ 完成: Input=${INPUT_SIZE}, Target=${TARGET_SIZE}"
+            echo "✓ 完成: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
         done
     
     echo ""
@@ -513,11 +444,11 @@ echo ""
 echo "训练统计:"
 echo "  数据集数量: ${TOTAL_DATASETS}"
 echo "  Channel Attention设置数: ${#CHANNEL_ATTENTION_LIST[@]}"
-echo "  每个数据集的组合数: ${#INPUT_TARGET_PAIRS[@]}"
-echo "  每个组合的微调任务数: ${#TARGET_POINTS_LIST[@]}"
-echo "  每个数据集每个CA设置的任务数: $(( ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "  每个数据集的总任务数: $(( ${#CHANNEL_ATTENTION_LIST[@]} * ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#INPUT_TARGET_PAIRS[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
+echo "  每个Progressive Step Size的微调任务数: ${#TARGET_POINTS_LIST[@]}"
+echo "  每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  每个数据集的总任务数: $(( ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo ""
 echo "结果保存位置:"
 for DSET in "${DATASETS[@]}"; do
