@@ -1,7 +1,6 @@
 #!/bin/bash
 # TF-C VQVAE 预训练脚本
 # 使用时频一致性对比学习增强码本的语义表达能力
-# 包含熵正则化损失提高码本利用率
 
 # 设置默认参数
 DATASET=${1:-"ettm1"}
@@ -9,7 +8,6 @@ PATCH_SIZE=${2:-16}
 CODEBOOK_SIZE=${3:-256}
 TEMPERATURE=${4:-0.07}
 GAMMA=${5:-0.5}
-ENTROPY_WEIGHT=${6:-0.1}
 
 echo "=============================================="
 echo "TF-C VQVAE 预训练"
@@ -17,9 +15,8 @@ echo "=============================================="
 echo "数据集: $DATASET"
 echo "Patch大小: $PATCH_SIZE"
 echo "码本大小: $CODEBOOK_SIZE"
-echo "对比损失温度系数: $TEMPERATURE"
+echo "温度系数: $TEMPERATURE"
 echo "对比损失权重 (γ): $GAMMA"
-echo "熵正则化权重: $ENTROPY_WEIGHT"
 echo "=============================================="
 
 python tfc_vqvae_pretrain.py \
@@ -49,8 +46,6 @@ python tfc_vqvae_pretrain.py \
     --alpha 1.0 \
     --beta 1.0 \
     --gamma $GAMMA \
-    --entropy_weight $ENTROPY_WEIGHT \
-    --entropy_temperature 1.0 \
     --n_epochs 100 \
     --lr 1e-4 \
     --weight_decay 1e-4 \

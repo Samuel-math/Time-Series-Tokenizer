@@ -244,23 +244,15 @@ class TFCPatchVQVAE(nn.Module):
         
         # ============ 共享VQ码本 ============
         vq_init_method = config.get('vq_init_method', 'random')
-        # 熵正则化参数
-        self.entropy_weight = config.get('entropy_weight', 0.1)
-        self.entropy_temperature = config.get('entropy_temperature', 1.0)
-        
         if self.use_codebook_ema:
             self.vq = FlattenedVectorQuantizerEMA(
                 self.codebook_size, self.code_dim, self.commitment_cost,
                 decay=self.ema_decay, eps=self.ema_eps,
-                entropy_weight=self.entropy_weight,
-                entropy_temperature=self.entropy_temperature,
                 init_method=vq_init_method
             )
         else:
             self.vq = FlattenedVectorQuantizer(
                 self.codebook_size, self.code_dim, self.commitment_cost,
-                entropy_weight=self.entropy_weight,
-                entropy_temperature=self.entropy_temperature,
                 init_method=vq_init_method
             )
         
@@ -775,10 +767,6 @@ def get_tfc_model_config(args):
         
         # VQ初始化方法
         'vq_init_method': getattr(args, 'vq_init_method', 'random'),
-        
-        # 熵正则化参数（码本利用率损失）
-        'entropy_weight': getattr(args, 'entropy_weight', 0.1),
-        'entropy_temperature': getattr(args, 'entropy_temperature', 1.0),
     }
     
     return config

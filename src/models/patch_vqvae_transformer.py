@@ -19,45 +19,16 @@ from .vqvae import Encoder, Decoder
 from .channel_attention import ChannelAttention
 
 
-def compute_entropy(probs, eps=1e-8):
-    """
-    计算离散分布的熵
-    
-    Args:
-        probs: [N, K] 概率分布，每行是一个概率分布
-        eps: 数值稳定性的小常数
-    
-    Returns:
-        entropy: [N] 每个分布的熵
-    """
-    # H(p) = -sum(p * log(p))
-    # 加入eps防止log(0)
-    log_probs = torch.log(probs + eps)
-    entropy = -torch.sum(probs * log_probs, dim=-1)
-    return entropy
-
-
 class FlattenedVectorQuantizer(nn.Module):
     """
-    展平的 Vector Quantizer (带熵正则化)
+    展平的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
-    
-    损失函数：
-    L_vq = ||z - sg(e)||^2 + λ_commit * ||sg(z) - e||^2 
-           + λ_entropy * (E[H(q)] - H(E[q]))
-    
-    其中：
-    - E[H(q)]: 平均样本熵（最小化使分配更确定）
-    - H(E[q]): 平均分布熵（最大化使码本均匀使用）
     """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, 
-                 entropy_weight=0.1, entropy_temperature=1.0, init_method='random'):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, init_method='random'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
-        self.entropy_weight = entropy_weight  # λ_entropy
-        self.entropy_temperature = entropy_temperature  # softmax温度
         self.init_method = init_method
         
         # 码本: [codebook_size, code_dim]
@@ -111,130 +82,29 @@ class FlattenedVectorQuantizer(nn.Module):
             self.embedding.weight.data.copy_(centroids)
             print(f"✓ 码本已从随机采样初始化 (codebook_size={self.codebook_size}, 样本数={N})")
     
-    def compute_soft_assignment(self, distances):
-        """
-        计算软分配分布 q(z, Z) = softmax(-dist / temperature)
-        
-        Args:
-            distances: [N, codebook_size] 距离矩阵
-        
-        Returns:
-            q: [N, codebook_size] 软分配概率
-        """
-        # 使用负距离计算softmax（距离越小，概率越高）
-        logits = -distances / self.entropy_temperature
-        q = F.softmax(logits, dim=-1)
-        return q
-    
-    def compute_entropy_loss(self, q, eps=1e-8):
-        """
-        计算熵正则化损失
-        
-        Args:
-            q: [N, codebook_size] 软分配概率分布
-        
-        Returns:
-            entropy_loss: scalar
-            avg_sample_entropy: scalar (用于监控)
-            global_entropy: scalar (用于监控)
-        """
-        # 项 A: E[H(q)] - 平均样本熵
-        # 每个样本的熵
-        sample_entropies = compute_entropy(q, eps)  # [N]
-        avg_sample_entropy = sample_entropies.mean()  # scalar
-        
-        # 项 B: H(E[q]) - 全局分布熵
-        # 先计算batch内的平均分布
-        avg_q = q.mean(dim=0, keepdim=True)  # [1, codebook_size]
-        global_entropy = compute_entropy(avg_q, eps).squeeze()  # scalar
-        
-        # 熵损失 = E[H(q)] - H(E[q])
-        # 最小化E[H(q)]使分配更确定，最大化H(E[q])使码本均匀使用
-        entropy_loss = avg_sample_entropy - global_entropy
-        
-        return entropy_loss, avg_sample_entropy, global_entropy
-    
     def forward(self, z_flat):
         """
         Args:
             z_flat: [N, code_dim]
         Returns:
             loss, quantized, indices
-            (可选) 额外返回 entropy_info 用于监控
         """
-        # 计算距离: [N, codebook_size]
         distances = (
             torch.sum(z_flat ** 2, dim=1, keepdim=True) +
             torch.sum(self.embedding.weight ** 2, dim=1) -
             2 * torch.matmul(z_flat, self.embedding.weight.t())
         )
         
-        # 硬分配（用于量化）
         indices = torch.argmin(distances, dim=1)
         quantized = self.embedding(indices)
         
-        # 传统VQ损失
-        e_latent_loss = F.mse_loss(quantized.detach(), z_flat)  # commitment loss
-        q_latent_loss = F.mse_loss(quantized, z_flat.detach())  # quantization loss
-        vq_loss = q_latent_loss + self.commitment_cost * e_latent_loss
+        e_latent_loss = F.mse_loss(quantized.detach(), z_flat)
+        q_latent_loss = F.mse_loss(quantized, z_flat.detach())
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
-        # 熵正则化损失
-        if self.entropy_weight > 0:
-            # 计算软分配
-            q = self.compute_soft_assignment(distances)
-            entropy_loss, avg_sample_entropy, global_entropy = self.compute_entropy_loss(q)
-            
-            # 总损失
-            loss = vq_loss + self.entropy_weight * entropy_loss
-        else:
-            loss = vq_loss
-        
-        # Straight-through estimator
         quantized = z_flat + (quantized - z_flat).detach()
         
         return loss, quantized, indices
-    
-    def forward_with_entropy_info(self, z_flat):
-        """
-        带熵信息的前向传播（用于监控和调试）
-        
-        Returns:
-            loss, quantized, indices, entropy_info
-        """
-        # 计算距离
-        distances = (
-            torch.sum(z_flat ** 2, dim=1, keepdim=True) +
-            torch.sum(self.embedding.weight ** 2, dim=1) -
-            2 * torch.matmul(z_flat, self.embedding.weight.t())
-        )
-        
-        indices = torch.argmin(distances, dim=1)
-        quantized = self.embedding(indices)
-        
-        # 传统VQ损失
-        e_latent_loss = F.mse_loss(quantized.detach(), z_flat)
-        q_latent_loss = F.mse_loss(quantized, z_flat.detach())
-        vq_loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        
-        # 计算软分配和熵
-        q = self.compute_soft_assignment(distances)
-        entropy_loss, avg_sample_entropy, global_entropy = self.compute_entropy_loss(q)
-        
-        # 总损失
-        loss = vq_loss + self.entropy_weight * entropy_loss
-        
-        # Straight-through estimator
-        quantized = z_flat + (quantized - z_flat).detach()
-        
-        entropy_info = {
-            'vq_loss': vq_loss.item(),
-            'entropy_loss': entropy_loss.item(),
-            'avg_sample_entropy': avg_sample_entropy.item(),
-            'global_entropy': global_entropy.item(),
-            'soft_assignment': q.detach(),
-        }
-        
-        return loss, quantized, indices, entropy_info
     
     def get_embedding(self, indices):
         return self.embedding(indices)
@@ -242,24 +112,16 @@ class FlattenedVectorQuantizer(nn.Module):
 
 class FlattenedVectorQuantizerEMA(nn.Module):
     """
-    使用 EMA 更新码本的 Vector Quantizer (带熵正则化)
+    使用 EMA 更新码本的 Vector Quantizer
     码本维度 = embedding_dim * compressed_len
-    
-    损失函数：
-    L_vq = λ_commit * ||sg(z) - e||^2 + λ_entropy * (E[H(q)] - H(E[q]))
-    
-    注意：EMA版本没有q_latent_loss项，因为码本通过EMA更新而非梯度
     """
-    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, 
-                 entropy_weight=0.1, entropy_temperature=1.0, init_method='random'):
+    def __init__(self, codebook_size, code_dim, commitment_cost=0.25, decay=0.99, eps=1e-5, init_method='random'):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
         self.commitment_cost = commitment_cost
         self.decay = decay
         self.eps = eps
-        self.entropy_weight = entropy_weight  # λ_entropy
-        self.entropy_temperature = entropy_temperature  # softmax温度
         self.init_method = init_method
         
         # 码本权重与EMA状态
@@ -323,45 +185,6 @@ class FlattenedVectorQuantizerEMA(nn.Module):
             self.ema_w.data.copy_(centroids)
             print(f"✓ 码本已从随机采样初始化 (codebook_size={self.codebook_size}, 样本数={N})")
     
-    def compute_soft_assignment(self, distances):
-        """
-        计算软分配分布 q(z, Z) = softmax(-dist / temperature)
-        
-        Args:
-            distances: [N, codebook_size] 距离矩阵
-        
-        Returns:
-            q: [N, codebook_size] 软分配概率
-        """
-        logits = -distances / self.entropy_temperature
-        q = F.softmax(logits, dim=-1)
-        return q
-    
-    def compute_entropy_loss(self, q, eps=1e-8):
-        """
-        计算熵正则化损失
-        
-        Args:
-            q: [N, codebook_size] 软分配概率分布
-        
-        Returns:
-            entropy_loss: scalar
-            avg_sample_entropy: scalar (用于监控)
-            global_entropy: scalar (用于监控)
-        """
-        # 项 A: E[H(q)] - 平均样本熵
-        sample_entropies = compute_entropy(q, eps)  # [N]
-        avg_sample_entropy = sample_entropies.mean()  # scalar
-        
-        # 项 B: H(E[q]) - 全局分布熵
-        avg_q = q.mean(dim=0, keepdim=True)  # [1, codebook_size]
-        global_entropy = compute_entropy(avg_q, eps).squeeze()  # scalar
-        
-        # 熵损失 = E[H(q)] - H(E[q])
-        entropy_loss = avg_sample_entropy - global_entropy
-        
-        return entropy_loss, avg_sample_entropy, global_entropy
-    
     def forward(self, z_flat):
         """
         Args:
@@ -369,7 +192,6 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         Returns:
             loss, quantized, indices
         """
-        # 计算距离
         distances = (
             torch.sum(z_flat ** 2, dim=1, keepdim=True) +
             torch.sum(self.embedding.weight ** 2, dim=1) -
@@ -395,72 +217,12 @@ class FlattenedVectorQuantizerEMA(nn.Module):
                 embed_normalized = self.ema_w / cluster_size.unsqueeze(1)
                 self.embedding.weight.data.copy_(embed_normalized)
         
-        # Commitment loss
+        # 只有commitment项
         e_latent_loss = F.mse_loss(z_flat, quantized.detach())
-        vq_loss = self.commitment_cost * e_latent_loss
+        loss = self.commitment_cost * e_latent_loss
         
-        # 熵正则化损失
-        if self.entropy_weight > 0:
-            q = self.compute_soft_assignment(distances)
-            entropy_loss, avg_sample_entropy, global_entropy = self.compute_entropy_loss(q)
-            loss = vq_loss + self.entropy_weight * entropy_loss
-        else:
-            loss = vq_loss
-        
-        # Straight-through estimator
         quantized = z_flat + (quantized - z_flat).detach()
         return loss, quantized, indices
-    
-    def forward_with_entropy_info(self, z_flat):
-        """
-        带熵信息的前向传播（用于监控和调试）
-        
-        Returns:
-            loss, quantized, indices, entropy_info
-        """
-        distances = (
-            torch.sum(z_flat ** 2, dim=1, keepdim=True) +
-            torch.sum(self.embedding.weight ** 2, dim=1) -
-            2 * torch.matmul(z_flat, self.embedding.weight.t())
-        )
-        
-        indices = torch.argmin(distances, dim=1)
-        quantized = self.embedding(indices)
-        
-        # EMA更新
-        if self.training and not self._disable_ema_update:
-            with torch.no_grad():
-                one_hot = F.one_hot(indices, self.codebook_size).type(z_flat.dtype)
-                self.ema_cluster_size.mul_(self.decay).add_(one_hot.sum(0), alpha=1 - self.decay)
-                dw = torch.matmul(one_hot.t(), z_flat)
-                self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
-                
-                n = self.ema_cluster_size.sum()
-                cluster_size = (self.ema_cluster_size + self.eps) / (n + self.codebook_size * self.eps) * n
-                embed_normalized = self.ema_w / cluster_size.unsqueeze(1)
-                self.embedding.weight.data.copy_(embed_normalized)
-        
-        # Commitment loss
-        e_latent_loss = F.mse_loss(z_flat, quantized.detach())
-        vq_loss = self.commitment_cost * e_latent_loss
-        
-        # 熵损失
-        q = self.compute_soft_assignment(distances)
-        entropy_loss, avg_sample_entropy, global_entropy = self.compute_entropy_loss(q)
-        loss = vq_loss + self.entropy_weight * entropy_loss
-        
-        # Straight-through estimator
-        quantized = z_flat + (quantized - z_flat).detach()
-        
-        entropy_info = {
-            'vq_loss': vq_loss.item(),
-            'entropy_loss': entropy_loss.item(),
-            'avg_sample_entropy': avg_sample_entropy.item(),
-            'global_entropy': global_entropy.item(),
-            'soft_assignment': q.detach(),
-        }
-        
-        return loss, quantized, indices, entropy_info
     
     def get_embedding(self, indices):
         return self.embedding(indices)
@@ -837,23 +599,15 @@ class PatchVQVAETransformer(nn.Module):
         
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'random')
-        # 熵正则化参数
-        self.entropy_weight = config.get('entropy_weight', 0.1)
-        self.entropy_temperature = config.get('entropy_temperature', 1.0)
-        
         if self.use_codebook_ema:
             self.vq = FlattenedVectorQuantizerEMA(
                 self.codebook_size, self.code_dim, self.commitment_cost,
                 decay=self.ema_decay, eps=self.ema_eps,
-                entropy_weight=self.entropy_weight,
-                entropy_temperature=self.entropy_temperature,
                 init_method=vq_init_method
             )
         else:
             self.vq = FlattenedVectorQuantizer(
                 self.codebook_size, self.code_dim, self.commitment_cost,
-                entropy_weight=self.entropy_weight,
-                entropy_temperature=self.entropy_temperature,
                 init_method=vq_init_method
             )
         
@@ -1371,9 +1125,6 @@ def get_model_config(args):
         'num_residual_hiddens': args.num_residual_hiddens,
         # Transformer hidden_dim（可选，默认使用code_dim）
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
-        # 熵正则化参数
-        'entropy_weight': getattr(args, 'entropy_weight', 0.1),
-        'entropy_temperature': getattr(args, 'entropy_temperature', 1.0),
     }
     
     # Patch attention 已移除

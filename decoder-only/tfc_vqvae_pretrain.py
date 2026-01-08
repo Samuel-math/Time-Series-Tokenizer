@@ -59,12 +59,6 @@ def parse_args():
     parser.add_argument('--ema_eps', type=float, default=1e-5, help='EMA平滑项')
     parser.add_argument('--vq_init_method', type=str, default='random', help='VQ初始化方法')
     
-    # ============ 熵正则化参数（码本利用率损失） ============
-    parser.add_argument('--entropy_weight', type=float, default=0.1, 
-                       help='熵正则化权重 λ_entropy，控制码本利用率损失强度')
-    parser.add_argument('--entropy_temperature', type=float, default=1.0,
-                       help='软分配的温度系数，越小分配越尖锐')
-    
     # ============ VQVAE Encoder/Decoder 参数 ============
     parser.add_argument('--num_hiddens', type=int, default=64, help='VQVAE隐藏层维度')
     parser.add_argument('--num_residual_layers', type=int, default=2, help='残差层数')
