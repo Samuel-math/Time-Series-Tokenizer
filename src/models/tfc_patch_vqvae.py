@@ -141,7 +141,7 @@ class InfoNCELoss(nn.Module):
     
     def forward(self, p_t, p_f):
         """
-        计算InfoNCE损失
+        计算InfoNCE损失（使用L2距离）
         
         Args:
             p_t: [B, D] 时域投影（已L2归一化）
@@ -153,15 +153,25 @@ class InfoNCELoss(nn.Module):
         batch_size = p_t.shape[0]
         device = p_t.device
         
-        # 计算余弦相似度矩阵 [B, B]
-        # p_t @ p_f.T: 每行是p_t[i]与所有p_f[j]的相似度
-        sim_t2f = torch.matmul(p_t, p_f.t()) / self.temperature  # [B, B]
-        sim_f2t = torch.matmul(p_f, p_t.t()) / self.temperature  # [B, B]
+        # 计算L2距离矩阵 [B, B]
+        # dist[i,j] = ||p_t[i] - p_f[j]||_2^2
+        # 使用公式: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a·b
+        p_t_sq = torch.sum(p_t ** 2, dim=1, keepdim=True)  # [B, 1]
+        p_f_sq = torch.sum(p_f ** 2, dim=1, keepdim=True)  # [B, 1]
+        
+        # t->f 距离矩阵
+        dist_t2f = p_t_sq + p_f_sq.t() - 2 * torch.matmul(p_t, p_f.t())  # [B, B]
+        # f->t 距离矩阵
+        dist_f2t = p_f_sq + p_t_sq.t() - 2 * torch.matmul(p_f, p_t.t())  # [B, B]
+        
+        # 转换为相似度：使用负距离（距离越小，相似度越高）
+        sim_t2f = -dist_t2f / self.temperature  # [B, B]
+        sim_f2t = -dist_f2t / self.temperature  # [B, B]
         
         # 正样本在对角线上，标签为 [0, 1, 2, ..., B-1]
         labels = torch.arange(batch_size, device=device)
         
-        # 交叉熵损失：对角线应该最大
+        # 交叉熵损失：对角线应该最大（即距离最小）
         # t->f方向：给定时域，找对应频域
         loss_t2f = F.cross_entropy(sim_t2f, labels)
         # f->t方向：给定频域，找对应时域
