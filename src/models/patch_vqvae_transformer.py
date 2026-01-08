@@ -986,7 +986,11 @@ class PatchVQVAETransformer(nn.Module):
                 return False
             
             # 加载encoder、decoder、VQ
+            # 注意：TFCPatchVQVAE使用time_encoder，需要兼容两种前缀
             if try_load_module(self.encoder, 'Encoder', 'encoder_state_dict', 'encoder'):
+                loaded_components.append('Encoder')
+            elif try_load_module(self.encoder, 'Encoder', None, 'time_encoder'):
+                # 兼容TFCPatchVQVAE的time_encoder
                 loaded_components.append('Encoder')
             
             if try_load_module(self.decoder, 'Decoder', 'decoder_state_dict', 'decoder'):
