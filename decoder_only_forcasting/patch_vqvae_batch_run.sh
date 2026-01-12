@@ -1,0 +1,461 @@
+#!/bin/bash
+
+# =====================================================
+# Patch VQVAE Transformer 批量训练脚本
+# 批量运行多个 progressive_step_size 的预训练和微调
+# PRETRAIN_CONTEXT_POINTS = 12 * PROGRESSIVE_STEP_SIZE * PATCH_SIZE
+# =====================================================
+
+# 输出日志文件
+LOG_FILE="res.txt"
+
+# 将所有输出同时写入文件并显示在屏幕上
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+echo "================================================="
+echo "批量训练开始时间: $(date)"
+echo "日志文件: ${LOG_FILE}"
+echo "================================================="
+
+# =====================================================
+# 配置参数
+# =====================================================
+
+# 数据集列表（将遍历所有数据集）
+DATASETS=(
+    "weather"
+    "electricity"
+)
+
+MODEL_ID=1
+
+# ----- 码本模型路径（可选）-----
+# 如果为空，脚本会自动查找，或手动指定完整路径
+# VQVAE_CHECKPOINT=""  # 留空表示不使用预训练VQVAE
+# 注意：路径会在循环中根据数据集和CA设置动态构建
+
+# ----- Patch 参数 -----
+PATCH_SIZE=16
+EMBEDDING_DIM=32
+COMPRESSION_FACTOR=8
+CODEBOOK_SIZE=256
+
+# ----- VQVAE Encoder/Decoder 参数 -----
+NUM_HIDDENS=64
+NUM_RESIDUAL_LAYERS=2
+NUM_RESIDUAL_HIDDENS=32
+COMMITMENT_COST=0.25
+CODEBOOK_EMA=1
+EMA_DECAY=0.99
+EMA_EPS=1e-5
+
+# ----- Transformer 参数 -----
+N_LAYERS=4
+N_HEADS=4
+D_FF=256
+DROPOUT=0.3
+
+# ----- Channel Attention 参数 -----
+# 遍历是否使用channel_attention（0=不使用，1=使用）
+CHANNEL_ATTENTION_LIST=(0)
+CHANNEL_ATTENTION_DROPOUT=0.1
+
+# ----- 批量训练配置 -----
+# 渐进式预训练的步长列表（patches数）
+PROGRESSIVE_STEP_SIZE_LIST=(6 3 1 9 12 15 18)
+
+# 微调时的 target_points 列表（对每个预训练模型都会运行这些微调）
+TARGET_POINTS_LIST=(96 192 336 720)
+
+# ----- 预训练参数 -----
+PRETRAIN_EPOCHS=100
+PRETRAIN_BATCH_SIZE=64
+PRETRAIN_LR=3e-4
+VQ_WEIGHT=0.5
+RECON_WEIGHT=0.1
+
+# ----- 微调参数 -----
+FINETUNE_CONTEXT_POINTS=512  # 微调时固定的 context_points（输入长度）
+FINETUNE_EPOCHS=50
+FINETUNE_BATCH_SIZE=64
+FINETUNE_LR=1e-4
+
+# ----- 其他参数 -----
+REVIN=1
+WEIGHT_DECAY=1e-4
+FREEZE_VQVAE=1
+LOAD_VQ_WEIGHTS=1
+
+# =====================================================
+# 计算 code_dim 用于模型命名
+# =====================================================
+CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
+
+echo "================================================="
+echo "Patch VQVAE Transformer 批量训练"
+echo "================================================="
+echo "数据集列表: ${DATASETS[@]}"
+echo "数据集数量: ${#DATASETS[@]}"
+echo "模型ID: ${MODEL_ID}"
+echo "Code Dim: ${CODE_DIM}"
+echo "Channel Attention设置: ${CHANNEL_ATTENTION_LIST[@]}"
+echo "Progressive Step Size列表: ${PROGRESSIVE_STEP_SIZE_LIST[@]}"
+echo "Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
+echo "微调固定 Context Points: ${FINETUNE_CONTEXT_POINTS}"
+echo "微调目标长度数: ${#TARGET_POINTS_LIST[@]}"
+echo "每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "================================================="
+
+# =====================================================
+# 数据集遍历循环
+# =====================================================
+
+TOTAL_DATASETS=${#DATASETS[@]}
+CURRENT_DATASET=0
+
+for DSET in "${DATASETS[@]}"; do
+    CURRENT_DATASET=$((CURRENT_DATASET + 1))
+    
+    echo ""
+    echo "#########################################################################"
+    echo "数据集 ${CURRENT_DATASET}/${TOTAL_DATASETS}: ${DSET}"
+    echo "#########################################################################"
+    
+    # =====================================================
+    # Channel Attention 遍历循环
+    # =====================================================
+    
+    TOTAL_CA_SETTINGS=${#CHANNEL_ATTENTION_LIST[@]}
+    CURRENT_CA_SETTING=0
+    
+    for USE_CHANNEL_ATTENTION in "${CHANNEL_ATTENTION_LIST[@]}"; do
+        CURRENT_CA_SETTING=$((CURRENT_CA_SETTING + 1))
+        
+        echo ""
+        echo "====================================================================="
+        echo "Channel Attention 设置 ${CURRENT_CA_SETTING}/${TOTAL_CA_SETTINGS}: ${USE_CHANNEL_ATTENTION} (${USE_CHANNEL_ATTENTION} = $([ "${USE_CHANNEL_ATTENTION}" -eq 1 ] && echo "启用" || echo "禁用"))"
+        echo "====================================================================="
+        
+        # =====================================================
+        # 自动查找或训练码本模型
+        # =====================================================
+        
+        # 构建codebook模型名称（根据channel_attention添加后缀）
+        CA_SUFFIX=""
+        if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
+            CA_SUFFIX="_ca1"
+        fi
+        CODEBOOK_MODEL_NAME="codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${CA_SUFFIX}_model${MODEL_ID}"
+        
+        # 为当前数据集和channel_attention设置构建VQVAE checkpoint路径
+        # 构建CA_SUFFIX（用于路径）
+        # 注意：codebook_pretrain.py 中的命名格式是 cd64{ca_suffix}_model1
+        # 其中 ca_suffix 是 "_ca1" 或 ""（空字符串）
+        # 所以：
+        # - 不使用 CA: cd64 + "" + _model1 = cd64_model1
+        # - 使用 CA: cd64 + _ca1 + _model1 = cd64_ca1_model1
+        CA_SUFFIX_FOR_PATH=""
+        if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
+            CA_SUFFIX_FOR_PATH="_ca1"
+        else
+            # 当不使用 CA 时，ca_suffix 是空字符串
+            CA_SUFFIX_FOR_PATH=""
+        fi
+        
+        # 直接构建完整的路径，不使用占位符
+        DSET_VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${CA_SUFFIX_FOR_PATH}_model${MODEL_ID}.pth"
+        
+        # 处理相对路径
+        if [[ ! "${DSET_VQVAE_CHECKPOINT}" = /* ]]; then
+            SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+            DSET_VQVAE_CHECKPOINT="${SCRIPT_DIR}/${DSET_VQVAE_CHECKPOINT}"
+        fi
+        
+        # 规范化路径
+        DSET_VQVAE_CHECKPOINT=$(readlink -f "${DSET_VQVAE_CHECKPOINT}" 2>/dev/null || realpath "${DSET_VQVAE_CHECKPOINT}" 2>/dev/null || echo "${DSET_VQVAE_CHECKPOINT}")
+        
+        if [ ! -f "${DSET_VQVAE_CHECKPOINT}" ]; then
+            echo "警告: VQVAE模型文件不存在: ${DSET_VQVAE_CHECKPOINT}"
+            echo "尝试自动训练codebook..."
+            DSET_VQVAE_CHECKPOINT=""
+        else
+            echo "找到VQVAE模型: ${DSET_VQVAE_CHECKPOINT}"
+        fi
+        
+        # 如果没有找到codebook，自动训练一个
+        if [ -z "${DSET_VQVAE_CHECKPOINT}" ]; then
+            echo ""
+            echo "================================================="
+            echo "自动训练 Codebook 模型"
+            echo "================================================="
+            echo "数据集: ${DSET}"
+            echo "Channel Attention: ${USE_CHANNEL_ATTENTION}"
+            echo "模型名称: ${CODEBOOK_MODEL_NAME}"
+            echo "================================================="
+            
+            # 切换到vqvae-only目录
+            SCRIPT_DIR_CA="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+            VQVAE_ONLY_DIR="${SCRIPT_DIR_CA}/../vqvae-only"
+            
+            if [ ! -d "${VQVAE_ONLY_DIR}" ]; then
+                echo "错误: 找不到vqvae-only目录: ${VQVAE_ONLY_DIR}"
+                echo "将跳过该CA设置的训练"
+                continue
+            fi
+            
+            # 运行codebook训练脚本
+            cd "${VQVAE_ONLY_DIR}"
+            
+            # 注意：使用EMA时，VQ的embedding会被冻结（EMA自动更新）
+            # 但由于Encoder和Decoder是可训练的，所以仍然有可训练参数
+            # 如果USE_CHANNEL_ATTENTION=0，只有Encoder和Decoder可训练
+            # 如果USE_CHANNEL_ATTENTION=1，Encoder、Decoder和Channel Attention都可训练
+            
+            # 根据数据集设置采样参数（electricity 使用 0.3，其他数据集使用 1.0）
+            if [ "${DSET}" = "electricity" ]; then
+                TRAIN_SAMPLE_RATIO=0.3
+                VALID_SAMPLE_RATIO=0.3
+            else
+                TRAIN_SAMPLE_RATIO=1.0
+                VALID_SAMPLE_RATIO=1.0
+            fi
+            
+            python codebook_pretrain.py \
+                --dset ${DSET} \
+                --context_points 512 \
+                --batch_size ${PRETRAIN_BATCH_SIZE} \
+                --patch_size ${PATCH_SIZE} \
+                --embedding_dim ${EMBEDDING_DIM} \
+                --codebook_size ${CODEBOOK_SIZE} \
+                --compression_factor ${COMPRESSION_FACTOR} \
+                --num_hiddens ${NUM_HIDDENS} \
+                --num_residual_layers ${NUM_RESIDUAL_LAYERS} \
+                --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS} \
+                --commitment_cost ${COMMITMENT_COST} \
+                --codebook_ema ${CODEBOOK_EMA} \
+                --ema_decay ${EMA_DECAY} \
+                --ema_eps ${EMA_EPS} \
+                --use_channel_attention ${USE_CHANNEL_ATTENTION} \
+                --channel_attention_dropout ${CHANNEL_ATTENTION_DROPOUT} \
+                --n_epochs 50 \
+                --lr 1e-4 \
+                --weight_decay ${WEIGHT_DECAY} \
+                --revin ${REVIN} \
+                --vq_weight 1.0 \
+                --recon_weight 1.0 \
+                --train_sample_ratio ${TRAIN_SAMPLE_RATIO} \
+                --valid_sample_ratio ${VALID_SAMPLE_RATIO} \
+                --model_id ${MODEL_ID}
+            
+            CODEBOOK_TRAIN_EXIT_CODE=$?
+            cd "${SCRIPT_DIR_CA}"
+            
+            if [ ${CODEBOOK_TRAIN_EXIT_CODE} -ne 0 ]; then
+                echo "错误: Codebook训练失败，跳过该CA设置"
+                continue
+            fi
+            
+            # 构建训练后的codebook路径
+            CODEBOOK_PATH="${VQVAE_ONLY_DIR}/saved_models/vqvae_only/${DSET}/${CODEBOOK_MODEL_NAME}.pth"
+            
+            if [ -f "${CODEBOOK_PATH}" ]; then
+                DSET_VQVAE_CHECKPOINT="${CODEBOOK_PATH}"
+                echo "✓ Codebook训练完成: ${DSET_VQVAE_CHECKPOINT}"
+            else
+                echo "警告: Codebook训练完成但文件不存在: ${CODEBOOK_PATH}"
+                echo "将从头训练Transformer"
+            fi
+        fi
+        
+        # =====================================================
+        # 批量训练循环（针对当前数据集和CA设置）
+        # =====================================================
+        
+        TOTAL_TASKS=${#PROGRESSIVE_STEP_SIZE_LIST[@]}
+        CURRENT_TASK=0
+        
+        for PROGRESSIVE_STEP_SIZE in "${PROGRESSIVE_STEP_SIZE_LIST[@]}"; do
+            CURRENT_TASK=$((CURRENT_TASK + 1))
+            
+            # 计算预训练的 context_points: 12 * PROGRESSIVE_STEP_SIZE * patch_size
+            PRETRAIN_CONTEXT_POINTS=$((12 * PROGRESSIVE_STEP_SIZE * PATCH_SIZE))
+            
+            echo ""
+            echo "================================================="
+            echo "任务 ${CURRENT_TASK}/${TOTAL_TASKS}: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
+            echo "================================================="
+            
+            # 构建模型名称（包含 context_points 和 step_size）
+            MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}"
+            
+            # =====================================================
+            # 阶段 1: 预训练
+            # =====================================================
+            echo ""
+            echo "-------------------------------------------------"
+            echo "阶段 1: 预训练"
+            echo "-------------------------------------------------"
+            echo "Context Points: ${PRETRAIN_CONTEXT_POINTS}"
+            echo "Progressive Step Size: ${PROGRESSIVE_STEP_SIZE}"
+            echo "Epochs: ${PRETRAIN_EPOCHS}"
+            echo "Batch Size: ${PRETRAIN_BATCH_SIZE}"
+            echo "-------------------------------------------------"
+            
+            # 构建预训练命令参数
+            PRETRAIN_ARGS=(
+                --dset ${DSET}
+                --context_points ${PRETRAIN_CONTEXT_POINTS}
+                --progressive_step_size ${PROGRESSIVE_STEP_SIZE}
+                --batch_size ${PRETRAIN_BATCH_SIZE}
+                --patch_size ${PATCH_SIZE}
+                --embedding_dim ${EMBEDDING_DIM}
+                --compression_factor ${COMPRESSION_FACTOR}
+                --codebook_size ${CODEBOOK_SIZE}
+                --n_layers ${N_LAYERS}
+                --n_heads ${N_HEADS}
+                --d_ff ${D_FF}
+                --dropout ${DROPOUT}
+                --num_hiddens ${NUM_HIDDENS}
+                --num_residual_layers ${NUM_RESIDUAL_LAYERS}
+                --num_residual_hiddens ${NUM_RESIDUAL_HIDDENS}
+                --commitment_cost ${COMMITMENT_COST}
+                --codebook_ema ${CODEBOOK_EMA}
+                --ema_decay ${EMA_DECAY}
+                --ema_eps ${EMA_EPS}
+                --n_epochs ${PRETRAIN_EPOCHS}
+                --lr ${PRETRAIN_LR}
+                --weight_decay ${WEIGHT_DECAY}
+                --revin ${REVIN}
+                --vq_weight ${VQ_WEIGHT}
+                --recon_weight ${RECON_WEIGHT}
+                --model_id ${MODEL_ID}
+            )
+            
+            # 如果指定了VQVAE checkpoint，添加相关参数
+            if [ -n "${DSET_VQVAE_CHECKPOINT}" ]; then
+                PRETRAIN_ARGS+=(
+                    --vqvae_checkpoint "${DSET_VQVAE_CHECKPOINT}"
+                    --freeze_vqvae ${FREEZE_VQVAE}
+                    --load_vq_weights ${LOAD_VQ_WEIGHTS}
+                )
+            fi
+            
+            # 运行预训练
+            python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
+            
+            if [ $? -ne 0 ]; then
+                echo "错误: 预训练失败 (Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS})"
+                echo "跳过该组合的微调任务"
+                continue
+            fi
+            
+            # =====================================================
+            # 阶段 2: 微调（多个预测长度）
+            # =====================================================
+            PRETRAINED_MODEL="saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
+            
+            echo "调试: MODEL_NAME = ${MODEL_NAME}"
+            echo "调试: 构建的PRETRAINED_MODEL = ${PRETRAINED_MODEL}"
+            
+            # 处理相对路径
+            if [[ ! "${PRETRAINED_MODEL}" = /* ]]; then
+                SCRIPT_DIR_PRETRAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+                PRETRAINED_MODEL="${SCRIPT_DIR_PRETRAIN}/${PRETRAINED_MODEL}"
+                echo "调试: 转换为绝对路径后 = ${PRETRAINED_MODEL}"
+            fi
+            
+            # 规范化路径
+            PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${PRETRAINED_MODEL}" 2>/dev/null || echo "${PRETRAINED_MODEL}")
+            echo "调试: 规范化后的路径 = ${PRETRAINED_MODEL}"
+            
+            # 检查预训练模型是否存在
+            if [ ! -f "${PRETRAINED_MODEL}" ]; then
+                echo "警告: 预训练模型不存在: ${PRETRAINED_MODEL}"
+                echo "期望的模型名称格式: patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}.pth"
+                echo "实际 MODEL_NAME: ${MODEL_NAME}"
+                echo "检查目录是否存在: $(dirname "${PRETRAINED_MODEL}")"
+                if [ -d "$(dirname "${PRETRAINED_MODEL}")" ]; then
+                    echo "目录中的文件列表:"
+                    ls -la "$(dirname "${PRETRAINED_MODEL}")" | head -20 || echo "无法列出目录内容"
+                fi
+                echo "跳过微调任务"
+                continue
+            fi
+            
+            echo ""
+            echo "-------------------------------------------------"
+            echo "阶段 2: 微调"
+            echo "-------------------------------------------------"
+            echo "预训练模型: ${PRETRAINED_MODEL}"
+            echo "Context Points: ${FINETUNE_CONTEXT_POINTS} (固定)"
+            echo "Target Points: ${TARGET_POINTS_LIST[@]}"
+            echo "-------------------------------------------------"
+            
+            for FINETUNE_TARGET in ${TARGET_POINTS_LIST[@]}; do
+                echo ""
+                echo "  └─ 微调: Target Points = ${FINETUNE_TARGET}"
+                
+                python patch_vqvae_finetune.py \
+                    --dset ${DSET} \
+                    --context_points ${FINETUNE_CONTEXT_POINTS} \
+                    --target_points ${FINETUNE_TARGET} \
+                    --batch_size ${FINETUNE_BATCH_SIZE} \
+                    --pretrained_model "${PRETRAINED_MODEL}" \
+                    --n_epochs ${FINETUNE_EPOCHS} \
+                    --lr ${FINETUNE_LR} \
+                    --weight_decay ${WEIGHT_DECAY} \
+                    --revin ${REVIN} \
+                    --model_id ${MODEL_ID}
+                
+                if [ $? -ne 0 ]; then
+                    echo "    警告: 微调失败 (Target=${FINETUNE_TARGET})"
+                fi
+            done
+            
+            echo ""
+            echo "✓ 完成: Progressive Step Size=${PROGRESSIVE_STEP_SIZE}, Context Points=${PRETRAIN_CONTEXT_POINTS}"
+        done
+    
+    echo ""
+    echo "================================================="
+    echo "Channel Attention=${USE_CHANNEL_ATTENTION} 的所有任务完成！"
+    echo "================================================="
+    echo "预训练模型保存在: saved_models/patch_vqvae/${DSET}/"
+    echo "微调模型保存在: saved_models/patch_vqvae_finetune/${DSET}/"
+    echo "================================================="
+    done
+    
+    echo ""
+    echo "================================================="
+    echo "数据集 ${DSET} 的所有任务完成！"
+    echo "================================================="
+    echo "预训练模型保存在: saved_models/patch_vqvae/${DSET}/"
+    echo "微调模型保存在: saved_models/patch_vqvae_finetune/${DSET}/"
+    echo "================================================="
+done
+
+echo ""
+echo "#########################################################################"
+echo "全部批量训练完成！"
+echo "#########################################################################"
+echo "批量训练结束时间: $(date)"
+echo ""
+echo "训练统计:"
+echo "  数据集数量: ${TOTAL_DATASETS}"
+echo "  Channel Attention设置数: ${#CHANNEL_ATTENTION_LIST[@]}"
+echo "  Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
+echo "  每个Progressive Step Size的微调任务数: ${#TARGET_POINTS_LIST[@]}"
+echo "  每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  每个数据集的总任务数: $(( ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo ""
+echo "结果保存位置:"
+for DSET in "${DATASETS[@]}"; do
+    echo "  - ${DSET}:"
+    echo "    预训练: saved_models/patch_vqvae/${DSET}/"
+    echo "    微调: saved_models/patch_vqvae_finetune/${DSET}/"
+done
+echo ""
+echo "日志文件: ${LOG_FILE}"
+echo "#########################################################################"
