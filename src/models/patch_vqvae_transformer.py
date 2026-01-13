@@ -585,6 +585,11 @@ class PatchVQVAETransformer(nn.Module):
         self.num_residual_layers = config.get('num_residual_layers', 2)
         self.num_residual_hiddens = config.get('num_residual_hiddens', 32)
         
+        # 微调阶段的Gumbel-Softmax配置
+        self.use_gumbel_softmax = config.get('use_gumbel_softmax', True)  # 默认启用Gumbel-Softmax
+        self.gumbel_temperature = config.get('gumbel_temperature', 1.0)   # Gumbel-Softmax温度
+        self.gumbel_hard = config.get('gumbel_hard', False)               # 是否使用Straight-Through
+        
         # code_dim = embedding_dim * compressed_len
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.compressed_len = self.patch_size // self.compression_factor
@@ -890,8 +895,14 @@ class PatchVQVAETransformer(nn.Module):
         # 输出头: [B*C, num_pred_patches, codebook_size]
         logits = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
         
-        # 使用 softmax + 加权求和 替代 argmax，保持可微分
-        weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
+        # 使用 Gumbel-Softmax 或 普通Softmax 替代 argmax，保持可微分
+        if self.use_gumbel_softmax and self.training:
+            # 训练时使用 Gumbel-Softmax（增加探索性）
+            weights = F.gumbel_softmax(logits, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
+        else:
+            # 推理时使用普通 Softmax（确定性）
+            weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
+        
         codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
         pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
         

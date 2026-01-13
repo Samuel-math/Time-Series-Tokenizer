@@ -68,6 +68,11 @@ FINETUNE_BATCH_SIZE=64
 FINETUNE_LR=1e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
+# ----- Gumbel-Softmax参数（微调阶段的码本查找）-----
+USE_GUMBEL_SOFTMAX=1           # 是否使用Gumbel-Softmax（1启用，0使用普通Softmax）
+GUMBEL_TEMPERATURE=1.0         # Gumbel-Softmax温度（越小越接近argmax，建议0.5-2.0）
+GUMBEL_HARD=0                  # 是否使用Straight-Through（前向硬采样，反向软梯度）
+
 # ----- 其他参数 -----
 REVIN=1
 WEIGHT_DECAY=1e-4
@@ -242,6 +247,9 @@ for TARGET_POINTS in ${TARGET_POINTS_LIST[@]}; do
         --lr ${FINETUNE_LR} \
         --weight_decay ${WEIGHT_DECAY} \
         --revin ${REVIN} \
+        --use_gumbel_softmax ${USE_GUMBEL_SOFTMAX} \
+        --gumbel_temperature ${GUMBEL_TEMPERATURE} \
+        --gumbel_hard ${GUMBEL_HARD} \
         --model_id ${MODEL_ID}
 done
 

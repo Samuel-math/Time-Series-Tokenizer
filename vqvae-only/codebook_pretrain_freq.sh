@@ -43,17 +43,14 @@ VQ_WEIGHT=1.0
 RECON_WEIGHT=1.0
 
 # ============ 频域一致性损失参数 ============
-FREQ_WEIGHT=0.1                  # 频域一致性损失权重
+FREQ_WEIGHT=0.1                  # 频域一致性损失最终权重
 FREQ_SIMILARITY_THRESHOLD=0.8    # 相似度阈值（高于此阈值的样本对视为正样本）
 FREQ_LOSS_TYPE="mse"             # 损失类型: "mse" 或 "infonce"
 FREQ_TEMPERATURE=0.1             # InfoNCE温度系数
 
-# ============ 软索引参数（解决argmax梯度断裂问题） ============
-USE_SOFT_INDICES=1               # 是否使用软索引（1启用，0使用硬索引）
-SOFT_INDEX_METHOD="gumbel"       # 软索引方法: "gumbel" 或 "softmax"
-GUMBEL_TEMPERATURE=1.0           # Gumbel-Softmax温度（越小越接近argmax）
-GUMBEL_HARD=0                    # 是否使用Straight-Through Gumbel
-SOFT_INDEX_TEMPERATURE=1.0       # 普通Softmax温度
+# ============ 频域损失Warmup参数 ============
+FREQ_WARMUP_EPOCHS=10            # Warmup的epoch数
+FREQ_WEIGHT_START=0.01           # Warmup起始权重（从小到大逐渐增加到FREQ_WEIGHT）
 
 # ============ 数据采样参数 ============
 TRAIN_SAMPLE_RATIO=1.0
@@ -69,7 +66,7 @@ echo "=============================================="
 echo "数据集: $DSET"
 echo "Patch大小: $PATCH_SIZE"
 echo "码本大小: $CODEBOOK_SIZE"
-echo "频域损失权重: $FREQ_WEIGHT"
+echo "频域损失权重: $FREQ_WEIGHT (warmup: $FREQ_WEIGHT_START -> $FREQ_WEIGHT, ${FREQ_WARMUP_EPOCHS} epochs)"
 echo "频域损失类型: $FREQ_LOSS_TYPE"
 echo "相似度阈值: $FREQ_SIMILARITY_THRESHOLD"
 echo "=============================================="
@@ -106,11 +103,8 @@ python codebook_pretrain_freq.py \
     --freq_similarity_threshold $FREQ_SIMILARITY_THRESHOLD \
     --freq_loss_type $FREQ_LOSS_TYPE \
     --freq_temperature $FREQ_TEMPERATURE \
-    --use_soft_indices $USE_SOFT_INDICES \
-    --soft_index_method $SOFT_INDEX_METHOD \
-    --gumbel_temperature $GUMBEL_TEMPERATURE \
-    --gumbel_hard $GUMBEL_HARD \
-    --soft_index_temperature $SOFT_INDEX_TEMPERATURE \
+    --freq_warmup_epochs $FREQ_WARMUP_EPOCHS \
+    --freq_weight_start $FREQ_WEIGHT_START \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
     --save_path $SAVE_PATH \

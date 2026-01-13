@@ -84,18 +84,11 @@ def parse_args():
     parser.add_argument('--freq_temperature', type=float, default=0.1,
                        help='InfoNCE损失的温度系数')
     
-    # ============ 软索引参数（解决argmax梯度断裂问题） ============
-    parser.add_argument('--use_soft_indices', type=int, default=1,
-                       help='是否使用软索引（1启用Gumbel-Softmax，0使用硬索引）')
-    parser.add_argument('--soft_index_method', type=str, default='gumbel',
-                       choices=['gumbel', 'softmax'],
-                       help='软索引方法：gumbel（Gumbel-Softmax）或softmax（普通Softmax）')
-    parser.add_argument('--gumbel_temperature', type=float, default=1.0,
-                       help='Gumbel-Softmax温度（越小越接近argmax，建议0.5-2.0）')
-    parser.add_argument('--gumbel_hard', type=int, default=0,
-                       help='是否使用Straight-Through Gumbel（前向硬采样，反向软梯度）')
-    parser.add_argument('--soft_index_temperature', type=float, default=1.0,
-                       help='普通Softmax软索引的温度系数')
+    # ============ 频域损失warmup参数 ============
+    parser.add_argument('--freq_warmup_epochs', type=int, default=10,
+                       help='频域损失权重warmup的epoch数')
+    parser.add_argument('--freq_weight_start', type=float, default=0.01,
+                       help='频域损失权重的起始值（warmup开始时的值）')
     
     # 数据采样参数
     parser.add_argument('--train_sample_ratio', type=float, default=1.0, 
@@ -128,6 +121,31 @@ def get_model_config(args):
         'use_patch_attention': False,
     }
     return config
+
+
+def get_freq_weight_with_warmup(args, current_epoch):
+    """
+    计算当前epoch的频域损失权重（带warmup）
+    
+    Args:
+        args: 参数
+        current_epoch: 当前epoch（从0开始）
+    
+    Returns:
+        freq_weight: 当前的频域损失权重
+    """
+    warmup_epochs = getattr(args, 'freq_warmup_epochs', 10)
+    weight_start = getattr(args, 'freq_weight_start', 0.01)
+    weight_end = args.freq_weight
+    
+    if current_epoch >= warmup_epochs:
+        return weight_end
+    
+    # 线性warmup
+    progress = current_epoch / warmup_epochs
+    freq_weight = weight_start + (weight_end - weight_start) * progress
+    
+    return freq_weight
 
 
 def compute_freq_magnitude(x, dim=-1):
@@ -225,135 +243,62 @@ def compute_freq_consistency_loss_infonce(S_orig, S_discrete, threshold=0.8, tem
     return loss
 
 
-def compute_soft_indices_gumbel(distances, codebook_size, temperature=1.0, hard=False):
+def compute_inter_sequence_freq_loss(x_orig, z_q, args):
     """
-    使用 Gumbel-Softmax 计算可微分的软索引
+    计算Batch内序列间频域一致性损失（改进版）
     
-    Args:
-        distances: [N, codebook_size] 到码本的距离
-        codebook_size: 码本大小
-        temperature: Gumbel-Softmax 温度（越小越接近 argmax）
-        hard: 是否使用 straight-through estimator（前向 argmax，反向软梯度）
-    
-    Returns:
-        soft_indices: [N] 期望索引值（可微分）
-        one_hot_soft: [N, codebook_size] Gumbel-Softmax 输出
-    """
-    # 转换距离为 logits（距离越小，概率越高）
-    logits = -distances
-    
-    # Gumbel-Softmax
-    one_hot_soft = F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)  # [N, codebook_size]
-    
-    # 计算期望索引值
-    # indices = sum(one_hot * [0, 1, 2, ..., K-1])
-    index_values = torch.arange(codebook_size, device=distances.device, dtype=distances.dtype)
-    soft_indices = torch.matmul(one_hot_soft, index_values)  # [N]
-    
-    return soft_indices, one_hot_soft
-
-
-def compute_soft_indices_softmax(distances, codebook_size, temperature=1.0):
-    """
-    使用普通 Softmax 计算可微分的软索引（无 Gumbel 噪声）
-    
-    Args:
-        distances: [N, codebook_size] 到码本的距离
-        codebook_size: 码本大小
-        temperature: 温度系数
-    
-    Returns:
-        soft_indices: [N] 期望索引值
-        probs: [N, codebook_size] 软分配概率
-    """
-    logits = -distances / temperature
-    probs = F.softmax(logits, dim=-1)  # [N, codebook_size]
-    
-    index_values = torch.arange(codebook_size, device=distances.device, dtype=distances.dtype)
-    soft_indices = torch.matmul(probs, index_values)  # [N]
-    
-    return soft_indices, probs
-
-
-def compute_inter_sequence_freq_loss(x_orig, indices, args, distances=None, codebook_size=None):
-    """
-    计算Batch内序列间频域一致性损失
-    
-    支持两种模式：
-    1. 硬索引模式（无梯度流向encoder）：使用 argmax 得到的 indices
-    2. 软索引模式（有梯度流）：使用 Gumbel-Softmax 或 Softmax 得到的软索引
+    改进点：
+    1. 使用量化后的向量 z_q 进行DFT，而不是离散索引
+    2. 原始序列相似度矩阵使用 .detach()，只作为目标不产生梯度
+    3. 对 z_q 在 code_dim 维度取平均，投影到1维后再做FFT
     
     Args:
         x_orig: [B, T, C] 原始输入序列
-        indices: [B, num_patches, C] VQ量化后的索引（硬索引，用于统计）
+        z_q: [B, num_patches, C, code_dim] 量化后的向量
         args: 参数
-        distances: [B*num_patches*C, codebook_size] 到码本的距离（用于软索引）
-        codebook_size: 码本大小
     
     Returns:
         loss: scalar 频域一致性损失
         info: dict 包含中间信息
     """
     B, T, C = x_orig.shape
-    _, num_patches, _ = indices.shape
+    _, num_patches, _, code_dim = z_q.shape
     
     # ============ FFT支路：原始序列的频域相似度 ============
+    # 使用 .detach() 确保 S_orig 只作为目标，不产生反向梯度
     x_flat = x_orig.permute(0, 2, 1).reshape(B * C, T)  # [B*C, T]
     freq_orig = compute_freq_magnitude(x_flat, dim=-1)  # [B*C, T//2+1]
-    S_orig = compute_cosine_similarity_matrix(freq_orig)  # [B*C, B*C]
+    S_orig = compute_cosine_similarity_matrix(freq_orig).detach()  # [B*C, B*C] - 梯度隔离
     
-    # ============ DFT支路：量化索引的频域相似度 ============
-    # 判断是否使用软索引模式
-    use_soft_indices = (distances is not None and codebook_size is not None and 
-                        hasattr(args, 'use_soft_indices') and args.use_soft_indices)
+    # ============ DFT支路：量化向量的频域相似度 ============
+    # z_q: [B, num_patches, C, code_dim]
+    # 对 code_dim 维度取平均，得到 [B, num_patches, C]
+    z_q_reduced = z_q.mean(dim=-1)  # [B, num_patches, C]
     
-    if use_soft_indices:
-        # 使用软索引（可微分）
-        if hasattr(args, 'soft_index_method') and args.soft_index_method == 'gumbel':
-            # Gumbel-Softmax
-            soft_indices_flat, _ = compute_soft_indices_gumbel(
-                distances, 
-                codebook_size, 
-                temperature=args.gumbel_temperature,
-                hard=getattr(args, 'gumbel_hard', False)
-            )
-        else:
-            # 普通 Softmax
-            soft_indices_flat, _ = compute_soft_indices_softmax(
-                distances, 
-                codebook_size,
-                temperature=getattr(args, 'soft_index_temperature', 1.0)
-            )
-        
-        # Reshape: [B*num_patches*C] -> [B*C, num_patches]
-        indices_for_fft = soft_indices_flat.reshape(B, num_patches, C)
-        indices_for_fft = indices_for_fft.permute(0, 2, 1).reshape(B * C, num_patches)
-    else:
-        # 使用硬索引（无梯度流向encoder，但仍可用于正则化）
-        indices_for_fft = indices.permute(0, 2, 1).reshape(B * C, num_patches).float()
+    # 重排为 [B*C, num_patches] 以便计算FFT
+    z_q_flat = z_q_reduced.permute(0, 2, 1).reshape(B * C, num_patches)  # [B*C, num_patches]
     
-    # 对索引序列计算FFT幅值
-    freq_discrete = compute_freq_magnitude(indices_for_fft, dim=-1)  # [B*C, num_patches//2+1]
+    # 对量化向量序列计算FFT幅值
+    freq_quantized = compute_freq_magnitude(z_q_flat, dim=-1)  # [B*C, num_patches//2+1]
     
     # 计算余弦相似度矩阵
-    S_discrete = compute_cosine_similarity_matrix(freq_discrete)  # [B*C, B*C]
+    S_quantized = compute_cosine_similarity_matrix(freq_quantized)  # [B*C, B*C]
     
     # ============ 计算损失 ============
     if args.freq_loss_type == 'mse':
-        loss = compute_freq_consistency_loss_mse(S_orig, S_discrete)
+        loss = compute_freq_consistency_loss_mse(S_orig, S_quantized)
     else:  # infonce
         loss = compute_freq_consistency_loss_infonce(
-            S_orig, S_discrete, 
+            S_orig, S_quantized, 
             threshold=args.freq_similarity_threshold,
             temperature=args.freq_temperature
         )
     
     info = {
         'S_orig_mean': S_orig.mean().item(),
-        'S_discrete_mean': S_discrete.mean().item(),
+        'S_quantized_mean': S_quantized.mean().item(),
         'S_orig_diag_mean': S_orig.diag().mean().item(),
-        'S_discrete_diag_mean': S_discrete.diag().mean().item(),
-        'use_soft_indices': use_soft_indices,
+        'S_quantized_diag_mean': S_quantized.diag().mean().item(),
     }
     
     return loss, info
@@ -381,7 +326,7 @@ def compute_codebook_usage_stats(indices, codebook_size):
     }
 
 
-def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
+def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, current_epoch=0):
     """训练一个epoch"""
     model.train()
     total_loss = 0
@@ -393,23 +338,17 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     
     all_indices_list = []
     
+    # 获取当前epoch的频域损失权重（带warmup）
+    current_freq_weight = get_freq_weight_with_warmup(args, current_epoch)
+    
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
-        
-        # 保存原始输入用于频域损失计算
-        batch_x_orig = batch_x.clone()
         
         if revin:
             batch_x = revin(batch_x, 'norm')
         
-        # 编码和解码（如果需要软索引，同时返回距离）
-        use_soft = hasattr(args, 'use_soft_indices') and args.use_soft_indices
-        if use_soft:
-            indices, vq_loss, z_q, distances = model.encode_to_indices(batch_x, return_distances=True)
-        else:
-            indices, vq_loss, z_q = model.encode_to_indices(batch_x, return_distances=False)
-            distances = None
-        
+        # 编码和解码
+        indices, vq_loss, z_q = model.encode_to_indices(batch_x, return_distances=False)
         x_recon = model.decode_from_codes(z_q)
         
         # 计算重构损失
@@ -418,19 +357,17 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         recon_len = num_patches * model.patch_size
         recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
         
-        # 计算频域一致性损失（支持软索引）
+        # 计算频域一致性损失（使用量化向量z_q，不是索引）
         freq_loss, freq_info = compute_inter_sequence_freq_loss(
-            batch_x[:, :recon_len, :],  # 使用RevIN后的数据（与重构目标一致）
-            indices, 
-            args,
-            distances=distances,
-            codebook_size=model.codebook_size
+            batch_x[:, :recon_len, :],  # 使用RevIN后的数据
+            z_q,  # 量化后的向量 [B, num_patches, C, code_dim]
+            args
         )
         
-        # 总损失
+        # 总损失（使用warmup后的freq_weight）
         loss = (args.recon_weight * recon_loss + 
                 args.vq_weight * vq_loss + 
-                args.freq_weight * freq_loss)
+                current_freq_weight * freq_loss)
         
         # 反向传播
         optimizer.zero_grad()
@@ -470,10 +407,11 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         'freq_loss': total_freq_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
+        'current_freq_weight': current_freq_weight,  # 返回当前使用的权重
     }
 
 
-def validate_epoch(model, dataloader, revin, args, device):
+def validate_epoch(model, dataloader, revin, args, device, current_epoch=0):
     """验证一个epoch"""
     model.eval()
     total_loss = 0
@@ -485,6 +423,9 @@ def validate_epoch(model, dataloader, revin, args, device):
     
     all_indices_list = []
     
+    # 获取当前epoch的频域损失权重（带warmup）
+    current_freq_weight = get_freq_weight_with_warmup(args, current_epoch)
+    
     with torch.no_grad():
         for batch_x, _ in dataloader:
             batch_x = batch_x.to(device)
@@ -492,7 +433,7 @@ def validate_epoch(model, dataloader, revin, args, device):
             if revin:
                 batch_x = revin(batch_x, 'norm')
             
-            # 验证时使用硬索引即可（不需要梯度）
+            # 编码和解码
             indices, vq_loss, z_q = model.encode_to_indices(batch_x, return_distances=False)
             x_recon = model.decode_from_codes(z_q)
             
@@ -501,18 +442,16 @@ def validate_epoch(model, dataloader, revin, args, device):
             recon_len = num_patches * model.patch_size
             recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
             
-            # 计算频域一致性损失（验证时使用硬索引）
+            # 计算频域一致性损失（使用量化向量z_q）
             freq_loss, freq_info = compute_inter_sequence_freq_loss(
                 batch_x[:, :recon_len, :],
-                indices, 
-                args,
-                distances=None,
-                codebook_size=model.codebook_size
+                z_q,  # 量化后的向量 [B, num_patches, C, code_dim]
+                args
             )
             
             loss = (args.recon_weight * recon_loss + 
                     args.vq_weight * vq_loss + 
-                    args.freq_weight * freq_loss)
+                    current_freq_weight * freq_loss)
             
             unique_indices = torch.unique(indices.reshape(-1))
             perplexity = len(unique_indices) / args.codebook_size
@@ -536,6 +475,7 @@ def validate_epoch(model, dataloader, revin, args, device):
         'freq_loss': total_freq_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
+        'current_freq_weight': current_freq_weight,
     }
 
 
@@ -678,20 +618,24 @@ def main():
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
-        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
+        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler, current_epoch=epoch)
         scheduler.step()
         
-        val_metrics = validate_epoch(model, dls.valid, revin, args, device)
+        val_metrics = validate_epoch(model, dls.valid, revin, args, device, current_epoch=epoch)
         
         train_losses.append(train_metrics['loss'])
         valid_losses.append(val_metrics['loss'])
         
-        # 打印进度
+        # 获取当前频域损失权重（用于打印）
+        current_freq_weight = train_metrics.get('current_freq_weight', args.freq_weight)
+        
+        # 打印进度（显示当前warmup状态）
+        warmup_info = f"[warmup {current_freq_weight:.4f}]" if epoch < getattr(args, 'freq_warmup_epochs', 10) else ""
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train: total={train_metrics['loss']:.4f} "
               f"(recon={train_metrics['recon_loss']:.4f}, "
               f"vq={train_metrics['vq_loss']:.4f}, "
-              f"freq={train_metrics['freq_loss']:.4f}) | "
+              f"freq={train_metrics['freq_loss']:.4f}{warmup_info}) | "
               f"Valid: total={val_metrics['loss']:.4f} "
               f"(recon={val_metrics['recon_loss']:.4f}, "
               f"freq={val_metrics['freq_loss']:.4f})")

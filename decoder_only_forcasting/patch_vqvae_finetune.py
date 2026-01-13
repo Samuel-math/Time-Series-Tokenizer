@@ -50,6 +50,11 @@ def parse_args():
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     parser.add_argument('--run_id', type=int, default=None, help='运行ID（用于多次运行同一参数组合）')
     
+    # Gumbel-Softmax参数（微调阶段的码本查找）
+    parser.add_argument('--use_gumbel_softmax', type=int, default=1, help='是否使用Gumbel-Softmax（1启用，0使用普通Softmax）')
+    parser.add_argument('--gumbel_temperature', type=float, default=1.0, help='Gumbel-Softmax温度（越小越接近argmax）')
+    parser.add_argument('--gumbel_hard', type=int, default=0, help='是否使用Straight-Through Gumbel（前向硬采样，反向软梯度）')
+    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -57,13 +62,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_pretrained_model(checkpoint_path, device, n_channels=None):
+def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     """加载预训练模型
     
     Args:
         checkpoint_path: checkpoint路径
         device: 设备
         n_channels: 通道数（如果提供且启用patch_attention，会在创建模型时立即初始化）
+        args: 命令行参数（用于Gumbel-Softmax配置）
     """
     print(f'加载预训练模型: {checkpoint_path}')
     # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
@@ -83,6 +89,13 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
     # 如果启用patch_attention且提供了通道数，添加到config中以便立即初始化
     if config.get('use_patch_attention', False) and n_channels is not None:
         config['n_channels'] = n_channels
+    
+    # 添加Gumbel-Softmax配置（微调阶段的码本查找）
+    if args is not None:
+        config['use_gumbel_softmax'] = bool(getattr(args, 'use_gumbel_softmax', 1))
+        config['gumbel_temperature'] = getattr(args, 'gumbel_temperature', 1.0)
+        config['gumbel_hard'] = bool(getattr(args, 'gumbel_hard', 0))
+        print(f'Gumbel-Softmax配置: use={config["use_gumbel_softmax"]}, temp={config["gumbel_temperature"]}, hard={config["gumbel_hard"]}')
     
     # 创建模型（如果use_patch_attention=True且n_channels存在，会自动初始化）
     model = PatchVQVAETransformer(config).to(device)
@@ -237,8 +250,8 @@ def main():
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
-    # 加载预训练模型（传入通道数以便立即初始化patch_attention）
-    model, config = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars)
+    # 加载预训练模型（传入通道数以便立即初始化patch_attention，传入args以配置Gumbel-Softmax）
+    model, config = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars, args=args)
     
     # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
     patch_attention_loaded = hasattr(model, 'patch_attention') and model.patch_attention is not None
