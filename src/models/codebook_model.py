@@ -132,16 +132,18 @@ class CodebookModel(nn.Module):
         
         self.train()  # 恢复训练模式
     
-    def encode_to_indices(self, x):
+    def encode_to_indices(self, x, return_distances=False):
         """
         编码为码本索引和量化向量（channel-independent版本）
         
         Args:
             x: [B, T, C]
+            return_distances: 是否返回到码本的距离（用于软索引计算）
         Returns:
             indices: [B, num_patches, C]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
+            distances (optional): [B*num_patches*C, codebook_size] 到码本的距离
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
@@ -176,11 +178,21 @@ class CodebookModel(nn.Module):
         # VQ量化（对每个通道独立进行）
         indices_list = []
         z_q_list = []
+        distances_list = []
         vq_loss_sum = 0
         
         for c in range(C):
             z_c = z_all[:, :, c, :]  # [B, num_patches, code_dim]
             z_c_flat = z_c.reshape(B * num_patches, self.code_dim)  # [B*num_patches, code_dim]
+            
+            # 计算到码本的距离
+            if return_distances:
+                distances_c = (
+                    torch.sum(z_c_flat ** 2, dim=1, keepdim=True) +
+                    torch.sum(self.vq.embedding.weight ** 2, dim=1) -
+                    2 * torch.matmul(z_c_flat, self.vq.embedding.weight.t())
+                )  # [B*num_patches, codebook_size]
+                distances_list.append(distances_c)
             
             # VQ
             vq_loss_c, z_q_flat_c, indices_c = self.vq(z_c_flat)
@@ -197,6 +209,11 @@ class CodebookModel(nn.Module):
         indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
         z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C  # 平均VQ损失
+        
+        if return_distances:
+            # 合并所有通道的距离: [C, B*num_patches, codebook_size] -> [B*num_patches*C, codebook_size]
+            distances = torch.cat(distances_list, dim=0)  # [B*num_patches*C, codebook_size]
+            return indices, vq_loss, z_q, distances
         
         return indices, vq_loss, z_q
     
