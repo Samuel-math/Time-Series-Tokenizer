@@ -103,12 +103,6 @@ def parse_args():
     parser.add_argument('--valid_sample_ratio', type=float, default=1.0,
                        help='验证集采样比例')
     
-    # Channel Attention参数
-    parser.add_argument('--use_channel_attention', type=int, default=0,
-                       help='是否使用Channel Attention模块')
-    parser.add_argument('--channel_attention_dropout', type=float, default=0.1,
-                       help='Channel Attention的dropout率')
-    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only_freq/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -132,8 +126,6 @@ def get_model_config(args):
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
         'use_patch_attention': False,
-        'use_channel_attention': bool(args.use_channel_attention),
-        'channel_attention_dropout': args.channel_attention_dropout,
     }
     return config
 
@@ -588,9 +580,8 @@ def main():
     
     # 模型文件名
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    ca_suffix = "_ca1" if args.use_channel_attention else ""
     freq_suffix = f"_freq{args.freq_weight}"
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{ca_suffix}{freq_suffix}_model{args.model_id}'
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{freq_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -663,9 +654,7 @@ def main():
     if len(trainable_params_list) == 0:
         raise ValueError(
             "错误: 没有可训练参数！\n"
-            "解决方案：\n"
-            "  1. 启用Channel Attention: --use_channel_attention 1\n"
-            "  2. 或禁用EMA: --codebook_ema 0"
+            "解决方案：禁用EMA: --codebook_ema 0"
         )
     
     # RevIN

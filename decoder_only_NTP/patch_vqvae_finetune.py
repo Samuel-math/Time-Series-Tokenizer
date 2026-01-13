@@ -80,19 +80,11 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
         print('检测到checkpoint中有patch_attention权重，强制启用use_patch_attention')
         config['use_patch_attention'] = True
     
-    # 检查checkpoint中是否有channel_attention权重
-    has_channel_attention = any('channel_attention' in k for k in state_dict.keys())
-    
-    # 如果checkpoint有channel_attention权重但config未开启，强制开启
-    if has_channel_attention and not config.get('use_channel_attention', False):
-        print('检测到checkpoint中有channel_attention权重，强制启用use_channel_attention')
-        config['use_channel_attention'] = True
-    
-    # 如果启用patch_attention或channel_attention且提供了通道数，添加到config中以便立即初始化
-    if (config.get('use_patch_attention', False) or config.get('use_channel_attention', False)) and n_channels is not None:
+    # 如果启用patch_attention且提供了通道数，添加到config中以便立即初始化
+    if config.get('use_patch_attention', False) and n_channels is not None:
         config['n_channels'] = n_channels
     
-    # 创建模型（如果use_patch_attention=True或use_channel_attention=True且n_channels存在，会自动初始化）
+    # 创建模型（如果use_patch_attention=True且n_channels存在，会自动初始化）
     model = PatchVQVAETransformer(config).to(device)
     
     # 直接加载所有权重（包括patch_attention），使用strict=False允许架构差异
@@ -105,15 +97,9 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None):
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层、channel attention和patch attention（将patch映射成码本前的所有参数）"""
+    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
     # 使用模型的方法冻结VQVAE组件
     model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
-    
-    # 冻结 channel attention（如果存在）
-    if hasattr(model, 'channel_attention') and model.channel_attention is not None:
-        for param in model.channel_attention.parameters():
-            param.requires_grad = False
-        print('✓ 已冻结 Channel Attention')
     
     # 冻结 patch attention（如果存在）
     if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:
@@ -263,21 +249,10 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     frozen_params = total_params - trainable_params
     
-    # 检查Channel Attention状态
-    has_channel_attention = hasattr(model, 'channel_attention') and model.channel_attention is not None
-    if has_channel_attention:
-        ca_total = sum(p.numel() for p in model.channel_attention.parameters())
-        ca_trainable = sum(p.numel() for p in model.channel_attention.parameters() if p.requires_grad)
-        ca_frozen = ca_total - ca_trainable
-    
     print(f'\n模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  可训练参数: {trainable_params:,}')
     print(f'  冻结参数: {frozen_params:,}')
-    if has_channel_attention:
-        print(f'  Channel Attention: {ca_total:,} 参数 (可训练: {ca_trainable:,}, 冻结: {ca_frozen:,})')
-        if ca_frozen == ca_total:
-            print(f'  ✓ Channel Attention已冻结')
     
     # AMP
     use_amp = bool(args.amp) and device.type == 'cuda'

@@ -77,12 +77,6 @@ def parse_args():
     parser.add_argument('--valid_sample_ratio', type=float, default=1.0,
                        help='验证集采样比例 (0.0-1.0)，例如0.1表示只使用10%%的验证数据')
     
-    # Channel Attention参数
-    parser.add_argument('--use_channel_attention', type=int, default=0,
-                       help='是否使用Channel Attention模块(1启用，0禁用)')
-    parser.add_argument('--channel_attention_dropout', type=float, default=0.1,
-                       help='Channel Attention的dropout率')
-    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -106,8 +100,6 @@ def get_model_config(args):
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
         'use_patch_attention': False,  # 码本预训练不使用patch attention
-        'use_channel_attention': bool(args.use_channel_attention),
-        'channel_attention_dropout': args.channel_attention_dropout,
     }
     return config
 
@@ -333,10 +325,9 @@ def main():
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 模型文件名（如果有channel_attention，添加_ca1后缀）
+    # 模型文件名
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    ca_suffix = "_ca1" if args.use_channel_attention else ""
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{ca_suffix}_model{args.model_id}'
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -408,24 +399,16 @@ def main():
     print(f'  VQ层: {vq_total:,} (可训练: {vq_trainable:,})')
     print(f'  码本初始化方法: {args.vq_init_method}')
     print(f'  使用EMA: {bool(args.codebook_ema)}')
-    if args.use_channel_attention:
-        ca_trainable = sum(p.numel() for p in model.channel_attention.parameters() if p.requires_grad)
-        ca_total = sum(p.numel() for p in model.channel_attention.parameters())
-        print(f'  ✓ Channel Attention已启用 (参数: {ca_total:,}, 可训练: {ca_trainable:,})')
     
     # 检查是否有可训练参数
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
     if len(trainable_params_list) == 0:
         raise ValueError(
             "错误: 没有可训练参数！\n"
-            f"  - use_channel_attention: {args.use_channel_attention}\n"
             f"  - codebook_ema: {args.codebook_ema}\n"
             f"  - VQ层参数数量: {vq_total:,}\n"
             f"  - VQ层可训练参数数量: {vq_trainable:,}\n"
-            "\n解决方案：\n"
-            "  1. 启用Channel Attention: --use_channel_attention 1\n"
-            "  2. 或禁用EMA: --codebook_ema 0\n"
-            "  3. 或同时启用Channel Attention和EMA（推荐）"
+            "\n解决方案：禁用EMA: --codebook_ema 0"
         )
     
     # RevIN

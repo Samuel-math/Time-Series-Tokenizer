@@ -55,11 +55,6 @@ N_HEADS=4
 D_FF=256
 DROPOUT=0.3
 
-# ----- Channel Attention 参数 -----
-# 遍历是否使用channel_attention（0=不使用，1=使用）
-CHANNEL_ATTENTION_LIST=(0)
-CHANNEL_ATTENTION_DROPOUT=0.1
-
 # ----- 批量训练配置 -----
 # 渐进式预训练的步长列表（patches数）
 PROGRESSIVE_STEP_SIZE_LIST=(6 3 1 9 12 15 18)
@@ -98,13 +93,12 @@ echo "数据集列表: ${DATASETS[@]}"
 echo "数据集数量: ${#DATASETS[@]}"
 echo "模型ID: ${MODEL_ID}"
 echo "Code Dim: ${CODE_DIM}"
-echo "Channel Attention设置: ${CHANNEL_ATTENTION_LIST[@]}"
 echo "Progressive Step Size列表: ${PROGRESSIVE_STEP_SIZE_LIST[@]}"
 echo "Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
 echo "微调固定 Context Points: ${FINETUNE_CONTEXT_POINTS}"
 echo "微调目标长度数: ${#TARGET_POINTS_LIST[@]}"
-echo "每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "总任务数: $(( ${#DATASETS[@]} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "每个数据集的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "总任务数: $(( ${#DATASETS[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo "================================================="
 
 # =====================================================
@@ -123,48 +117,14 @@ for DSET in "${DATASETS[@]}"; do
     echo "#########################################################################"
     
     # =====================================================
-    # Channel Attention 遍历循环
+    # 自动查找或训练码本模型
     # =====================================================
     
-    TOTAL_CA_SETTINGS=${#CHANNEL_ATTENTION_LIST[@]}
-    CURRENT_CA_SETTING=0
+    # 构建codebook模型名称
+    CODEBOOK_MODEL_NAME="codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_model${MODEL_ID}"
     
-    for USE_CHANNEL_ATTENTION in "${CHANNEL_ATTENTION_LIST[@]}"; do
-        CURRENT_CA_SETTING=$((CURRENT_CA_SETTING + 1))
-        
-        echo ""
-        echo "====================================================================="
-        echo "Channel Attention 设置 ${CURRENT_CA_SETTING}/${TOTAL_CA_SETTINGS}: ${USE_CHANNEL_ATTENTION} (${USE_CHANNEL_ATTENTION} = $([ "${USE_CHANNEL_ATTENTION}" -eq 1 ] && echo "启用" || echo "禁用"))"
-        echo "====================================================================="
-        
-        # =====================================================
-        # 自动查找或训练码本模型
-        # =====================================================
-        
-        # 构建codebook模型名称（根据channel_attention添加后缀）
-        CA_SUFFIX=""
-        if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
-            CA_SUFFIX="_ca1"
-        fi
-        CODEBOOK_MODEL_NAME="codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${CA_SUFFIX}_model${MODEL_ID}"
-        
-        # 为当前数据集和channel_attention设置构建VQVAE checkpoint路径
-        # 构建CA_SUFFIX（用于路径）
-        # 注意：codebook_pretrain.py 中的命名格式是 cd64{ca_suffix}_model1
-        # 其中 ca_suffix 是 "_ca1" 或 ""（空字符串）
-        # 所以：
-        # - 不使用 CA: cd64 + "" + _model1 = cd64_model1
-        # - 使用 CA: cd64 + _ca1 + _model1 = cd64_ca1_model1
-        CA_SUFFIX_FOR_PATH=""
-        if [ "${USE_CHANNEL_ATTENTION}" -eq 1 ]; then
-            CA_SUFFIX_FOR_PATH="_ca1"
-        else
-            # 当不使用 CA 时，ca_suffix 是空字符串
-            CA_SUFFIX_FOR_PATH=""
-        fi
-        
-        # 直接构建完整的路径，不使用占位符
-        DSET_VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${CA_SUFFIX_FOR_PATH}_model${MODEL_ID}.pth"
+    # 直接构建完整的路径
+    DSET_VQVAE_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_model${MODEL_ID}.pth"
         
         # 处理相对路径
         if [[ ! "${DSET_VQVAE_CHECKPOINT}" = /* ]]; then
@@ -190,7 +150,6 @@ for DSET in "${DATASETS[@]}"; do
             echo "自动训练 Codebook 模型"
             echo "================================================="
             echo "数据集: ${DSET}"
-            echo "Channel Attention: ${USE_CHANNEL_ATTENTION}"
             echo "模型名称: ${CODEBOOK_MODEL_NAME}"
             echo "================================================="
             
@@ -209,8 +168,6 @@ for DSET in "${DATASETS[@]}"; do
             
             # 注意：使用EMA时，VQ的embedding会被冻结（EMA自动更新）
             # 但由于Encoder和Decoder是可训练的，所以仍然有可训练参数
-            # 如果USE_CHANNEL_ATTENTION=0，只有Encoder和Decoder可训练
-            # 如果USE_CHANNEL_ATTENTION=1，Encoder、Decoder和Channel Attention都可训练
             
             # 根据数据集设置采样参数（electricity 使用 0.3，其他数据集使用 1.0）
             if [ "${DSET}" = "electricity" ]; then
@@ -236,8 +193,6 @@ for DSET in "${DATASETS[@]}"; do
                 --codebook_ema ${CODEBOOK_EMA} \
                 --ema_decay ${EMA_DECAY} \
                 --ema_eps ${EMA_EPS} \
-                --use_channel_attention ${USE_CHANNEL_ATTENTION} \
-                --channel_attention_dropout ${CHANNEL_ATTENTION_DROPOUT} \
                 --n_epochs 50 \
                 --lr 1e-4 \
                 --weight_decay ${WEIGHT_DECAY} \
@@ -419,15 +374,6 @@ for DSET in "${DATASETS[@]}"; do
     
     echo ""
     echo "================================================="
-    echo "Channel Attention=${USE_CHANNEL_ATTENTION} 的所有任务完成！"
-    echo "================================================="
-    echo "预训练模型保存在: saved_models/patch_vqvae/${DSET}/"
-    echo "微调模型保存在: saved_models/patch_vqvae_finetune/${DSET}/"
-    echo "================================================="
-    done
-    
-    echo ""
-    echo "================================================="
     echo "数据集 ${DSET} 的所有任务完成！"
     echo "================================================="
     echo "预训练模型保存在: saved_models/patch_vqvae/${DSET}/"
@@ -443,12 +389,10 @@ echo "批量训练结束时间: $(date)"
 echo ""
 echo "训练统计:"
 echo "  数据集数量: ${TOTAL_DATASETS}"
-echo "  Channel Attention设置数: ${#CHANNEL_ATTENTION_LIST[@]}"
 echo "  Progressive Step Size数量: ${#PROGRESSIVE_STEP_SIZE_LIST[@]}"
 echo "  每个Progressive Step Size的微调任务数: ${#TARGET_POINTS_LIST[@]}"
-echo "  每个数据集每个CA设置的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "  每个数据集的总任务数: $(( ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
-echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#CHANNEL_ATTENTION_LIST[@]} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  每个数据集的任务数: $(( ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
+echo "  总任务数: $(( ${TOTAL_DATASETS} * ${#PROGRESSIVE_STEP_SIZE_LIST[@]} * (1 + ${#TARGET_POINTS_LIST[@]}) ))"
 echo ""
 echo "结果保存位置:"
 for DSET in "${DATASETS[@]}"; do

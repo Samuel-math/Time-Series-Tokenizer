@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .vqvae import Encoder, Decoder
 from .patch_vqvae_transformer import FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA
-from .channel_attention import ChannelAttention
 
 
 class CodebookModel(nn.Module):
@@ -45,17 +44,6 @@ class CodebookModel(nn.Module):
             compression_factor=self.compression_factor,
             out_channels=1
         )
-        
-        # Channel Attention模块（在VQ之前）
-        self.use_channel_attention = config.get('use_channel_attention', False)
-        if self.use_channel_attention:
-            self.channel_attention = ChannelAttention(
-                code_dim=self.code_dim,
-                n_channels=n_channels,
-                dropout=config.get('channel_attention_dropout', 0.1)
-            )
-        else:
-            self.channel_attention = None
         
         # VQ
         init_method = config.get('vq_init_method', 'random')
@@ -170,10 +158,6 @@ class CodebookModel(nn.Module):
         
         # 合并所有通道: [B, num_patches, C, code_dim]
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
-        
-        # Channel Attention（如果启用）
-        if self.use_channel_attention and self.channel_attention is not None:
-            z_all = self.channel_attention(z_all)  # [B, num_patches, C, code_dim]
         
         # VQ量化（对每个通道独立进行）
         indices_list = []

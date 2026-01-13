@@ -59,10 +59,6 @@ SOFT_INDEX_TEMPERATURE=1.0       # 普通Softmax温度
 TRAIN_SAMPLE_RATIO=1.0
 VALID_SAMPLE_RATIO=1.0
 
-# ============ Channel Attention参数 ============
-USE_CHANNEL_ATTENTION=1
-CHANNEL_ATTENTION_DROPOUT=0.1
-
 # ============ 保存参数 ============
 SAVE_PATH="saved_models/vqvae_only_freq/"
 MODEL_ID=1
@@ -117,8 +113,6 @@ python codebook_pretrain_freq.py \
     --soft_index_temperature $SOFT_INDEX_TEMPERATURE \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
-    --use_channel_attention $USE_CHANNEL_ATTENTION \
-    --channel_attention_dropout $CHANNEL_ATTENTION_DROPOUT \
     --save_path $SAVE_PATH \
     --model_id $MODEL_ID
 

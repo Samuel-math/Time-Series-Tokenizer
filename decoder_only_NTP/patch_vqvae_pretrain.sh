@@ -25,6 +25,4 @@ python patch_vqvae_pretrain.py \
     --revin 1 \
     --vq_weight 0.5 \
     --recon_weight 0.1 \
-    --use_channel_attention 1 \
-    --channel_attention_dropout 0.1 \
     --model_id 1
