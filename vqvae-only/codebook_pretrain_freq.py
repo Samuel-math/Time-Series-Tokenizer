@@ -85,8 +85,10 @@ def parse_args():
                        help='InfoNCE损失的温度系数')
     
     # ============ 频域损失warmup参数 ============
+    parser.add_argument('--freq_delay_epochs', type=int, default=20,
+                       help='前N个epoch完全禁用频域损失（权重=0）')
     parser.add_argument('--freq_warmup_epochs', type=int, default=10,
-                       help='频域损失权重warmup的epoch数')
+                       help='延迟后，频域损失权重warmup的epoch数')
     parser.add_argument('--freq_weight_start', type=float, default=0.01,
                        help='频域损失权重的起始值（warmup开始时的值）')
     
@@ -125,7 +127,12 @@ def get_model_config(args):
 
 def get_freq_weight_with_warmup(args, current_epoch):
     """
-    计算当前epoch的频域损失权重（带warmup）
+    计算当前epoch的频域损失权重（带延迟和warmup）
+    
+    逻辑：
+    1. epoch < delay_epochs: 权重 = 0（完全禁用freq_loss）
+    2. delay_epochs <= epoch < delay_epochs + warmup_epochs: 线性warmup
+    3. epoch >= delay_epochs + warmup_epochs: 权重 = freq_weight（目标权重）
     
     Args:
         args: 参数
@@ -134,18 +141,27 @@ def get_freq_weight_with_warmup(args, current_epoch):
     Returns:
         freq_weight: 当前的频域损失权重
     """
+    delay_epochs = getattr(args, 'freq_delay_epochs', 20)
     warmup_epochs = getattr(args, 'freq_warmup_epochs', 10)
     weight_start = getattr(args, 'freq_weight_start', 0.01)
     weight_end = args.freq_weight
     
-    if current_epoch >= warmup_epochs:
-        return weight_end
+    # 阶段1：延迟期（完全禁用）
+    if current_epoch < delay_epochs:
+        return 0.0
     
-    # 线性warmup
-    progress = current_epoch / warmup_epochs
-    freq_weight = weight_start + (weight_end - weight_start) * progress
+    # 阶段2：warmup期
+    warmup_start_epoch = delay_epochs
+    warmup_end_epoch = delay_epochs + warmup_epochs
     
-    return freq_weight
+    if current_epoch < warmup_end_epoch:
+        # 线性warmup：从 weight_start 到 weight_end
+        progress = (current_epoch - warmup_start_epoch) / warmup_epochs
+        freq_weight = weight_start + (weight_end - weight_start) * progress
+        return freq_weight
+    
+    # 阶段3：正常训练
+    return weight_end
 
 
 def compute_freq_magnitude(x, dim=-1):
@@ -629,8 +645,15 @@ def main():
         # 获取当前频域损失权重（用于打印）
         current_freq_weight = train_metrics.get('current_freq_weight', args.freq_weight)
         
-        # 打印进度（显示当前warmup状态）
-        warmup_info = f"[warmup {current_freq_weight:.4f}]" if epoch < getattr(args, 'freq_warmup_epochs', 10) else ""
+        # 打印进度（显示当前状态：delay/warmup/normal）
+        delay_epochs = getattr(args, 'freq_delay_epochs', 20)
+        warmup_epochs = getattr(args, 'freq_warmup_epochs', 10)
+        if epoch < delay_epochs:
+            warmup_info = f"[delay {epoch+1}/{delay_epochs}]"
+        elif epoch < delay_epochs + warmup_epochs:
+            warmup_info = f"[warmup {current_freq_weight:.4f}]"
+        else:
+            warmup_info = ""
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train: total={train_metrics['loss']:.4f} "
               f"(recon={train_metrics['recon_loss']:.4f}, "

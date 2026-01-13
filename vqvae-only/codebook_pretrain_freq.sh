@@ -48,8 +48,9 @@ FREQ_SIMILARITY_THRESHOLD=0.8    # 相似度阈值（高于此阈值的样本对
 FREQ_LOSS_TYPE="mse"             # 损失类型: "mse" 或 "infonce"
 FREQ_TEMPERATURE=0.1             # InfoNCE温度系数
 
-# ============ 频域损失Warmup参数 ============
-FREQ_WARMUP_EPOCHS=10            # Warmup的epoch数
+# ============ 频域损失延迟和Warmup参数 ============
+FREQ_DELAY_EPOCHS=20             # 前N个epoch完全禁用freq_loss（权重=0）
+FREQ_WARMUP_EPOCHS=10            # 延迟后，Warmup的epoch数
 FREQ_WEIGHT_START=0.01           # Warmup起始权重（从小到大逐渐增加到FREQ_WEIGHT）
 
 # ============ 数据采样参数 ============
@@ -66,7 +67,7 @@ echo "=============================================="
 echo "数据集: $DSET"
 echo "Patch大小: $PATCH_SIZE"
 echo "码本大小: $CODEBOOK_SIZE"
-echo "频域损失权重: $FREQ_WEIGHT (warmup: $FREQ_WEIGHT_START -> $FREQ_WEIGHT, ${FREQ_WARMUP_EPOCHS} epochs)"
+echo "频域损失权重: $FREQ_WEIGHT (delay: ${FREQ_DELAY_EPOCHS} epochs, warmup: $FREQ_WEIGHT_START -> $FREQ_WEIGHT, ${FREQ_WARMUP_EPOCHS} epochs)"
 echo "频域损失类型: $FREQ_LOSS_TYPE"
 echo "相似度阈值: $FREQ_SIMILARITY_THRESHOLD"
 echo "=============================================="
@@ -103,6 +104,7 @@ python codebook_pretrain_freq.py \
     --freq_similarity_threshold $FREQ_SIMILARITY_THRESHOLD \
     --freq_loss_type $FREQ_LOSS_TYPE \
     --freq_temperature $FREQ_TEMPERATURE \
+    --freq_delay_epochs $FREQ_DELAY_EPOCHS \
     --freq_warmup_epochs $FREQ_WARMUP_EPOCHS \
     --freq_weight_start $FREQ_WEIGHT_START \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
