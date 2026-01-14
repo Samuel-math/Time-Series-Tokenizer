@@ -105,9 +105,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         # 渐进式预训练：拼接输入和目标，使用完整序列
         batch_full = torch.cat([batch_x, batch_y], dim=1)  # [B, input_len + target_len, C]
         
-        # 前向传播：渐进式预测
+        # 前向传播：渐进式预测（如果recon_weight=0则跳过decoder调用）
+        compute_recon = args.recon_weight > 0
         all_logits, all_target_indices, vq_loss, recon_loss = model.forward_progressive_pretrain(
-            batch_full, step_size=step_size, max_stages=args.progressive_max_stages
+            batch_full, step_size=step_size, max_stages=args.progressive_max_stages,
+            compute_recon_loss=compute_recon
         )
         
         # 计算所有阶段的预测损失
@@ -171,9 +173,11 @@ def validate_epoch(model, dataloader, revin, args, device):
             # 渐进式预训练：拼接输入和目标，使用完整序列
             batch_full = torch.cat([batch_x, batch_y], dim=1)  # [B, input_len + target_len, C]
             
-            # 前向传播：渐进式预测
+            # 前向传播：渐进式预测（如果recon_weight=0则跳过decoder调用）
+            compute_recon = args.recon_weight > 0
             all_logits, all_target_indices, vq_loss, recon_loss = model.forward_progressive_pretrain(
-                batch_full, step_size=step_size, max_stages=args.progressive_max_stages
+                batch_full, step_size=step_size, max_stages=args.progressive_max_stages,
+                compute_recon_loss=compute_recon
             )
             
             # 计算所有阶段的预测损失

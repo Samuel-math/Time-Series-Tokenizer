@@ -715,7 +715,7 @@ class PatchVQVAETransformer(nn.Module):
     
     def decode_from_codes(self, z_q):
         """
-        从量化向量解码（channel-independent版本）
+        从量化向量解码（channel-independent版本，批量化优化）
         
         Args:
             z_q: [B, num_patches, C, code_dim]
@@ -724,29 +724,26 @@ class PatchVQVAETransformer(nn.Module):
         """
         B, num_patches, C, code_dim = z_q.shape
         
-        # Channel-independent: 对每个通道独立解码
-        x_recon_list = []
+        # ============ 批量化优化：将所有通道合并为一个大batch ============
+        # [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
+        z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
         
-        for c in range(C):
-            # 提取第c个通道的量化向量: [B, num_patches, code_dim]
-            z_q_c = z_q[:, :, c, :]  # [B, num_patches, code_dim]
-            
-            # Reshape for decoder: [B*num_patches, embedding_dim, compressed_len]
-            z_q_c_flat = z_q_c.reshape(B * num_patches, self.embedding_dim, self.compressed_len)
-            
-            # VQVAE Decoder (单通道输出)
-            x_recon_c = self.decoder(z_q_c_flat, self.compression_factor)  # [B*num_patches, patch_size]
-            x_recon_c = x_recon_c.reshape(B, num_patches, self.patch_size)  # [B, num_patches, patch_size]
-            
-            x_recon_list.append(x_recon_c)
+        # Reshape for decoder: [B*C*num_patches, embedding_dim, compressed_len]
+        z_q_for_decoder = z_q_flat.reshape(B * C * num_patches, self.embedding_dim, self.compressed_len)
         
-        # 合并所有通道: [B, num_patches, patch_size, C]
-        x_recon = torch.stack(x_recon_list, dim=3)  # [B, num_patches, patch_size, C]
-        x_recon = x_recon.reshape(B, -1, C)  # [B, num_patches * patch_size, C]
+        # 单次decoder调用（关键优化点！）
+        x_recon_flat = self.decoder(z_q_for_decoder, self.compression_factor)  # [B*C*num_patches, patch_size]
+        
+        # Reshape回原始格式
+        # [B*C*num_patches, patch_size] -> [B, C, num_patches, patch_size]
+        x_recon_reshaped = x_recon_flat.reshape(B, C, num_patches, self.patch_size)
+        
+        # [B, C, num_patches, patch_size] -> [B, num_patches, patch_size, C] -> [B, num_patches*patch_size, C]
+        x_recon = x_recon_reshaped.permute(0, 2, 3, 1).reshape(B, -1, C)
         
         return x_recon
     
-    def forward_progressive_pretrain(self, x_full, step_size, max_stages=None):
+    def forward_progressive_pretrain(self, x_full, step_size, max_stages=None, compute_recon_loss=True):
         """
         渐进式预训练: 使用不同长度的上下文预测固定长度的未来tokens
         
@@ -759,12 +756,13 @@ class PatchVQVAETransformer(nn.Module):
             x_full: [B, total_len, C] 完整序列
             step_size: int, 每个阶段的步长（以patches为单位）
             max_stages: int, 最大阶段数。如果为None，则使用所有可能的阶段
+            compute_recon_loss: bool, 是否计算重构损失。如果recon_weight=0可设为False以跳过decoder调用
         
         Returns:
             all_logits: List of [B, num_target_patches, C, codebook_size] 每个阶段的预测logits
             all_target_indices: List of [B, num_target_patches, C] 每个阶段的目标索引
             vq_loss: VQ损失（所有阶段的平均）
-            recon_loss: 重构损失（所有阶段的平均）
+            recon_loss: 重构损失（如果compute_recon_loss=False则为0.0）
         """
         B, total_len, C = x_full.shape
         
@@ -785,88 +783,88 @@ class PatchVQVAETransformer(nn.Module):
         all_logits = []
         all_target_indices = []
         all_vq_losses = []
-        all_recon_losses = []
         
         # Channel-independent处理: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
         B, num_patches, C, code_dim = z_q_full.shape
         z_q_full_flat = z_q_full.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
         
-        # 遍历每个阶段
+        # 逐阶段处理
         for stage in range(1, max_stages + 1):
-            context_size = stage * step_size  # 当前阶段的上下文长度
-            target_start = (stage - 1) * step_size  # 目标序列的起始位置
-            target_end = stage * step_size  # 目标序列的结束位置
+            context_size = stage * step_size
+            target_start = (stage - 1) * step_size
+            target_end = stage * step_size
             
             if target_end > num_patches:
                 break
             
-            # 提取当前阶段的上下文和目标（直接使用已编码的完整序列）
+            # 提取上下文
             z_q_context = z_q_full_flat[:, :context_size, :]  # [B*C, context_size, code_dim]
-            target_indices_stage = full_indices[:, target_start:target_end, :]  # [B, step_size, C]
             
-            # 重构损失（仅使用上下文序列）
-            # 从已编码的完整序列中提取上下文部分，避免重复编码
-            z_q_context_for_recon = z_q_full[:, :context_size, :, :]  # [B, context_size, C, code_dim]
-            x_recon_context = self.decode_from_codes(z_q_context_for_recon)
-            
-            # 计算上下文对应的原始序列长度
-            context_len = context_size * self.patch_size
-            x_context = x_full[:, :context_len, :]  # [B, context_len, C]
-            
-            # 重构损失
-            recon_loss_stage = F.mse_loss(
-                x_recon_context, 
-                x_context[:, :x_recon_context.shape[1], :]
-            )
-            
-            # VQ损失（使用完整序列的VQ损失，简化处理）
-            vq_loss_context = vq_loss_full
-            
-            # 创建占位符用于预测目标序列
-            num_target_patches = step_size
+            # 创建占位符
             placeholder = torch.zeros(
-                B * C, num_target_patches, code_dim,
+                B * C, step_size, code_dim,
                 device=z_q_context.device, dtype=z_q_context.dtype
             )
             
             # 拼接上下文和占位符
-            full_sequence_stage = torch.cat([z_q_context, placeholder], dim=1)
+            full_sequence_stage = torch.cat([z_q_context, placeholder], dim=1)  # [B*C, context_size + step_size, code_dim]
             
-            # Transformer处理完整序列
-            h_full_stage = self.transformer(full_sequence_stage)
+            # Transformer 前向传播
+            h_full_stage = self.transformer(full_sequence_stage)  # [B*C, context_size + step_size, code_dim]
             
-            # 只取占位符位置的输出
-            h_target_stage = h_full_stage[:, context_size:, :]
+            # 提取占位符位置的输出（预测结果）
+            h_target_stage = h_full_stage[:, context_size:context_size + step_size, :]  # [B*C, step_size, code_dim]
+            
+            # 提取目标索引
+            target_indices_stage = full_indices[:, target_start:target_end, :]  # [B, step_size, C]
             
             # 输出头: 预测目标序列的索引概率分布
-            logits_flat_stage = self.output_head(h_target_stage)  # [B*C, num_target_patches, codebook_size]
+            logits_flat_stage = self.output_head(h_target_stage)  # [B*C, step_size, codebook_size]
             
             # Reshape回通道分离格式
-            logits_stage = logits_flat_stage.reshape(B, C, num_target_patches, -1).permute(
+            logits_stage = logits_flat_stage.reshape(B, C, step_size, -1).permute(
                 0, 2, 1, 3
-            )  # [B, num_target_patches, C, codebook_size]
+            )  # [B, step_size, C, codebook_size]
             
             all_logits.append(logits_stage)
             all_target_indices.append(target_indices_stage)
-            all_vq_losses.append(vq_loss_context)
-            all_recon_losses.append(recon_loss_stage)
+            all_vq_losses.append(vq_loss_full)
         
-        # 计算平均损失
+        if len(all_logits) == 0:
+            raise ValueError(f"序列长度不足：总patches={num_patches}, step_size={step_size}, 无法创建任何阶段")
+        
+        # ============ 优化：重构损失只计算一次（移出循环）============
+        # 如果不需要计算重构损失（例如recon_weight=0），完全跳过decoder调用
+        if compute_recon_loss:
+            # 对完整序列计算一次重构损失，而不是每个阶段都计算
+            x_recon_full = self.decode_from_codes(z_q_full)  # 单次decoder调用
+            recon_loss = F.mse_loss(x_recon_full, x_full[:, :x_recon_full.shape[1], :])
+        else:
+            # 完全跳过decoder调用
+            recon_loss = torch.tensor(0.0, device=x_full.device)
+        
+        # 计算平均VQ损失
         vq_loss = sum(all_vq_losses) / len(all_vq_losses)
-        recon_loss = sum(all_recon_losses) / len(all_recon_losses)
         
         return all_logits, all_target_indices, vq_loss, recon_loss
     
-    def forward_finetune(self, x, target_len):
+    def forward_finetune(self, x, target_len, step_size=None):
         """
-        微调: 预测未来序列（非自回归版本，channel-independent）
+        微调: 预测未来序列（批量自回归版本，channel-independent）
         
         1. 编码输入为量化向量
-        2. 创建占位符位置（pred_len / patch_size个）
-        3. Transformer 处理整个序列（输入 + 占位符），一次性预测所有未来patches
-        4. 从码本获取向量并解码
+        2. 每步预测 step_size 个 patches，然后将预测结果加入上下文
+        3. 重复直到预测完所有需要的 patches
+        4. 最后一次性解码所有预测的 codes
         
-        非自回归：先留出对应数量的位置，然后对应预测，最终解码
+        Args:
+            x: [B, T, C] 输入序列
+            target_len: int, 目标预测长度（时间步）
+            step_size: int, 每步预测的 patch 数量。如果为 None，则一次性预测所有 patches（非自回归）
+        
+        Returns:
+            pred: [B, target_len, C] 预测序列
+            vq_loss: VQ 损失
         """
         B, T, C = x.shape
         num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
@@ -880,36 +878,81 @@ class PatchVQVAETransformer(nn.Module):
         B, num_patches, C, code_dim = z_q.shape
         z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
         
-        # 创建占位符（零向量）: [B*C, num_pred_patches, code_dim]
-        placeholder = torch.zeros(B * C, num_pred_patches, self.code_dim, device=z_q_flat.device, dtype=z_q_flat.dtype)
-        
-        # 拼接输入序列和占位符: [B*C, num_patches + num_pred_patches, code_dim]
-        full_sequence = torch.cat([z_q_flat, placeholder], dim=1)  # [B*C, num_patches + num_pred_patches, code_dim]
-        
-        # Transformer处理整个序列（causal mask确保占位符只能看到输入序列，不能看到其他占位符）
-        h_full = self.transformer(full_sequence)  # [B*C, num_patches + num_pred_patches, code_dim]
-        
-        # 只取占位符位置的输出: [B*C, num_pred_patches, code_dim]
-        h_pred = h_full[:, num_input_patches:, :]  # [B*C, num_pred_patches, code_dim]
-        
-        # 输出头: [B*C, num_pred_patches, codebook_size]
-        logits = self.output_head(h_pred)  # [B*C, num_pred_patches, codebook_size]
-        
-        # 使用 Gumbel-Softmax 或 普通Softmax 替代 argmax，保持可微分
-        if self.use_gumbel_softmax and self.training:
-            # 训练时使用 Gumbel-Softmax（增加探索性）
-            weights = F.gumbel_softmax(logits, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
-        else:
-            # 推理时使用普通 Softmax（确定性）
-            weights = F.softmax(logits, dim=-1)  # [B*C, num_pred_patches, codebook_size]
-        
         codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
-        pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
         
-        # Reshape回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
-        pred_codes = pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)  # [B, num_pred_patches, C, code_dim]
+        # 如果没有指定 step_size 或 step_size >= num_pred_patches，使用非自回归模式
+        if step_size is None or step_size >= num_pred_patches:
+            # ============ 非自回归模式：一次性预测所有 patches ============
+            placeholder = torch.zeros(B * C, num_pred_patches, self.code_dim, device=z_q_flat.device, dtype=z_q_flat.dtype)
+            full_sequence = torch.cat([z_q_flat, placeholder], dim=1)
+            
+            h_full = self.transformer(full_sequence)
+            h_pred = h_full[:, num_input_patches:, :]
+            logits = self.output_head(h_pred)
+            
+            if self.use_gumbel_softmax and self.training:
+                weights = F.gumbel_softmax(logits, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
+            else:
+                weights = F.softmax(logits, dim=-1)
+            
+            all_pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
+        else:
+            # ============ 批量自回归模式：每步预测 step_size 个 patches ============
+            # 计算需要多少步
+            num_steps = (num_pred_patches + step_size - 1) // step_size
+            
+            # 当前上下文（会逐步增长）
+            current_context = z_q_flat  # [B*C, num_input_patches, code_dim]
+            all_pred_codes_list = []
+            
+            remaining_patches = num_pred_patches
+            
+            for step in range(num_steps):
+                # 本步需要预测的 patch 数量
+                patches_to_predict = min(step_size, remaining_patches)
+                
+                # 创建本步的占位符
+                placeholder = torch.zeros(
+                    B * C, patches_to_predict, self.code_dim,
+                    device=current_context.device, dtype=current_context.dtype
+                )
+                
+                # 拼接当前上下文和占位符
+                full_sequence = torch.cat([current_context, placeholder], dim=1)
+                
+                # Transformer 前向传播
+                h_full = self.transformer(full_sequence)
+                
+                # 提取占位符位置的输出
+                context_len = current_context.shape[1]
+                h_pred_step = h_full[:, context_len:, :]  # [B*C, patches_to_predict, code_dim]
+                
+                # 预测 logits
+                logits_step = self.output_head(h_pred_step)  # [B*C, patches_to_predict, codebook_size]
+                
+                # 获取预测的 codes
+                if self.use_gumbel_softmax and self.training:
+                    weights_step = F.gumbel_softmax(logits_step, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
+                else:
+                    weights_step = F.softmax(logits_step, dim=-1)
+                
+                pred_codes_step = torch.matmul(weights_step, codebook)  # [B*C, patches_to_predict, code_dim]
+                
+                # 保存本步预测结果
+                all_pred_codes_list.append(pred_codes_step)
+                
+                # 更新上下文：将预测的 codes 加入
+                current_context = torch.cat([current_context, pred_codes_step], dim=1)
+                
+                remaining_patches -= patches_to_predict
+            
+            # 合并所有预测的 codes
+            all_pred_codes = torch.cat(all_pred_codes_list, dim=1)  # [B*C, num_pred_patches, code_dim]
         
-        # 解码
+        # Reshape 回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
+        pred_codes = all_pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)
+        
+        # 解码（优化后的批量解码）
         pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
         pred = pred[:, :target_len, :]  # [B, target_len, C]
         

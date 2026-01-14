@@ -55,6 +55,9 @@ def parse_args():
     parser.add_argument('--gumbel_temperature', type=float, default=1.0, help='Gumbel-Softmax温度（越小越接近argmax）')
     parser.add_argument('--gumbel_hard', type=int, default=0, help='是否使用Straight-Through Gumbel（前向硬采样，反向软梯度）')
     
+    # 自回归预测参数
+    parser.add_argument('--ar_step_size', type=int, default=None, help='自回归步长（每步预测的patch数）。None表示非自回归（一次预测所有）')
+    
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -70,6 +73,11 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
         device: 设备
         n_channels: 通道数（如果提供且启用patch_attention，会在创建模型时立即初始化）
         args: 命令行参数（用于Gumbel-Softmax配置）
+    
+    Returns:
+        model: 加载的模型
+        config: 模型配置
+        pretrain_args: 预训练时的参数（用于获取step_size等）
     """
     print(f'加载预训练模型: {checkpoint_path}')
     # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
@@ -77,6 +85,7 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     
     config = checkpoint['config']
     state_dict = checkpoint['model_state_dict']
+    pretrain_args = checkpoint.get('args', {})  # 获取预训练时的参数
     
     # 检查checkpoint中是否有patch_attention权重
     has_patch_attention = any('patch_attention' in k for k in state_dict.keys())
@@ -106,7 +115,11 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     print(f'预训练模型配置: {config}')
     print(f'预训练验证损失: {checkpoint.get("val_loss", "N/A")}')
     
-    return model, config
+    # 打印预训练时的step_size（如果存在）
+    if 'progressive_step_size' in pretrain_args:
+        print(f'预训练step_size: {pretrain_args["progressive_step_size"]}')
+    
+    return model, config, pretrain_args
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
@@ -131,8 +144,8 @@ def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
         batch_x = revin(batch_x, 'norm')
     
     with amp.autocast(enabled=scaler.is_enabled()):
-        # 前向传播: 预测码本索引 -> 解码
-        pred, _ = model.forward_finetune(batch_x, args.target_points)
+        # 前向传播: 预测码本索引 -> 解码（支持自回归步长）
+        pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
         
         # RevIN反归一化
         if revin:
@@ -169,7 +182,7 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
                 batch_x = revin(batch_x, 'norm')
             
             with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(batch_x, args.target_points)
+                pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
             
             if revin:
                 pred = revin(pred, 'denorm')
@@ -198,7 +211,7 @@ def test_model(model, dataloader, revin, args, device, use_amp):
                 batch_x = revin(batch_x, 'norm')
             
             with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(batch_x, args.target_points)
+                pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
             
             # 验证预测长度与目标长度一致
             assert pred.shape[1] == batch_y.shape[1] == args.target_points, \
@@ -251,7 +264,12 @@ def main():
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
     # 加载预训练模型（传入通道数以便立即初始化patch_attention，传入args以配置Gumbel-Softmax）
-    model, config = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars, args=args)
+    model, config, pretrain_args = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars, args=args)
+    
+    # 自动继承预训练的step_size（如果finetune时未指定ar_step_size）
+    if args.ar_step_size is None and 'progressive_step_size' in pretrain_args:
+        args.ar_step_size = pretrain_args['progressive_step_size']
+        print(f'✓ 自动继承预训练step_size: {args.ar_step_size}')
     
     # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
     patch_attention_loaded = hasattr(model, 'patch_attention') and model.patch_attention is not None
