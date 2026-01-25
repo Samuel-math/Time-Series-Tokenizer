@@ -19,16 +19,16 @@
 # 配置参数
 # =====================================================
 
-DSET=$1
+DSET='etth1'
 MODEL_ID=1
 
 # ----- 码本模型路径（相对于decoder-only目录）-----
 # 如果为空，脚本会自动查找，或手动指定完整路径
-CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps16_cb256_cd128_model1.pth"
+CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps8_cb256_cd32_model1.pth"
 # CODEBOOK_CHECKPOINT=""  # 如果为空，脚本会自动查找
 
 # ----- Patch 参数（会从码本checkpoint中自动读取，这里作为备用）-----
-PATCH_SIZE=16
+PATCH_SIZE=8
 COMPRESSION_FACTOR=8
 
 # ----- VQVAE 参数（会从码本checkpoint中自动读取，这里作为备用）-----
@@ -36,15 +36,15 @@ EMBEDDING_DIM=32
 CODEBOOK_SIZE=256
 NUM_HIDDENS=64
 NUM_RESIDUAL_LAYERS=2
-NUM_RESIDUAL_HIDDENS=32
+NUM_RESIDUAL_HIDDENS=64
 
 # ----- Transformer 参数 -----
 # code_dim = embedding_dim * (patch_size / compression_factor)
 # n_heads 需要整除 code_dim
-N_LAYERS=4
-N_HEADS=4
-D_FF=256
-DROPOUT=0.3
+N_LAYERS=3
+N_HEADS=8
+D_FF=128
+DROPOUT=0.2
 CODEBOOK_EMA=1
 EMA_DECAY=0.99
 EMA_EPS=1e-5
@@ -53,8 +53,8 @@ EMA_EPS=1e-5
 TRANSFORMER_HIDDEN_DIM=""  # 留空表示使用默认值（code_dim），可根据需要设置
 
 # ----- 预训练参数 -----
-PRETRAIN_CONTEXT_POINTS=$2
-PROGRESSIVE_STEP_SIZE=$3  # 渐进式预训练的步长（patches数）
+PRETRAIN_CONTEXT_POINTS=$1
+PROGRESSIVE_STEP_SIZE=$2  # 渐进式预训练的步长（patches数）
 PRETRAIN_EPOCHS=100
 PRETRAIN_BATCH_SIZE=128
 PRETRAIN_LR=3e-4
@@ -62,15 +62,15 @@ VQ_WEIGHT=0.0  # 码本已冻结，设为0
 RECON_WEIGHT=0.0  # 码本已冻结，设为0
 
 # ----- 微调参数 -----
-FINETUNE_CONTEXT_POINTS=512
+FINETUNE_CONTEXT_POINTS=192
 FINETUNE_EPOCHS=50
-FINETUNE_BATCH_SIZE=64
-FINETUNE_LR=1e-4
+FINETUNE_BATCH_SIZE=32
+FINETUNE_LR=3e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
 # ----- Gumbel-Softmax参数（微调阶段的码本查找）-----
 USE_GUMBEL_SOFTMAX=1           # 是否使用Gumbel-Softmax（1启用，0使用普通Softmax）
-GUMBEL_TEMPERATURE=1.0         # Gumbel-Softmax温度（越小越接近argmax，建议0.5-2.0）
+GUMBEL_TEMPERATURE=1.3         # Gumbel-Softmax温度（越小越接近argmax，建议0.5-2.0）
 GUMBEL_HARD=0                  # 是否使用Straight-Through（前向硬采样，反向软梯度）
 
 # ----- 自回归预测参数 -----

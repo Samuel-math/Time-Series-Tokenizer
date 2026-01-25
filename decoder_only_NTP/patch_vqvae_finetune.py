@@ -71,46 +71,51 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     Args:
         checkpoint_path: checkpoint路径
         device: 设备
-        n_channels: 通道数（如果提供且启用patch_attention，会在创建模型时立即初始化）
+        n_channels: 通道数（未使用，保留以兼容旧代码）
         args: 命令行参数（用于Gumbel-Softmax配置）
     
     Returns:
         model: 加载的模型
-        config: 模型配置
+        config: 模型配置（原始config，用于保存checkpoint）
+        model_config: 模型配置（包含Gumbel-Softmax，用于创建模型）
         pretrain_args: 预训练时的参数（用于获取step_size等）
     """
     print(f'加载预训练模型: {checkpoint_path}')
     # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    config = checkpoint['config']
+    # 保存原始config（用于保存checkpoint，确保架构一致性）
+    import copy
+    config = copy.deepcopy(checkpoint['config'])  # 深拷贝，避免修改原始config
     state_dict = checkpoint['model_state_dict']
     pretrain_args = checkpoint.get('args', {})  # 获取预训练时的参数
     
-    # 检查checkpoint中是否有patch_attention权重
-    has_patch_attention = any('patch_attention' in k for k in state_dict.keys())
+    # 打印预训练时的关键参数，用于调试
+    print(f'预训练checkpoint中的关键参数:')
+    print(f'  num_residual_hiddens: {config.get("num_residual_hiddens", "NOT FOUND")}')
+    print(f'  num_hiddens: {config.get("num_hiddens", "NOT FOUND")}')
+    print(f'  num_residual_layers: {config.get("num_residual_layers", "NOT FOUND")}')
+    print(f'  n_layers: {config.get("n_layers", "NOT FOUND")}')
+    print(f'  n_heads: {config.get("n_heads", "NOT FOUND")}')
     
-    # 如果checkpoint有patch_attention权重但config未开启，强制开启
-    if has_patch_attention and not config.get('use_patch_attention', False):
-        print('检测到checkpoint中有patch_attention权重，强制启用use_patch_attention')
-        config['use_patch_attention'] = True
-    
-    # 如果启用patch_attention且提供了通道数，添加到config中以便立即初始化
-    if config.get('use_patch_attention', False) and n_channels is not None:
-        config['n_channels'] = n_channels
-    
-    # 添加Gumbel-Softmax配置（微调阶段的码本查找）
+    # 创建模型配置（添加Gumbel-Softmax配置，但不影响架构）
+    import copy
+    model_config = copy.deepcopy(config)  # 深拷贝原始config
     if args is not None:
-        config['use_gumbel_softmax'] = bool(getattr(args, 'use_gumbel_softmax', 1))
-        config['gumbel_temperature'] = getattr(args, 'gumbel_temperature', 1.0)
-        config['gumbel_hard'] = bool(getattr(args, 'gumbel_hard', 0))
-        print(f'Gumbel-Softmax配置: use={config["use_gumbel_softmax"]}, temp={config["gumbel_temperature"]}, hard={config["gumbel_hard"]}')
+        model_config['use_gumbel_softmax'] = bool(getattr(args, 'use_gumbel_softmax', 1))
+        model_config['gumbel_temperature'] = getattr(args, 'gumbel_temperature', 1.0)
+        model_config['gumbel_hard'] = bool(getattr(args, 'gumbel_hard', 0))
+        print(f'Gumbel-Softmax配置: use={model_config["use_gumbel_softmax"]}, temp={model_config["gumbel_temperature"]}, hard={model_config["gumbel_hard"]}')
     
-    # 创建模型（如果use_patch_attention=True且n_channels存在，会自动初始化）
-    model = PatchVQVAETransformer(config).to(device)
+    # 创建模型（使用model_config，包含Gumbel-Softmax配置）
+    model = PatchVQVAETransformer(model_config).to(device)
     
-    # 直接加载所有权重（包括patch_attention），使用strict=False允许架构差异
-    model.load_state_dict(state_dict, strict=False)
+    # 直接加载所有权重，使用strict=False允许架构差异
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        print(f"警告: 以下权重未加载: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"警告: 以下权重未加载: {missing_keys}")
+    if unexpected_keys:
+        print(f"警告: 以下权重未使用: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"警告: 以下权重未使用: {unexpected_keys}")
     
     print(f'预训练模型配置: {config}')
     print(f'预训练验证损失: {checkpoint.get("val_loss", "N/A")}')
@@ -119,19 +124,14 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     if 'progressive_step_size' in pretrain_args:
         print(f'预训练step_size: {pretrain_args["progressive_step_size"]}')
     
+    # 返回原始config（用于保存checkpoint），确保架构一致性
     return model, config, pretrain_args
 
 
 def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层和patch attention（将patch映射成码本前的所有参数）"""
+    """冻结encoder、decoder、VQ层（将patch映射成码本前的所有参数）"""
     # 使用模型的方法冻结VQVAE组件
     model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
-    
-    # 冻结 patch attention（如果存在）
-    if freeze_patch_attention and hasattr(model, 'patch_attention') and model.patch_attention is not None:
-        for param in model.patch_attention.parameters():
-            param.requires_grad = False
-        print('✓ 已冻结 Patch Attention')
 
 
 def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler):
@@ -257,23 +257,32 @@ def main():
     save_dir = Path(args.save_path) / args.dset
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 先获取数据以知道通道数（用于提前初始化patch_attention）
+    # 先获取数据
     args.dset_finetune = args.dset
     dls = get_dls(args)
     print(f'Number of channels: {dls.vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
-    # 加载预训练模型（传入通道数以便立即初始化patch_attention，传入args以配置Gumbel-Softmax）
+    # 加载预训练模型（传入args以配置Gumbel-Softmax）
     model, config, pretrain_args = load_pretrained_model(args.pretrained_model, device, n_channels=dls.vars, args=args)
+    
+    # 验证config完整性（确保所有必要的配置项都存在）
+    required_config_keys = ['patch_size', 'embedding_dim', 'compression_factor', 'codebook_size', 
+                           'n_layers', 'n_heads', 'd_ff', 'dropout', 'num_hiddens', 
+                           'num_residual_layers', 'num_residual_hiddens']
+    missing_keys = [key for key in required_config_keys if key not in config]
+    if missing_keys:
+        raise ValueError(f"配置不完整，缺少以下键: {missing_keys}")
+    
+    print(f'✓ 模型配置验证通过: {config}')
     
     # 自动继承预训练的step_size（如果finetune时未指定ar_step_size）
     if args.ar_step_size is None and 'progressive_step_size' in pretrain_args:
         args.ar_step_size = pretrain_args['progressive_step_size']
         print(f'✓ 自动继承预训练step_size: {args.ar_step_size}')
     
-    # 冻结 encoder、VQ 层和 patch attention（将patch映射成码本前的所有参数）
-    patch_attention_loaded = hasattr(model, 'patch_attention') and model.patch_attention is not None
-    freeze_encoder_vq(model, freeze_patch_attention=patch_attention_loaded)
+    # 冻结 encoder、VQ 层（将patch映射成码本前的所有参数）
+    freeze_encoder_vq(model)
     
     # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -358,9 +367,11 @@ def main():
             no_improve_epochs = 0  # 重置计数器
             
             # 保存最佳模型
+            # 确保使用原始config（从预训练checkpoint加载的），确保架构一致性
+            import copy
             checkpoint = {
                 'model_state_dict': model.state_dict(),
-                'config': config,
+                'config': copy.deepcopy(config),  # 深拷贝，确保config不被后续修改影响
                 'args': vars(args),
                 'epoch': epoch,
                 'train_loss': avg_train_loss,
@@ -368,6 +379,8 @@ def main():
                 'timestamp': datetime.now().isoformat(),
                 'total_training_time_seconds': total_time,
             }
+            # 验证保存的config与预训练时一致
+            print(f'保存checkpoint时的config验证: num_residual_hiddens={checkpoint["config"].get("num_residual_hiddens")}')
             torch.save(checkpoint, save_dir / f'{model_name}.pth')
             status = "*Best*"
         else:
@@ -387,9 +400,10 @@ def main():
         if no_improve_epochs >= early_stop_patience:
             print(f"\n>>> 早停: 连续 {early_stop_patience} 个 epoch 无改善")
             # 保存当前模型（10个epoch无改善时的模型）
+            import copy
             checkpoint = {
                 'model_state_dict': model.state_dict(),
-                'config': config,
+                'config': copy.deepcopy(config),  # 深拷贝，确保config不被后续修改影响
                 'args': vars(args),
                 'epoch': epoch,
                 'train_loss': avg_train_loss,
@@ -410,7 +424,43 @@ def main():
     # 加载最佳模型
     # PyTorch 2.6+ 兼容性：设置 weights_only=False 以支持包含 numpy 对象的 checkpoint
     best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device, weights_only=False)
-    model.load_state_dict(best_checkpoint['model_state_dict'])
+    
+    # 始终使用checkpoint中的config重新创建模型，确保架构完全一致
+    import copy
+    checkpoint_config = copy.deepcopy(best_checkpoint.get('config', {}))
+    if not checkpoint_config:
+        raise ValueError(f"Checkpoint中缺少config！文件: {save_dir / f'{model_name}.pth'}")
+    
+    print(f"使用checkpoint中的config创建模型:")
+    print(f"  num_residual_hiddens: {checkpoint_config.get('num_residual_hiddens')}")
+    print(f"  num_hiddens: {checkpoint_config.get('num_hiddens')}")
+    print(f"  num_residual_layers: {checkpoint_config.get('num_residual_layers')}")
+    print(f"  n_layers: {checkpoint_config.get('n_layers')}")
+    print(f"  n_heads: {checkpoint_config.get('n_heads')}")
+    
+    # 确保config包含必要的字段
+    checkpoint_config['n_channels'] = dls.vars  # 确保通道数正确
+    if args is not None:
+        checkpoint_config['use_gumbel_softmax'] = bool(getattr(args, 'use_gumbel_softmax', 1))
+        checkpoint_config['gumbel_temperature'] = getattr(args, 'gumbel_temperature', 1.0)
+        checkpoint_config['gumbel_hard'] = bool(getattr(args, 'gumbel_hard', 0))
+    
+    # 使用checkpoint中的config重新创建模型（确保架构完全一致）
+    model = PatchVQVAETransformer(checkpoint_config).to(device)
+    freeze_encoder_vq(model)
+    print("✓ 已使用checkpoint config重新创建模型")
+    
+    # 加载权重
+    try:
+        model.load_state_dict(best_checkpoint['model_state_dict'], strict=True)
+        print("✓ 权重加载成功（strict=True）")
+    except RuntimeError as e:
+        print(f"警告: strict=True加载失败，尝试strict=False: {e}")
+        missing_keys, unexpected_keys = model.load_state_dict(best_checkpoint['model_state_dict'], strict=False)
+        if missing_keys:
+            print(f"警告: 以下权重未加载: {missing_keys[:10]}..." if len(missing_keys) > 10 else f"警告: 以下权重未加载: {missing_keys}")
+        if unexpected_keys:
+            print(f"警告: 以下权重未使用: {unexpected_keys[:10]}..." if len(unexpected_keys) > 10 else f"警告: 以下权重未使用: {unexpected_keys}")
     
     mse, mae, preds, targets = test_model(model, dls.test, revin, args, device, use_amp)
     print(f'测试结果: MSE = {mse:.6f}, MAE = {mae:.6f}')
