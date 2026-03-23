@@ -1,10 +1,12 @@
 """
-码本预训练脚本（带序列间频域一致性损失）
+码本预训练脚本（带序列间对比学习损失）
 独立训练 Encoder + Codebook (VQ) + Decoder
 
 新增功能：
-- Batch 内序列间频域一致性 Loss
-- 确保频率相似的原始序列，其量化编码在周期性上也相似
+- Batch 内序列间对比学习 Loss（基于MSE距离）
+- 如果原始序列之间的MSE距离小于阈值，标记为相似
+- 对量化后的序列进行对比学习，让相似序列对的量化距离也小，不相似序列对的量化距离也大
+- 相似度的衡量始终使用MSE范式
 """
 
 import numpy as np
@@ -32,7 +34,7 @@ from datautils import get_dls
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='码本预训练（带频域一致性损失）')
+    parser = argparse.ArgumentParser(description='码本预训练（带序列间对比学习损失）')
     
     # 数据集参数
     parser.add_argument('--dset', type=str, default='ettm1', help='数据集名称')
@@ -73,24 +75,33 @@ def parse_args():
     parser.add_argument('--vq_weight', type=float, default=1.0, help='VQ损失权重')
     parser.add_argument('--recon_weight', type=float, default=1.0, help='重构损失权重')
     
-    # ============ 频域一致性损失参数 ============
-    parser.add_argument('--freq_weight', type=float, default=0.1, 
-                       help='频域一致性损失权重')
-    parser.add_argument('--freq_similarity_threshold', type=float, default=0.8,
-                       help='频域相似度阈值，高于此阈值的样本对被视为正样本')
-    parser.add_argument('--freq_loss_type', type=str, default='mse',
-                       choices=['mse', 'infonce'],
-                       help='频域一致性损失类型：mse或infonce')
-    parser.add_argument('--freq_temperature', type=float, default=0.1,
-                       help='InfoNCE损失的温度系数')
+    # ============ 对比学习损失参数 ============
+    parser.add_argument('--inter_weight', type=float, default=0.1, 
+                       help='对比学习损失权重')
+    parser.add_argument('--similarity_threshold', type=float, default=0.5,
+                       help='原始序列MSE距离阈值，低于此阈值的样本对被视为相似（正样本）')
+    parser.add_argument('--inter_loss_type', type=str, default='mse',
+                       choices=['mse', 'contrastive'],
+                       help='对比学习损失类型：mse（对齐距离矩阵）或contrastive（对比学习）')
+    parser.add_argument('--inter_temperature', type=float, default=0.1,
+                       help='对比学习损失的温度系数（仅用于contrastive模式）')
     
-    # ============ 频域损失warmup参数 ============
-    parser.add_argument('--freq_delay_epochs', type=int, default=20,
-                       help='前N个epoch完全禁用频域损失（权重=0）')
-    parser.add_argument('--freq_warmup_epochs', type=int, default=10,
-                       help='延迟后，频域损失权重warmup的epoch数')
-    parser.add_argument('--freq_weight_start', type=float, default=0.01,
-                       help='频域损失权重的起始值（warmup开始时的值）')
+    # ============ 对比学习损失延迟参数 ============
+    parser.add_argument('--inter_delay_epochs', type=int, default=5,
+                       help='前N个epoch完全禁用对比学习损失（只使用intra_loss），之后直接加入inter_loss')
+    
+    # ============ 软索引参数（Gumbel Softmax） ============
+    parser.add_argument('--use_soft_indices', type=int, default=1,
+                       help='是否使用软索引（1=启用，0=禁用，使用硬索引）')
+    parser.add_argument('--soft_index_method', type=str, default='gumbel',
+                       choices=['gumbel', 'softmax'],
+                       help='软索引方法：gumbel或softmax')
+    parser.add_argument('--gumbel_temperature', type=float, default=1.0,
+                       help='Gumbel Softmax温度系数')
+    parser.add_argument('--gumbel_hard', type=int, default=0,
+                       help='Gumbel Softmax是否使用Straight-Through（1=hard，0=soft）')
+    parser.add_argument('--soft_index_temperature', type=float, default=1.0,
+                       help='Softmax温度系数（仅用于softmax方法）')
     
     # 数据采样参数
     parser.add_argument('--train_sample_ratio', type=float, default=1.0, 
@@ -99,7 +110,7 @@ def parse_args():
                        help='验证集采样比例')
     
     # 保存参数
-    parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only_freq/', help='模型保存路径')
+    parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only_inter/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
     
     return parser.parse_args()
@@ -121,47 +132,39 @@ def get_model_config(args):
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
         'use_patch_attention': False,
+        # 软索引配置
+        'use_soft_indices': bool(getattr(args, 'use_soft_indices', 1)),
+        'soft_index_method': getattr(args, 'soft_index_method', 'gumbel'),
+        'gumbel_temperature': getattr(args, 'gumbel_temperature', 1.0),
+        'gumbel_hard': bool(getattr(args, 'gumbel_hard', 0)),
+        'soft_index_temperature': getattr(args, 'soft_index_temperature', 1.0),
     }
     return config
 
 
-def get_freq_weight_with_warmup(args, current_epoch):
+def get_inter_weight_with_delay(args, current_epoch):
     """
-    计算当前epoch的频域损失权重（带延迟和warmup）
+    计算当前epoch的对比学习损失权重（简单延迟开关）
     
     逻辑：
-    1. epoch < delay_epochs: 权重 = 0（完全禁用freq_loss）
-    2. delay_epochs <= epoch < delay_epochs + warmup_epochs: 线性warmup
-    3. epoch >= delay_epochs + warmup_epochs: 权重 = freq_weight（目标权重）
+    1. epoch < delay_epochs: 权重 = 0（完全禁用对比学习损失，只使用intra_loss）
+    2. epoch >= delay_epochs: 权重 = inter_weight（直接加入inter_loss）
     
     Args:
         args: 参数
         current_epoch: 当前epoch（从0开始）
     
     Returns:
-        freq_weight: 当前的频域损失权重
+        inter_weight: 当前的对比学习损失权重（0或inter_weight）
     """
-    delay_epochs = getattr(args, 'freq_delay_epochs', 20)
-    warmup_epochs = getattr(args, 'freq_warmup_epochs', 10)
-    weight_start = getattr(args, 'freq_weight_start', 0.01)
-    weight_end = args.freq_weight
+    delay_epochs = getattr(args, 'inter_delay_epochs', 5)
     
-    # 阶段1：延迟期（完全禁用）
+    # 前k步：只使用intra_loss
     if current_epoch < delay_epochs:
         return 0.0
     
-    # 阶段2：warmup期
-    warmup_start_epoch = delay_epochs
-    warmup_end_epoch = delay_epochs + warmup_epochs
-    
-    if current_epoch < warmup_end_epoch:
-        # 线性warmup：从 weight_start 到 weight_end
-        progress = (current_epoch - warmup_start_epoch) / warmup_epochs
-        freq_weight = weight_start + (weight_end - weight_start) * progress
-        return freq_weight
-    
-    # 阶段3：正常训练
-    return weight_end
+    # k步后：直接加入inter_loss
+    return args.inter_weight
 
 
 def compute_freq_magnitude(x, dim=-1):
@@ -180,141 +183,164 @@ def compute_freq_magnitude(x, dim=-1):
     return magnitude
 
 
-def compute_cosine_similarity_matrix(features, eps=1e-8):
+def compute_mse_distance_matrix(sequences):
     """
-    计算特征向量的成对余弦相似度矩阵
+    计算序列之间的成对MSE距离矩阵（向量化实现）
     
     Args:
-        features: [B, D] 特征向量
-        eps: 数值稳定性常数
+        sequences: [B, L] 或 [B, L, C] 序列
     
     Returns:
-        sim_matrix: [B, B] 余弦相似度矩阵
+        dist_matrix: [B, B] MSE距离矩阵
     """
-    # L2归一化
-    features_norm = F.normalize(features, p=2, dim=-1, eps=eps)
-    # 计算余弦相似度
-    sim_matrix = torch.matmul(features_norm, features_norm.t())
-    return sim_matrix
+    if sequences.dim() == 3:
+        # [B, L, C] -> [B, L*C] 展平
+        sequences = sequences.reshape(sequences.shape[0], -1)
+    
+    B, L = sequences.shape
+    # 向量化计算MSE距离矩阵
+    # dist[i, j] = mean((sequences[i] - sequences[j])^2)
+    # 使用广播：sequences[i] - sequences[j] for all i, j
+    # sequences: [B, L]
+    # sequences.unsqueeze(0): [1, B, L]
+    # sequences.unsqueeze(1): [B, 1, L]
+    # diff: [B, B, L]
+    diff = sequences.unsqueeze(0) - sequences.unsqueeze(1)  # [B, B, L]
+    dist_matrix = (diff ** 2).mean(dim=-1)  # [B, B]
+    
+    return dist_matrix
 
 
-def compute_freq_consistency_loss_mse(S_orig, S_discrete):
+def compute_contrastive_loss_mse(D_orig, D_quantized, threshold):
     """
-    计算频域一致性损失（MSE版本）
+    计算对比学习损失（MSE对齐版本）
+    让量化序列的距离矩阵与原始序列的距离矩阵对齐
     
     Args:
-        S_orig: [B, B] 原始序列的频域相似度矩阵
-        S_discrete: [B, B] 量化序列的频域相似度矩阵
+        D_orig: [B, B] 原始序列的MSE距离矩阵
+        D_quantized: [B, B] 量化序列的MSE距离矩阵
+        threshold: float, 相似度阈值（距离小于此值视为相似）
     
     Returns:
         loss: scalar MSE损失
     """
-    loss = F.mse_loss(S_discrete, S_orig)
+    loss = F.mse_loss(D_quantized, D_orig)
     return loss
 
 
-def compute_freq_consistency_loss_infonce(S_orig, S_discrete, threshold=0.8, temperature=0.1):
+def compute_contrastive_loss_contrastive(D_orig, D_quantized, threshold, temperature=0.1):
     """
-    计算频域一致性损失（InfoNCE版本）
-    使用原始序列的相似度作为权重/标签
+    计算对比学习损失（对比学习版本）
+    相似序列对（距离 < threshold）的量化距离应该小
+    不相似序列对（距离 >= threshold）的量化距离应该大
     
     Args:
-        S_orig: [B, B] 原始序列的频域相似度矩阵
-        S_discrete: [B, B] 量化序列的频域相似度矩阵
-        threshold: 相似度阈值，高于此阈值的视为正样本
-        temperature: InfoNCE温度系数
+        D_orig: [B, B] 原始序列的MSE距离矩阵
+        D_quantized: [B, B] 量化序列的MSE距离矩阵
+        threshold: float, 相似度阈值（距离小于此值视为相似）
+        temperature: float, 温度系数
     
     Returns:
-        loss: scalar InfoNCE损失
+        loss: scalar 对比学习损失
     """
-    B = S_orig.shape[0]
-    device = S_orig.device
+    B = D_orig.shape[0]
+    device = D_orig.device
     
-    # 根据阈值生成软标签
-    # 高于阈值的样本对权重更高
-    positive_mask = (S_orig > threshold).float()
-    
-    # 对角线永远是正样本
+    # 创建相似性掩码：距离 < threshold 的为相似（正样本）
+    positive_mask = (D_orig < threshold).float()  # [B, B]
+    # 对角线永远是正样本（自己和自己）
     positive_mask.fill_diagonal_(1.0)
     
-    # 计算加权对比损失
-    # logits = S_discrete / temperature
-    logits = S_discrete / temperature
+    # 正样本损失：相似序列对的量化距离应该小
+    positive_loss = (positive_mask * D_quantized).sum() / (positive_mask.sum() + 1e-8)
     
-    # 对每个样本，计算其与所有正样本的对比损失
-    # 使用 S_orig 作为软权重
-    weights = S_orig.clamp(min=0)  # 确保非负
+    # 负样本损失：不相似序列对的量化距离应该大（使用exp(-distance/temperature)作为权重）
+    negative_mask = 1.0 - positive_mask  # [B, B]
+    # 对于负样本，我们希望距离大，所以使用 exp(-D_quantized/temperature) 作为权重
+    # 距离越大，权重越小（即我们希望距离大的样本对贡献更小）
+    negative_weights = torch.exp(-D_quantized / temperature) * negative_mask
+    negative_loss = (negative_weights * D_quantized).sum() / (negative_weights.sum() + 1e-8)
     
-    # log_softmax
-    log_probs = F.log_softmax(logits, dim=-1)
-    
-    # 加权对比损失：正样本权重高，负样本权重低
-    # loss = -sum(weights * log_probs) / sum(weights)
-    weighted_log_probs = weights * log_probs
-    
-    # 每行求和，然后平均
-    loss = -weighted_log_probs.sum(dim=-1) / (weights.sum(dim=-1) + 1e-8)
-    loss = loss.mean()
+    # 总损失：正样本距离小 + 负样本距离大
+    loss = positive_loss - negative_loss
     
     return loss
 
 
-def compute_inter_sequence_freq_loss(x_orig, z_q, args):
+def compute_inter_sequence_loss(x_orig, z_q, args, patch_size):
     """
-    计算Batch内序列间频域一致性损失（改进版）
+    计算Batch内序列间对比学习损失（基于MSE距离）
     
-    改进点：
-    1. 使用量化后的向量 z_q 进行DFT，而不是离散索引
-    2. 原始序列相似度矩阵使用 .detach()，只作为目标不产生梯度
-    3. 对 z_q 在 code_dim 维度取平均，投影到1维后再做FFT
+    逻辑：
+    1. 计算原始序列之间的MSE距离矩阵（先在patch内取mean）
+    2. 如果距离 < threshold，标记为相似（正样本）
+    3. 计算量化序列之间的MSE距离矩阵（对code_dim取mean）
+    4. 使用对比学习，让相似序列对的量化距离也小，不相似序列对的量化距离也大
     
     Args:
         x_orig: [B, T, C] 原始输入序列
         z_q: [B, num_patches, C, code_dim] 量化后的向量
         args: 参数
+        patch_size: int, patch大小
     
     Returns:
-        loss: scalar 频域一致性损失
+        loss: scalar 对比学习损失
         info: dict 包含中间信息
     """
     B, T, C = x_orig.shape
     _, num_patches, _, code_dim = z_q.shape
     
-    # ============ FFT支路：原始序列的频域相似度 ============
-    # 使用 .detach() 确保 S_orig 只作为目标，不产生反向梯度
-    x_flat = x_orig.permute(0, 2, 1).reshape(B * C, T)  # [B*C, T]
-    freq_orig = compute_freq_magnitude(x_flat, dim=-1)  # [B*C, T//2+1]
-    S_orig = compute_cosine_similarity_matrix(freq_orig).detach()  # [B*C, B*C] - 梯度隔离
+    # ============ 原始序列的MSE距离矩阵 ============
+    # x_orig: [B, T, C]
+    # 先按patch_size分成patches，然后在每个patch内取mean
+    # [B, T, C] -> [B, num_patches, patch_size, C] -> [B, num_patches, C] (在patch_size维度取mean)
+    x_patches = x_orig[:, :num_patches * patch_size, :].reshape(B, num_patches, patch_size, C)
+    x_patch_mean = x_patches.mean(dim=2)  # [B, num_patches, C]
     
-    # ============ DFT支路：量化向量的频域相似度 ============
+    # 重组为 (B*C)*num_patches 格式：[B, num_patches, C] -> [B*C, num_patches]
+    x_flat = x_patch_mean.permute(0, 2, 1).reshape(B * C, num_patches)  # [B*C, num_patches]
+    
+    # 计算原始序列之间的MSE距离矩阵
+    D_orig = compute_mse_distance_matrix(x_flat)  # [B*C, B*C]
+    D_orig = D_orig.detach()  # 梯度隔离，只作为目标
+    
+    # ============ 量化序列的MSE距离矩阵 ============
     # z_q: [B, num_patches, C, code_dim]
     # 对 code_dim 维度取平均，得到 [B, num_patches, C]
     z_q_reduced = z_q.mean(dim=-1)  # [B, num_patches, C]
     
-    # 重排为 [B*C, num_patches] 以便计算FFT
+    # 重组为 (B*C)*num_patches 格式：[B, num_patches, C] -> [B*C, num_patches]
     z_q_flat = z_q_reduced.permute(0, 2, 1).reshape(B * C, num_patches)  # [B*C, num_patches]
     
-    # 对量化向量序列计算FFT幅值
-    freq_quantized = compute_freq_magnitude(z_q_flat, dim=-1)  # [B*C, num_patches//2+1]
+    # 计算量化序列之间的MSE距离矩阵
+    D_quantized = compute_mse_distance_matrix(z_q_flat)  # [B*C, B*C]
     
-    # 计算余弦相似度矩阵
-    S_quantized = compute_cosine_similarity_matrix(freq_quantized)  # [B*C, B*C]
-    
-    # ============ 计算损失 ============
-    if args.freq_loss_type == 'mse':
-        loss = compute_freq_consistency_loss_mse(S_orig, S_quantized)
-    else:  # infonce
-        loss = compute_freq_consistency_loss_infonce(
-            S_orig, S_quantized, 
-            threshold=args.freq_similarity_threshold,
-            temperature=args.freq_temperature
+    # ============ 计算对比学习损失 ============
+    if args.inter_loss_type == 'mse':
+        # MSE对齐：直接对齐距离矩阵
+        loss = compute_contrastive_loss_mse(D_orig, D_quantized, args.similarity_threshold)
+    else:  # contrastive
+        # 对比学习：相似序列对距离小，不相似序列对距离大
+        loss = compute_contrastive_loss_contrastive(
+            D_orig, D_quantized,
+            threshold=args.similarity_threshold,
+            temperature=args.inter_temperature
         )
     
+    # 计算相似性统计
+    positive_mask = (D_orig < args.similarity_threshold).float()
+    positive_mask.fill_diagonal_(1.0)
+    num_total_samples = B * C
+    num_positive_pairs = positive_mask.sum().item() - num_total_samples  # 减去对角线
+    
     info = {
-        'S_orig_mean': S_orig.mean().item(),
-        'S_quantized_mean': S_quantized.mean().item(),
-        'S_orig_diag_mean': S_orig.diag().mean().item(),
-        'S_quantized_diag_mean': S_quantized.diag().mean().item(),
+        'D_orig_mean': D_orig.mean().item(),
+        'D_quantized_mean': D_quantized.mean().item(),
+        'D_orig_diag_mean': D_orig.diag().mean().item(),
+        'D_quantized_diag_mean': D_quantized.diag().mean().item(),
+        'num_positive_pairs': num_positive_pairs,
+        'num_total_pairs': num_total_samples * (num_total_samples - 1),
+        'positive_ratio': num_positive_pairs / (num_total_samples * (num_total_samples - 1)) if num_total_samples > 1 else 0.0,
     }
     
     return loss, info
@@ -348,14 +374,14 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, curre
     total_loss = 0
     total_vq_loss = 0
     total_recon_loss = 0
-    total_freq_loss = 0
+    total_inter_loss = 0
     total_perplexity = 0
     n_batches = 0
     
     all_indices_list = []
     
-    # 获取当前epoch的频域损失权重（带warmup）
-    current_freq_weight = get_freq_weight_with_warmup(args, current_epoch)
+    # 获取当前epoch的对比学习损失权重（简单延迟开关）
+    current_inter_weight = get_inter_weight_with_delay(args, current_epoch)
     
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
@@ -373,17 +399,18 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, curre
         recon_len = num_patches * model.patch_size
         recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
         
-        # 计算频域一致性损失（使用量化向量z_q，不是索引）
-        freq_loss, freq_info = compute_inter_sequence_freq_loss(
+        # 计算对比学习损失（使用量化向量z_q，基于MSE距离）
+        inter_loss, inter_info = compute_inter_sequence_loss(
             batch_x[:, :recon_len, :],  # 使用RevIN后的数据
             z_q,  # 量化后的向量 [B, num_patches, C, code_dim]
-            args
+            args,
+            model.patch_size  # 传递patch_size
         )
         
-        # 总损失（使用warmup后的freq_weight）
+        # 总损失（使用延迟后的inter_weight）
         loss = (args.recon_weight * recon_loss + 
                 args.vq_weight * vq_loss + 
-                current_freq_weight * freq_loss)
+                current_inter_weight * inter_loss)
         
         # 反向传播
         optimizer.zero_grad()
@@ -409,7 +436,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, curre
         total_loss += loss.item()
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
-        total_freq_loss += freq_loss.item()
+        total_inter_loss += inter_loss.item()
         total_perplexity += perplexity
         n_batches += 1
     
@@ -420,10 +447,10 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, curre
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
-        'freq_loss': total_freq_loss / n_batches if n_batches > 0 else 0.0,
+        'inter_loss': total_inter_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
-        'current_freq_weight': current_freq_weight,  # 返回当前使用的权重
+        'current_inter_weight': current_inter_weight,  # 返回当前使用的权重
     }
 
 
@@ -433,14 +460,14 @@ def validate_epoch(model, dataloader, revin, args, device, current_epoch=0):
     total_loss = 0
     total_vq_loss = 0
     total_recon_loss = 0
-    total_freq_loss = 0
+    total_inter_loss = 0
     total_perplexity = 0
     n_batches = 0
     
     all_indices_list = []
     
-    # 获取当前epoch的频域损失权重（带warmup）
-    current_freq_weight = get_freq_weight_with_warmup(args, current_epoch)
+    # 获取当前epoch的对比学习损失权重（简单延迟开关）
+    current_inter_weight = get_inter_weight_with_delay(args, current_epoch)
     
     with torch.no_grad():
         for batch_x, _ in dataloader:
@@ -458,16 +485,17 @@ def validate_epoch(model, dataloader, revin, args, device, current_epoch=0):
             recon_len = num_patches * model.patch_size
             recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
             
-            # 计算频域一致性损失（使用量化向量z_q）
-            freq_loss, freq_info = compute_inter_sequence_freq_loss(
+            # 计算对比学习损失（使用量化向量z_q，基于MSE距离）
+            inter_loss, inter_info = compute_inter_sequence_loss(
                 batch_x[:, :recon_len, :],
                 z_q,  # 量化后的向量 [B, num_patches, C, code_dim]
-                args
+                args,
+                model.patch_size  # 传递patch_size
             )
             
             loss = (args.recon_weight * recon_loss + 
                     args.vq_weight * vq_loss + 
-                    current_freq_weight * freq_loss)
+                    current_inter_weight * inter_loss)
             
             unique_indices = torch.unique(indices.reshape(-1))
             perplexity = len(unique_indices) / args.codebook_size
@@ -477,7 +505,7 @@ def validate_epoch(model, dataloader, revin, args, device, current_epoch=0):
             total_loss += loss.item()
             total_vq_loss += vq_loss.item()
             total_recon_loss += recon_loss.item()
-            total_freq_loss += freq_loss.item()
+            total_inter_loss += inter_loss.item()
             total_perplexity += perplexity
             n_batches += 1
     
@@ -488,10 +516,10 @@ def validate_epoch(model, dataloader, revin, args, device, current_epoch=0):
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
-        'freq_loss': total_freq_loss / n_batches if n_batches > 0 else 0.0,
+        'inter_loss': total_inter_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
-        'current_freq_weight': current_freq_weight,
+        'current_inter_weight': current_inter_weight,
     }
 
 
@@ -511,7 +539,7 @@ def set_seed(seed):
 def main():
     args = parse_args()
     print('=' * 80)
-    print('码本预训练（带序列间频域一致性损失）')
+    print('码本预训练（带序列间对比学习损失 - Inter-Loss）')
     print('=' * 80)
     print(f'Args: {args}')
     
@@ -536,8 +564,8 @@ def main():
     
     # 模型文件名
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    freq_suffix = f"_freq{args.freq_weight}"
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{freq_suffix}_model{args.model_id}'
+    inter_suffix = f"_inter{args.inter_weight}"
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{inter_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -587,15 +615,15 @@ def main():
     print(f'\n模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  可训练参数: {trainable_params:,}')
-    print(f'\n频域一致性损失配置:')
-    print(f'  损失类型: {args.freq_loss_type}')
-    print(f'  损失权重: {args.freq_weight}')
-    print(f'  相似度阈值: {args.freq_similarity_threshold}')
-    print(f'  温度系数: {args.freq_temperature}')
+    print(f'\n对比学习损失配置:')
+    print(f'  损失类型: {args.inter_loss_type}')
+    print(f'  损失权重: {args.inter_weight}')
+    print(f'  相似度阈值（MSE距离）: {args.similarity_threshold}')
+    print(f'  温度系数: {args.inter_temperature}')
     
     print(f'\n软索引配置（解决argmax梯度断裂）:')
     if hasattr(args, 'use_soft_indices') and args.use_soft_indices:
-        print(f'  ✓ 启用软索引')
+        print(f'  启用软索引')
         print(f'  方法: {args.soft_index_method}')
         if args.soft_index_method == 'gumbel':
             print(f'  Gumbel温度: {args.gumbel_temperature}')
@@ -603,7 +631,7 @@ def main():
         else:
             print(f'  Softmax温度: {args.soft_index_temperature}')
     else:
-        print(f'  ✗ 使用硬索引（无梯度流向encoder）')
+        print(f'  使用硬索引（无梯度流向encoder）')
     
     # 检查可训练参数
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
@@ -629,6 +657,7 @@ def main():
     no_improve_count = 0
     early_stop_patience = 10
     model_saved = False
+    delay_epochs = getattr(args, 'inter_delay_epochs', 5)
     
     print(f'\n开始训练，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
     print('=' * 80)
@@ -642,26 +671,23 @@ def main():
         train_losses.append(train_metrics['loss'])
         valid_losses.append(val_metrics['loss'])
         
-        # 获取当前频域损失权重（用于打印）
-        current_freq_weight = train_metrics.get('current_freq_weight', args.freq_weight)
+        # 获取当前对比学习损失权重（用于打印）
+        current_inter_weight = train_metrics.get('current_inter_weight', args.inter_weight)
         
-        # 打印进度（显示当前状态：delay/warmup/normal）
-        delay_epochs = getattr(args, 'freq_delay_epochs', 20)
-        warmup_epochs = getattr(args, 'freq_warmup_epochs', 10)
+        # 打印进度（显示当前状态：delay/normal）
+        delay_epochs = getattr(args, 'inter_delay_epochs', 5)
         if epoch < delay_epochs:
-            warmup_info = f"[delay {epoch+1}/{delay_epochs}]"
-        elif epoch < delay_epochs + warmup_epochs:
-            warmup_info = f"[warmup {current_freq_weight:.4f}]"
+            warmup_info = f"[intra_only {epoch+1}/{delay_epochs}]"
         else:
-            warmup_info = ""
+            warmup_info = f"[inter_enabled]"
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train: total={train_metrics['loss']:.4f} "
               f"(recon={train_metrics['recon_loss']:.4f}, "
               f"vq={train_metrics['vq_loss']:.4f}, "
-              f"freq={train_metrics['freq_loss']:.4f}{warmup_info}) | "
+              f"inter={train_metrics['inter_loss']:.4f}{warmup_info}) | "
               f"Valid: total={val_metrics['loss']:.4f} "
               f"(recon={val_metrics['recon_loss']:.4f}, "
-              f"freq={val_metrics['freq_loss']:.4f})")
+              f"inter={val_metrics['inter_loss']:.4f})")
         
         # 定期报告码本利用率
         if (epoch + 1) % args.codebook_report_interval == 0:
@@ -671,34 +697,40 @@ def main():
             val_usage = val_stats.get('usage_rate', 0.0) * 100
             print(f"  └─ 码本利用率: Train {train_usage:.1f}% | Valid {val_usage:.1f}%")
         
-        # 保存最佳模型
-        if epoch >= 5:
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
-                no_improve_count = 0
-                model_saved = True
-                
-                checkpoint = {
-                    'encoder_state_dict': model.encoder.state_dict(),
-                    'decoder_state_dict': model.decoder.state_dict(),
-                    'vq_state_dict': model.vq.state_dict(),
-                    'config': config,
-                    'args': vars(args),
-                    'epoch': epoch,
-                    'train_loss': train_metrics['loss'],
-                    'val_loss': val_metrics['loss'],
-                    'train_recon_loss': train_metrics['recon_loss'],
-                    'val_recon_loss': val_metrics['recon_loss'],
-                    'train_freq_loss': train_metrics['freq_loss'],
-                    'val_freq_loss': val_metrics['freq_loss'],
-                }
-                torch.save(checkpoint, save_dir / f'{model_name}.pth')
-                print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
-            else:
-                no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
-                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
-                    break
+        # 保存最佳模型（只有当inter_loss启用时才保存）
+        delay_epochs = getattr(args, 'inter_delay_epochs', 5)
+        if epoch >= delay_epochs:  # 只有inter_loss启用后才保存模型
+            if epoch >= 5:  # 同时满足至少5个epoch的条件
+                if val_metrics['loss'] < best_val_loss:
+                    best_val_loss = val_metrics['loss']
+                    no_improve_count = 0
+                    model_saved = True
+                    
+                    checkpoint = {
+                        'encoder_state_dict': model.encoder.state_dict(),
+                        'decoder_state_dict': model.decoder.state_dict(),
+                        'vq_state_dict': model.vq.state_dict(),
+                        'config': config,
+                        'args': vars(args),
+                        'epoch': epoch,
+                        'train_loss': train_metrics['loss'],
+                        'val_loss': val_metrics['loss'],
+                        'train_recon_loss': train_metrics['recon_loss'],
+                        'val_recon_loss': val_metrics['recon_loss'],
+                        'train_inter_loss': train_metrics['inter_loss'],
+                        'val_inter_loss': val_metrics['inter_loss'],
+                    }
+                    torch.save(checkpoint, save_dir / f'{model_name}.pth')
+                    print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
+                else:
+                    no_improve_count += 1
+                    if no_improve_count >= early_stop_patience:
+                        print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
+                        break
+        else:
+            # inter_loss未启用时，不保存模型，但更新no_improve_count用于早停判断
+            # 注意：在inter_loss启用前，不进行早停判断
+            pass
     
     # 保存训练历史
     actual_epochs = len(train_losses)
@@ -715,8 +747,12 @@ def main():
     
     print('=' * 80)
     print(f'训练完成！')
-    print(f'最佳验证损失: {best_val_loss:.4f}')
-    print(f'模型保存至: {save_dir / model_name}.pth')
+    if model_saved:
+        print(f'最佳验证损失: {best_val_loss:.4f}')
+        print(f'模型保存至: {save_dir / model_name}.pth')
+    else:
+        print(f'注意: 模型未保存（inter_loss在epoch {delay_epochs}后才启用，可能未达到保存条件）')
+        print(f'最终验证损失: {valid_losses[-1] if valid_losses else "N/A":.4f}')
 
 
 if __name__ == '__main__':

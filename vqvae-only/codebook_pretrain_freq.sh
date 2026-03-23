@@ -1,11 +1,13 @@
 #!/bin/bash
 
-# 码本预训练脚本（带序列间频域一致性损失）
+# 码本预训练脚本（带序列间对比学习损失）
 # 用于在decoder-only预训练之前先训练好encoder、codebook和decoder
 # 
 # 新增功能：
-# - Batch 内序列间频域一致性 Loss
-# - 确保频率相似的原始序列，其量化编码在周期性上也相似
+# - Batch 内序列间对比学习 Loss（基于MSE距离）
+# - 如果原始序列之间的MSE距离小于阈值，标记为相似
+# - 对量化后的序列进行对比学习，让相似序列对的量化距离也小，不相似序列对的量化距离也大
+# - 相似度的衡量始终使用MSE范式
 
 # ============ 数据集参数 ============
 DSET="ettm1"
@@ -42,34 +44,33 @@ AMP=1
 VQ_WEIGHT=1.0
 RECON_WEIGHT=1.0
 
-# ============ 频域一致性损失参数 ============
-FREQ_WEIGHT=0.1                  # 频域一致性损失最终权重
-FREQ_SIMILARITY_THRESHOLD=0.8    # 相似度阈值（高于此阈值的样本对视为正样本）
-FREQ_LOSS_TYPE="mse"             # 损失类型: "mse" 或 "infonce"
-FREQ_TEMPERATURE=0.1             # InfoNCE温度系数
+# ============ 对比学习损失参数 ============
+INTER_WEIGHT=0.1                  # 对比学习损失权重
+SIMILARITY_THRESHOLD=0.5         # MSE距离阈值（低于此阈值的样本对视为相似）
+INTER_LOSS_TYPE="mse"             # 损失类型: "mse"（对齐距离矩阵）或 "contrastive"（对比学习）
+INTER_TEMPERATURE=0.1            # 对比学习温度系数（仅用于contrastive模式）
 
-# ============ 频域损失延迟和Warmup参数 ============
-FREQ_DELAY_EPOCHS=20             # 前N个epoch完全禁用freq_loss（权重=0）
-FREQ_WARMUP_EPOCHS=10            # 延迟后，Warmup的epoch数
-FREQ_WEIGHT_START=0.01           # Warmup起始权重（从小到大逐渐增加到FREQ_WEIGHT）
+# ============ 对比学习损失延迟参数 ============
+INTER_DELAY_EPOCHS=5             # 前N个epoch只使用intra_loss，之后直接加入inter_loss
 
 # ============ 数据采样参数 ============
 TRAIN_SAMPLE_RATIO=1.0
 VALID_SAMPLE_RATIO=1.0
 
 # ============ 保存参数 ============
-SAVE_PATH="saved_models/vqvae_only_freq/"
+SAVE_PATH="saved_models/vqvae_only_inter/"
 MODEL_ID=1
 
 echo "=============================================="
-echo "码本预训练（带序列间频域一致性损失）"
+echo "码本预训练（带序列间对比学习损失）"
 echo "=============================================="
 echo "数据集: $DSET"
 echo "Patch大小: $PATCH_SIZE"
 echo "码本大小: $CODEBOOK_SIZE"
-echo "频域损失权重: $FREQ_WEIGHT (delay: ${FREQ_DELAY_EPOCHS} epochs, warmup: $FREQ_WEIGHT_START -> $FREQ_WEIGHT, ${FREQ_WARMUP_EPOCHS} epochs)"
-echo "频域损失类型: $FREQ_LOSS_TYPE"
-echo "相似度阈值: $FREQ_SIMILARITY_THRESHOLD"
+echo "对比学习损失权重: $INTER_WEIGHT"
+echo "延迟epochs: $INTER_DELAY_EPOCHS (前${INTER_DELAY_EPOCHS}个epoch只使用intra_loss，之后直接加入inter_loss)"
+echo "对比学习损失类型: $INTER_LOSS_TYPE"
+echo "相似度阈值（MSE距离）: $SIMILARITY_THRESHOLD"
 echo "=============================================="
 
 python codebook_pretrain_freq.py \
@@ -100,17 +101,14 @@ python codebook_pretrain_freq.py \
     --amp $AMP \
     --vq_weight $VQ_WEIGHT \
     --recon_weight $RECON_WEIGHT \
-    --freq_weight $FREQ_WEIGHT \
-    --freq_similarity_threshold $FREQ_SIMILARITY_THRESHOLD \
-    --freq_loss_type $FREQ_LOSS_TYPE \
-    --freq_temperature $FREQ_TEMPERATURE \
-    --freq_delay_epochs $FREQ_DELAY_EPOCHS \
-    --freq_warmup_epochs $FREQ_WARMUP_EPOCHS \
-    --freq_weight_start $FREQ_WEIGHT_START \
+    --inter_weight $INTER_WEIGHT \
+    --similarity_threshold $SIMILARITY_THRESHOLD \
+    --inter_loss_type $INTER_LOSS_TYPE \
+    --inter_temperature $INTER_TEMPERATURE \
+    --inter_delay_epochs $INTER_DELAY_EPOCHS \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
     --save_path $SAVE_PATH \
     --model_id $MODEL_ID
 
 echo "训练完成！"
-
