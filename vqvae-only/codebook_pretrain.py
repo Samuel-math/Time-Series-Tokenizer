@@ -22,7 +22,7 @@ import random
 
 # 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.models.codebook_model import CodebookModel
+from src.models.codebook_model import CodebookModel, PerChannelCodebookModel
 from src.models.layers.revin import RevIN
 from src.basics import set_device
 from datautils import get_dls
@@ -81,6 +81,10 @@ def parse_args():
     parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
     
+    # Per-channel 码本
+    parser.add_argument('--per_channel_codebook', type=int, default=0,
+                        help='每个通道使用独立码本 (1启用, 0共享码本)')
+    
     return parser.parse_args()
 
 
@@ -106,7 +110,7 @@ def get_model_config(args):
 
 def compute_codebook_usage_stats(indices, codebook_size):
     """
-    计算码本利用率统计信息
+    计算码本利用率统计信息（所有通道合并，适用于共享码本）
     
     Args:
         indices: [B, num_patches, C] 码本索引
@@ -136,6 +140,42 @@ def compute_codebook_usage_stats(indices, codebook_size):
     }
 
 
+def compute_per_channel_usage_stats(indices, codebook_size):
+    """
+    计算 per-channel 码本利用率统计信息（每个通道独立计算，适用于 per-channel 码本）
+
+    Args:
+        indices: [B, num_patches, C] 码本索引
+        codebook_size: 码本大小（每个通道相同）
+    Returns:
+        dict: 包含各通道和平均利用率统计的字典
+    """
+    B, num_patches, C = indices.shape
+    per_ch_usage = []
+    per_ch_num_used = []
+    per_ch_num_unused = []
+
+    for c in range(C):
+        idx_c = indices[:, :, c].reshape(-1).cpu()
+        unique_c = torch.unique(idx_c)
+        num_used_c = len(unique_c)
+        per_ch_usage.append(num_used_c / codebook_size)
+        per_ch_num_used.append(num_used_c)
+        per_ch_num_unused.append(codebook_size - num_used_c)
+
+    avg_usage = sum(per_ch_usage) / C
+
+    return {
+        'usage_rate': avg_usage,          # 各通道平均利用率
+        'num_used': sum(per_ch_num_used) / C,
+        'num_unused': sum(per_ch_num_unused) / C,
+        'per_channel_usage': per_ch_usage,       # list of float, one per channel
+        'per_channel_num_used': per_ch_num_used,
+        'top5_usage': [],  # 不适用于 per-channel 统计
+        'total_tokens': indices.numel(),
+    }
+
+
 def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     """训练一个epoch"""
     model.train()
@@ -147,6 +187,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     
     # 用于累积码本使用统计
     all_indices_list = []
+    per_channel = bool(args.per_channel_codebook)
     
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
@@ -182,9 +223,16 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
         
-        # 计算perplexity（码本使用率）
-        unique_indices = torch.unique(indices.reshape(-1))
-        perplexity = len(unique_indices) / args.codebook_size
+        # 计算 perplexity（per-channel 时取各通道平均）
+        if per_channel:
+            ch_usages = [
+                len(torch.unique(indices[:, :, c])) / args.codebook_size
+                for c in range(indices.shape[2])
+            ]
+            perplexity = sum(ch_usages) / len(ch_usages)
+        else:
+            unique_indices = torch.unique(indices.reshape(-1))
+            perplexity = len(unique_indices) / args.codebook_size
         
         # 累积索引用于统计
         all_indices_list.append(indices.detach().cpu())
@@ -197,7 +245,10 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     
     # 计算整个epoch的码本利用率统计
     all_indices_epoch = torch.cat(all_indices_list, dim=0)  # [total_B, num_patches, C]
-    codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
+    if per_channel:
+        codebook_stats = compute_per_channel_usage_stats(all_indices_epoch, args.codebook_size)
+    else:
+        codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
     
     return {
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
@@ -219,6 +270,7 @@ def validate_epoch(model, dataloader, revin, args, device):
     
     # 用于累积码本使用统计
     all_indices_list = []
+    per_channel = bool(args.per_channel_codebook)
     
     with torch.no_grad():
         for batch_x, _ in dataloader:
@@ -240,9 +292,16 @@ def validate_epoch(model, dataloader, revin, args, device):
             # 总损失
             loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
             
-            # 计算perplexity
-            unique_indices = torch.unique(indices.reshape(-1))
-            perplexity = len(unique_indices) / args.codebook_size
+            # 计算 perplexity
+            if per_channel:
+                ch_usages = [
+                    len(torch.unique(indices[:, :, c])) / args.codebook_size
+                    for c in range(indices.shape[2])
+                ]
+                perplexity = sum(ch_usages) / len(ch_usages)
+            else:
+                unique_indices = torch.unique(indices.reshape(-1))
+                perplexity = len(unique_indices) / args.codebook_size
             
             # 累积索引用于统计
             all_indices_list.append(indices.cpu())
@@ -255,7 +314,10 @@ def validate_epoch(model, dataloader, revin, args, device):
     
     # 计算整个epoch的码本利用率统计
     all_indices_epoch = torch.cat(all_indices_list, dim=0)  # [total_B, num_patches, C]
-    codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
+    if per_channel:
+        codebook_stats = compute_per_channel_usage_stats(all_indices_epoch, args.codebook_size)
+    else:
+        codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
     
     return {
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
@@ -327,7 +389,8 @@ def main():
     
     # 模型文件名
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}_model{args.model_id}'
+    per_ch_suffix = '_perch' if args.per_channel_codebook else ''
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -375,7 +438,12 @@ def main():
     
     # 创建轻量级码本模型（只包含encoder、vq、decoder）
     config = get_model_config(args)
-    model = CodebookModel(config, dls.vars).to(device)
+    if args.per_channel_codebook:
+        model = PerChannelCodebookModel(config, dls.vars).to(device)
+        print(f'\n模式: Per-Channel 码本（每通道独立 VQ，共 {dls.vars} 个码本）')
+    else:
+        model = CodebookModel(config, dls.vars).to(device)
+        print(f'\n模式: 共享码本（所有通道使用同一 VQ）')
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
@@ -387,8 +455,13 @@ def main():
     encoder_total = sum(p.numel() for p in model.encoder.parameters())
     decoder_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
     decoder_total = sum(p.numel() for p in model.decoder.parameters())
-    vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
-    vq_total = sum(p.numel() for p in model.vq.parameters())
+    
+    if args.per_channel_codebook:
+        vq_trainable = sum(p.numel() for vq in model.vqs for p in vq.parameters() if p.requires_grad)
+        vq_total = sum(p.numel() for vq in model.vqs for p in vq.parameters())
+    else:
+        vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
+        vq_total = sum(p.numel() for p in model.vq.parameters())
     
     print(f'\n码本模型参数统计:')
     print(f'  总参数: {total_params:,}')
@@ -465,13 +538,20 @@ def main():
             train_unused = train_stats.get('num_unused', 0)
             val_unused = val_stats.get('num_unused', 0)
             
-            print(f"  └─ 码本利用率: Train {train_usage:.1f}% ({train_used}/{args.codebook_size} 使用, {train_unused} 未使用) | "
-                  f"Valid {val_usage:.1f}% ({val_used}/{args.codebook_size} 使用, {val_unused} 未使用)")
+            print(f"  └─ 码本利用率(avg): Train {train_usage:.1f}% ({train_used:.0f}/{args.codebook_size}) | "
+                  f"Valid {val_usage:.1f}% ({val_used:.0f}/{args.codebook_size})")
             
-            # 显示最常用的码本元素（仅训练集）
-            if train_stats.get('top5_usage'):
-                top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
-                print(f"  └─ 最常用码本元素 (Train): {top5_str}")
+            if args.per_channel_codebook:
+                per_ch_train = train_stats.get('per_channel_usage', [])
+                per_ch_val   = val_stats.get('per_channel_usage', [])
+                if per_ch_train:
+                    ch_strs = [f"ch{c}:{u*100:.0f}%" for c, u in enumerate(per_ch_train)]
+                    print(f"  └─ 各通道利用率 (Train): {', '.join(ch_strs)}")
+            else:
+                # 显示最常用的码本元素（仅训练集）
+                if train_stats.get('top5_usage'):
+                    top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
+                    print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
         # 基于val_loss保存最佳模型
         if epoch >= 5:  # 前5个epoch不保存
@@ -484,18 +564,35 @@ def main():
                 model_saved = True
                 
                 # 只保存encoder、decoder和vq的权重
-                checkpoint = {
-                    'encoder_state_dict': model.encoder.state_dict(),
-                    'decoder_state_dict': model.decoder.state_dict(),
-                    'vq_state_dict': model.vq.state_dict(),
-                    'config': config,
-                    'args': vars(args),
-                    'epoch': epoch,
-                    'train_loss': train_metrics['loss'],
-                    'val_loss': val_metrics['loss'],
-                    'train_recon_loss': train_metrics['recon_loss'],
-                    'val_recon_loss': val_metrics['recon_loss'],
-                }
+                if args.per_channel_codebook:
+                    checkpoint = {
+                        'encoder_state_dict': model.encoder.state_dict(),
+                        'decoder_state_dict': model.decoder.state_dict(),
+                        # model_state_dict 包含 vqs.0.*, vqs.1.*, ...
+                        # 可被 PatchVQVAETransformer.load_vqvae_weights() 直接加载
+                        'model_state_dict': model.state_dict(),
+                        'n_channels': dls.vars,
+                        'config': config,
+                        'args': vars(args),
+                        'epoch': epoch,
+                        'train_loss': train_metrics['loss'],
+                        'val_loss': val_metrics['loss'],
+                        'train_recon_loss': train_metrics['recon_loss'],
+                        'val_recon_loss': val_metrics['recon_loss'],
+                    }
+                else:
+                    checkpoint = {
+                        'encoder_state_dict': model.encoder.state_dict(),
+                        'decoder_state_dict': model.decoder.state_dict(),
+                        'vq_state_dict': model.vq.state_dict(),
+                        'config': config,
+                        'args': vars(args),
+                        'epoch': epoch,
+                        'train_loss': train_metrics['loss'],
+                        'val_loss': val_metrics['loss'],
+                        'train_recon_loss': train_metrics['recon_loss'],
+                        'val_recon_loss': val_metrics['recon_loss'],
+                    }
                 torch.save(checkpoint, save_dir / f'{model_name}.pth')
                 print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
             else:

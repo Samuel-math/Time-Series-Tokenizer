@@ -337,17 +337,28 @@ class PatchVQVAETransformer(nn.Module):
         
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'random')
-        if self.use_codebook_ema:
-            self.vq = FlattenedVectorQuantizerEMA(
+        self.per_channel_codebook = config.get('per_channel_codebook', False)
+        n_channels = config.get('n_channels', None)
+        self._n_channels = n_channels
+
+        def _make_vq():
+            if self.use_codebook_ema:
+                return FlattenedVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=self.ema_decay, eps=self.ema_eps,
+                    init_method=vq_init_method
+                )
+            return FlattenedVectorQuantizer(
                 self.codebook_size, self.code_dim, self.commitment_cost,
-                decay=self.ema_decay, eps=self.ema_eps,
                 init_method=vq_init_method
             )
+        
+        if self.per_channel_codebook:
+            if n_channels is None:
+                raise ValueError("per_channel_codebook=True 需要在 config 中提供 n_channels")
+            self.vqs = nn.ModuleList([_make_vq() for _ in range(n_channels)])
         else:
-            self.vq = FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost,
-                init_method=vq_init_method
-            )
+            self.vq = _make_vq()
         
         # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
         self.transformer = CausalTransformer(
@@ -359,9 +370,9 @@ class PatchVQVAETransformer(nn.Module):
         # 注意：Transformer输出始终是code_dim（通过输出投影），所以output_head输入维度是code_dim
         self.output_head = nn.Linear(self.code_dim, self.codebook_size)
 
-        # 获取通道数（从config中获取，如果不存在则为None，稍后通过load_vqvae_weights或直接设置）
-        n_channels = config.get('n_channels', None)
-        self._n_channels = n_channels
+        # NMPP 模式 (use_raw_input=True): 将原始 patch 投影到 Transformer 输入维度
+        self.patch_embedding = nn.Linear(self.patch_size, self.code_dim)
+
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
         self.encoder = Encoder(
             in_channels=1,  # 单通道输入
@@ -382,6 +393,18 @@ class PatchVQVAETransformer(nn.Module):
         
         # Channel Attention 已移除
     
+    def _get_vq(self, c: int):
+        """返回通道 c 对应的 VQ 模块（per_channel_codebook=True 时每通道独立，否则共享）"""
+        return self.vqs[c] if self.per_channel_codebook else self.vq
+
+    def _raw_patch_embedding_bc(self, x, B, num_patches, C):
+        """原始 patch 线性投影，输出 [B*C, num_patches, code_dim]（NMPP 模式使用）"""
+        x = x[:, :num_patches * self.patch_size, :]
+        # [B, num_patches, patch_size, C] -> [B, C, num_patches, patch_size]
+        x_patches = x.reshape(B, num_patches, self.patch_size, C).permute(0, 3, 1, 2)
+        flat = x_patches.reshape(B * C, num_patches, self.patch_size)
+        return self.patch_embedding(flat)  # [B*C, num_patches, code_dim]
+
     def encode_to_indices(self, x):
         """
         编码为码本索引和量化向量（channel-independent版本）
@@ -429,8 +452,8 @@ class PatchVQVAETransformer(nn.Module):
             z_c = z_all[:, :, c, :]  # [B, num_patches, code_dim]
             z_c_flat = z_c.reshape(B * num_patches, self.code_dim)  # [B*num_patches, code_dim]
             
-            # VQ
-            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_c_flat)
+            # VQ（每通道独立码本或共享码本）
+            vq_loss_c, z_q_flat_c, indices_c = self._get_vq(c)(z_c_flat)
             vq_loss_sum += vq_loss_c
             
             # Reshape: [B*num_patches] -> [B, num_patches]
@@ -477,211 +500,182 @@ class PatchVQVAETransformer(nn.Module):
         
         return x_recon
     
-    def forward_progressive_pretrain(self, x_full, step_size, max_stages=None, compute_recon_loss=True):
+    def forward_progressive_pretrain(self, x_full, step_size, max_stages=None,
+                                      compute_recon_loss=True, use_raw_input=False):
         """
-        渐进式预训练: 使用不同长度的上下文预测固定长度的未来tokens
-        
-        例如，如果 step_size=a，max_stages=3：
-        - 阶段1: 使用前 a 个tokens 预测接下来的 a 个tokens
-        - 阶段2: 使用前 2a 个tokens 预测接下来的 a 个tokens (从位置 a 开始)
-        - 阶段3: 使用前 3a 个tokens 预测接下来的 a 个tokens (从位置 2a 开始)
-        
+        渐进式预训练: 使用不同长度的上下文预测固定长度的未来 tokens。
+
         Args:
-            x_full: [B, total_len, C] 完整序列
-            step_size: int, 每个阶段的步长（以patches为单位）
-            max_stages: int, 最大阶段数。如果为None，则使用所有可能的阶段
-            compute_recon_loss: bool, 是否计算重构损失。如果recon_weight=0可设为False以跳过decoder调用
-        
+            x_full: [B, total_len, C]
+            step_size: int, 每阶段步长（patches）
+            max_stages: int | None, 最大阶段数
+            compute_recon_loss: bool, 是否计算重构损失（recon_weight=0 时可设 False）
+            use_raw_input: bool, NMPP 模式 —— Transformer 接收原始 patch embedding，
+                           VQVAE 仅作为 teacher 提供 indices；不计算 vq_loss / recon_loss
+
         Returns:
-            all_logits: List of [B, num_target_patches, C, codebook_size] 每个阶段的预测logits
-            all_target_indices: List of [B, num_target_patches, C] 每个阶段的目标索引
-            vq_loss: VQ损失（所有阶段的平均）
-            recon_loss: 重构损失（如果compute_recon_loss=False则为0.0）
+            all_logits: List[[B, step_size, C, codebook_size]]
+            all_target_indices: List[[B, step_size, C]]
+            vq_loss: scalar
+            recon_loss: scalar
         """
         B, total_len, C = x_full.shape
-        
-        # 编码完整序列
-        full_indices, vq_loss_full, z_q_full = self.encode_to_indices(x_full)
-        
+        num_patches = total_len // self.patch_size
+        x_full = x_full[:, :num_patches * self.patch_size, :]
+
+        if use_raw_input:
+            with torch.no_grad():
+                full_indices, _, _ = self.encode_to_indices(x_full)
+            vq_loss_full = x_full.new_tensor(0.0)
+            seq_full = self._raw_patch_embedding_bc(x_full, B, num_patches, C)
+        else:
+            full_indices, vq_loss_full, z_q_full = self.encode_to_indices(x_full)
+            B, num_patches, C, code_dim = z_q_full.shape
+            seq_full = z_q_full.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
+
         num_total_patches = full_indices.shape[1]
-        
-        # 计算最大阶段数
+
         if max_stages is None:
             max_stages = (num_total_patches - step_size) // step_size
         else:
             max_stages = min(max_stages, (num_total_patches - step_size) // step_size)
-        
+
         if max_stages <= 0:
-            raise ValueError(f"序列长度不足：总patches={num_total_patches}, step_size={step_size}, 无法创建任何阶段")
-        
-        all_logits = []
-        all_target_indices = []
-        all_vq_losses = []
-        
-        # Channel-independent处理: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
-        B, num_patches, C, code_dim = z_q_full.shape
-        z_q_full_flat = z_q_full.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
-        
-        # 逐阶段处理
+            raise ValueError(
+                f"序列长度不足：总patches={num_total_patches}, step_size={step_size}, 无法创建任何阶段"
+            )
+
+        all_logits, all_target_indices = [], []
+
         for stage in range(1, max_stages + 1):
             context_size = stage * step_size
             target_start = (stage - 1) * step_size
             target_end = stage * step_size
-            
+
             if target_end > num_patches:
                 break
-            
-            # 提取上下文
-            z_q_context = z_q_full_flat[:, :context_size, :]  # [B*C, context_size, code_dim]
-            
-            # 创建占位符
+
             placeholder = torch.zeros(
-                B * C, step_size, code_dim,
-                device=z_q_context.device, dtype=z_q_context.dtype
+                B * C, step_size, seq_full.shape[2],
+                device=seq_full.device, dtype=seq_full.dtype,
             )
-            
-            # 拼接上下文和占位符
-            full_sequence_stage = torch.cat([z_q_context, placeholder], dim=1)  # [B*C, context_size + step_size, code_dim]
-            
-            # Transformer 前向传播
-            h_full_stage = self.transformer(full_sequence_stage)  # [B*C, context_size + step_size, code_dim]
-            
-            # 提取占位符位置的输出（预测结果）
-            h_target_stage = h_full_stage[:, context_size:context_size + step_size, :]  # [B*C, step_size, code_dim]
-            
-            # 提取目标索引
-            target_indices_stage = full_indices[:, target_start:target_end, :]  # [B, step_size, C]
-            
-            # 输出头: 预测目标序列的索引概率分布
-            logits_flat_stage = self.output_head(h_target_stage)  # [B*C, step_size, codebook_size]
-            
-            # Reshape回通道分离格式
-            logits_stage = logits_flat_stage.reshape(B, C, step_size, -1).permute(
-                0, 2, 1, 3
-            )  # [B, step_size, C, codebook_size]
-            
+            full_sequence_stage = torch.cat([seq_full[:, :context_size, :], placeholder], dim=1)
+            h_full = self.transformer(full_sequence_stage)
+            h_target = h_full[:, context_size:context_size + step_size, :]
+
+            target_indices_stage = full_indices[:, target_start:target_end, :]
+            logits_flat = self.output_head(h_target)
+            logits_stage = logits_flat.reshape(B, C, step_size, -1).permute(0, 2, 1, 3)
+
             all_logits.append(logits_stage)
             all_target_indices.append(target_indices_stage)
-            all_vq_losses.append(vq_loss_full)
-        
-        if len(all_logits) == 0:
-            raise ValueError(f"序列长度不足：总patches={num_patches}, step_size={step_size}, 无法创建任何阶段")
-        
-        # ============ 优化：重构损失只计算一次（移出循环）============
-        # 如果不需要计算重构损失（例如recon_weight=0），完全跳过decoder调用
-        if compute_recon_loss:
-            # 对完整序列计算一次重构损失，而不是每个阶段都计算
-            x_recon_full = self.decode_from_codes(z_q_full)  # 单次decoder调用
+
+        if not all_logits:
+            raise ValueError(
+                f"序列长度不足：总patches={num_patches}, step_size={step_size}, 无法创建任何阶段"
+            )
+
+        if compute_recon_loss and not use_raw_input:
+            x_recon_full = self.decode_from_codes(z_q_full)
             recon_loss = F.mse_loss(x_recon_full, x_full[:, :x_recon_full.shape[1], :])
         else:
-            # 完全跳过decoder调用
-            recon_loss = torch.tensor(0.0, device=x_full.device)
-        
-        # 计算平均VQ损失
-        vq_loss = sum(all_vq_losses) / len(all_vq_losses)
-        
-        return all_logits, all_target_indices, vq_loss, recon_loss
+            recon_loss = x_full.new_tensor(0.0)
+
+        return all_logits, all_target_indices, vq_loss_full, recon_loss
     
-    def forward_finetune(self, x, target_len, step_size=None):
+    def forward_finetune(self, x, target_len, step_size=None, use_raw_input=False):
         """
         微调: 预测未来序列（批量自回归版本，channel-independent）
-        
-        1. 编码输入为量化向量
-        2. 每步预测 step_size 个 patches，然后将预测结果加入上下文
-        3. 重复直到预测完所有需要的 patches
-        4. 最后一次性解码所有预测的 codes
-        
+
         Args:
-            x: [B, T, C] 输入序列
-            target_len: int, 目标预测长度（时间步）
-            step_size: int, 每步预测的 patch 数量。如果为 None，则一次性预测所有 patches（非自回归）
-        
+            x: [B, T, C]
+            target_len: int
+            step_size: int | None
+            use_raw_input: bool, 与 NMPP 预训练一致时设 True，历史上下文用原始 patch embedding
+
         Returns:
-            pred: [B, target_len, C] 预测序列
-            vq_loss: VQ 损失
+            pred: [B, target_len, C]
+            vq_loss: scalar
         """
         B, T, C = x.shape
         num_pred_patches = (target_len + self.patch_size - 1) // self.patch_size
-        
-        # 编码输入
-        indices, vq_loss, z_q = self.encode_to_indices(x)  # z_q: [B, num_patches, C, code_dim]
-        num_input_patches = z_q.shape[1]
-        
-        # Channel-independent: 批量处理所有通道以加速
-        # z_q: [B, num_patches, C, code_dim] -> [B*C, num_patches, code_dim]
-        B, num_patches, C, code_dim = z_q.shape
-        z_q_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)  # [B*C, num_patches, code_dim]
-        
-        codebook = self.vq.embedding.weight  # [codebook_size, code_dim]
+        num_input_patches = T // self.patch_size
+        x_aligned = x[:, :num_input_patches * self.patch_size, :]
+
+        if use_raw_input:
+            context_flat = self._raw_patch_embedding_bc(x_aligned, B, num_input_patches, C)
+            vq_loss = x.new_tensor(0.0)
+            code_dim = self.code_dim
+        else:
+            indices, vq_loss, z_q = self.encode_to_indices(x)
+            num_input_patches = z_q.shape[1]
+            B, num_patches, C, code_dim = z_q.shape
+            context_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
+
+        # 预先准备 per-channel / 共享码本查找
+        if self.per_channel_codebook:
+            stacked_codebooks = torch.stack([self.vqs[c].embedding.weight for c in range(C)], dim=0)
+        else:
+            shared_codebook = self.vq.embedding.weight
+
+        def _lookup_codebook(weights_bc):
+            """weights_bc: [B*C, P, K] → [B*C, P, code_dim]"""
+            if self.per_channel_codebook:
+                w = weights_bc.reshape(B, C, -1, self.codebook_size)
+                out = torch.einsum('bcpk,ckd->bcpd', w, stacked_codebooks)
+                return out.reshape(B * C, -1, code_dim)
+            return torch.matmul(weights_bc, shared_codebook)
         
         # 如果没有指定 step_size 或 step_size >= num_pred_patches，使用非自回归模式
         if step_size is None or step_size >= num_pred_patches:
-            # ============ 非自回归模式：一次性预测所有 patches ============
-            placeholder = torch.zeros(B * C, num_pred_patches, self.code_dim, device=z_q_flat.device, dtype=z_q_flat.dtype)
-            full_sequence = torch.cat([z_q_flat, placeholder], dim=1)
-            
+            # 非自回归：一次性预测所有 patches
+            placeholder = torch.zeros(B * C, num_pred_patches, code_dim,
+                                      device=context_flat.device, dtype=context_flat.dtype)
+            full_sequence = torch.cat([context_flat, placeholder], dim=1)
+
             h_full = self.transformer(full_sequence)
             h_pred = h_full[:, num_input_patches:, :]
             logits = self.output_head(h_pred)
-            
+
             if self.use_gumbel_softmax and self.training:
                 weights = F.gumbel_softmax(logits, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
             else:
                 weights = F.softmax(logits, dim=-1)
-            
-            all_pred_codes = torch.matmul(weights, codebook)  # [B*C, num_pred_patches, code_dim]
+
+            all_pred_codes = _lookup_codebook(weights)
         else:
-            # ============ 批量自回归模式：每步预测 step_size 个 patches ============
-            # 计算需要多少步
+            # 批量自回归：每步预测 step_size 个 patches
             num_steps = (num_pred_patches + step_size - 1) // step_size
-            
-            # 当前上下文（会逐步增长）
-            current_context = z_q_flat  # [B*C, num_input_patches, code_dim]
+            current_context = context_flat
             all_pred_codes_list = []
-            
             remaining_patches = num_pred_patches
-            
+
             for step in range(num_steps):
-                # 本步需要预测的 patch 数量
                 patches_to_predict = min(step_size, remaining_patches)
-                
-                # 创建本步的占位符
+
                 placeholder = torch.zeros(
-                    B * C, patches_to_predict, self.code_dim,
-                    device=current_context.device, dtype=current_context.dtype
+                    B * C, patches_to_predict, code_dim,
+                    device=current_context.device, dtype=current_context.dtype,
                 )
-                
-                # 拼接当前上下文和占位符
                 full_sequence = torch.cat([current_context, placeholder], dim=1)
-                
-                # Transformer 前向传播
                 h_full = self.transformer(full_sequence)
-                
-                # 提取占位符位置的输出
+
                 context_len = current_context.shape[1]
-                h_pred_step = h_full[:, context_len:, :]  # [B*C, patches_to_predict, code_dim]
-                
-                # 预测 logits
-                logits_step = self.output_head(h_pred_step)  # [B*C, patches_to_predict, codebook_size]
-                
-                # 获取预测的 codes
+                h_pred_step = h_full[:, context_len:, :]
+                logits_step = self.output_head(h_pred_step)
+
                 if self.use_gumbel_softmax and self.training:
-                    weights_step = F.gumbel_softmax(logits_step, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
+                    weights_step = F.gumbel_softmax(logits_step, tau=self.gumbel_temperature,
+                                                    hard=self.gumbel_hard, dim=-1)
                 else:
                     weights_step = F.softmax(logits_step, dim=-1)
-                
-                pred_codes_step = torch.matmul(weights_step, codebook)  # [B*C, patches_to_predict, code_dim]
-                
-                # 保存本步预测结果
+
+                pred_codes_step = _lookup_codebook(weights_step)
                 all_pred_codes_list.append(pred_codes_step)
-                
-                # 更新上下文：将预测的 codes 加入
                 current_context = torch.cat([current_context, pred_codes_step], dim=1)
-                
                 remaining_patches -= patches_to_predict
-            
-            # 合并所有预测的 codes
-            all_pred_codes = torch.cat(all_pred_codes_list, dim=1)  # [B*C, num_pred_patches, code_dim]
+
+            all_pred_codes = torch.cat(all_pred_codes_list, dim=1)
         
         # Reshape 回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
         pred_codes = all_pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)
@@ -708,7 +702,18 @@ class PatchVQVAETransformer(nn.Module):
     @torch.no_grad()
     def get_codebook_usage(self, x):
         indices, _, _ = self.encode_to_indices(x)
-        # indices: [B, num_patches, C] (channel-independent)
+        # indices: [B, num_patches, C]
+        if self.per_channel_codebook:
+            # 分通道计算利用率，返回平均值
+            B, num_patches, C = indices.shape
+            usage_per_channel = []
+            all_unique = set()
+            for c in range(C):
+                unique_c = torch.unique(indices[:, :, c])
+                usage_per_channel.append(len(unique_c) / self.codebook_size)
+                all_unique.update(unique_c.tolist())
+            avg_usage = sum(usage_per_channel) / C
+            return avg_usage, torch.tensor(list(all_unique))
         unique = torch.unique(indices.reshape(-1))
         return len(unique) / self.codebook_size, unique
     
@@ -784,19 +789,48 @@ class PatchVQVAETransformer(nn.Module):
                 loaded_components.append('Decoder')
             
             if load_vq:
-                if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
-                    loaded_components.append('VQ')
-                elif state_dict is not None:
-                    # 尝试直接加载embedding权重
-                    for key in state_dict.keys():
-                        if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
-                            if hasattr(self.vq, 'embedding'):
-                                try:
-                                    self.vq.embedding.weight.data.copy_(state_dict[key])
-                                    loaded_components.append('VQ')
-                                    break
-                                except:
-                                    continue
+                if self.per_channel_codebook:
+                    # 尝试加载 per-channel VQ（格式：vqs.{c}.）
+                    any_vq_loaded = False
+                    for c, vq_mod in enumerate(self.vqs):
+                        per_ch_prefix = f'vqs.{c}'
+                        if try_load_module(vq_mod, f'VQ[{c}]', None, per_ch_prefix):
+                            any_vq_loaded = True
+                    
+                    if not any_vq_loaded:
+                        # 回退：从共享 VQ checkpoint 初始化所有通道码本
+                        shared_loaded = False
+                        for vq_mod in self.vqs:
+                            if try_load_module(vq_mod, 'VQ', 'vq_state_dict', 'vq'):
+                                shared_loaded = True
+                            elif state_dict is not None:
+                                for key in state_dict.keys():
+                                    if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
+                                        if hasattr(vq_mod, 'embedding'):
+                                            try:
+                                                vq_mod.embedding.weight.data.copy_(state_dict[key])
+                                                shared_loaded = True
+                                                break
+                                            except Exception:
+                                                continue
+                        if shared_loaded:
+                            loaded_components.append('VQ')
+                    else:
+                        loaded_components.append('VQ')
+                else:
+                    if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
+                        loaded_components.append('VQ')
+                    elif state_dict is not None:
+                        # 尝试直接加载embedding权重
+                        for key in state_dict.keys():
+                            if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
+                                if hasattr(self.vq, 'embedding'):
+                                    try:
+                                        self.vq.embedding.weight.data.copy_(state_dict[key])
+                                        loaded_components.append('VQ')
+                                        break
+                                    except Exception:
+                                        continue
             
             if loaded_components:
                 print(f"成功加载: {', '.join(loaded_components)}")
@@ -836,11 +870,12 @@ class PatchVQVAETransformer(nn.Module):
             frozen.append('Decoder')
         
         if 'VQ' in components:
-            for param in self.vq.parameters():
-                param.requires_grad = False
-            # 如果使用EMA codebook，禁用EMA更新
-            if isinstance(self.vq, FlattenedVectorQuantizerEMA):
-                self.vq._disable_ema_update = True
+            vq_modules = list(self.vqs) if self.per_channel_codebook else [self.vq]
+            for vq_mod in vq_modules:
+                for param in vq_mod.parameters():
+                    param.requires_grad = False
+                if isinstance(vq_mod, FlattenedVectorQuantizerEMA):
+                    vq_mod._disable_ema_update = True
             frozen.append('VQ')
         
         if frozen:
@@ -871,11 +906,12 @@ class PatchVQVAETransformer(nn.Module):
             unfrozen.append('Decoder')
         
         if 'VQ' in components:
-            for param in self.vq.parameters():
-                param.requires_grad = True
-            # 如果使用EMA codebook，重新启用EMA更新
-            if isinstance(self.vq, FlattenedVectorQuantizerEMA):
-                self.vq._disable_ema_update = False
+            vq_modules = list(self.vqs) if self.per_channel_codebook else [self.vq]
+            for vq_mod in vq_modules:
+                for param in vq_mod.parameters():
+                    param.requires_grad = True
+                if isinstance(vq_mod, FlattenedVectorQuantizerEMA):
+                    vq_mod._disable_ema_update = False
             unfrozen.append('VQ')
         
         if unfrozen:
@@ -916,6 +952,8 @@ def get_model_config(args):
         'num_residual_hiddens': args.num_residual_hiddens,
         # Transformer hidden_dim（可选，默认使用code_dim）
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
+        # 每通道独立码本（默认False，与旧行为兼容）
+        'per_channel_codebook': bool(getattr(args, 'per_channel_codebook', False)),
     }
     
     # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:

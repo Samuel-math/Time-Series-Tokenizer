@@ -1,6 +1,10 @@
 """
 轻量级码本模型：只包含Encoder、VQ和Decoder
 用于码本预训练，不包含Transformer等重型模块
+
+CodebookModel          — 所有通道共享一个 VQ
+PerChannelCodebookModel — 每个通道拥有独立 VQ（nn.ModuleList self.vqs），
+                          编码器/解码器仍然共享
 """
 
 import torch
@@ -233,3 +237,172 @@ class CodebookModel(nn.Module):
         x_recon = x_recon.reshape(B, -1, C)  # [B, num_patches * patch_size, C]
         
         return x_recon
+
+
+class PerChannelCodebookModel(nn.Module):
+    """
+    Per-channel 码本模型：共享 Encoder/Decoder，每个通道拥有独立 VQ。
+
+    VQ 模块存放在 self.vqs = nn.ModuleList(...)，保存时的 state_dict 键名为
+    vqs.0.*, vqs.1.*, ...，与 PatchVQVAETransformer(per_channel_codebook=True)
+    的命名完全一致，因此可以直接被 load_vqvae_weights() 加载。
+    """
+
+    def __init__(self, config, n_channels):
+        super().__init__()
+        self.patch_size = config['patch_size']
+        self.embedding_dim = config['embedding_dim']
+        self.compression_factor = config['compression_factor']
+        self.codebook_size = config['codebook_size']
+        self.commitment_cost = config['commitment_cost']
+        self.n_channels = n_channels
+
+        self.compressed_len = self.patch_size // self.compression_factor
+        self.code_dim = self.embedding_dim * self.compressed_len
+
+        # 共享 Encoder / Decoder（channel-independent：单通道输入/输出）
+        self.encoder = Encoder(
+            in_channels=1,
+            num_hiddens=config['num_hiddens'],
+            num_residual_layers=config['num_residual_layers'],
+            num_residual_hiddens=config['num_residual_hiddens'],
+            embedding_dim=self.embedding_dim,
+            compression_factor=self.compression_factor,
+        )
+        self.decoder = Decoder(
+            in_channels=self.embedding_dim,
+            num_hiddens=config['num_hiddens'],
+            num_residual_layers=config['num_residual_layers'],
+            num_residual_hiddens=config['num_residual_hiddens'],
+            compression_factor=self.compression_factor,
+            out_channels=1,
+        )
+
+        # 每个通道独立的 VQ（键名 vqs.{c}.* 与 PatchVQVAETransformer 保持一致）
+        init_method = config.get('vq_init_method', 'random')
+        if config.get('codebook_ema', False):
+            self.vqs = nn.ModuleList([
+                FlattenedVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=config.get('ema_decay', 0.99),
+                    eps=config.get('ema_eps', 1e-5),
+                    init_method=init_method,
+                )
+                for _ in range(n_channels)
+            ])
+        else:
+            self.vqs = nn.ModuleList([
+                FlattenedVectorQuantizer(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    init_method=init_method,
+                )
+                for _ in range(n_channels)
+            ])
+
+    # ------------------------------------------------------------------
+    # 初始化
+    # ------------------------------------------------------------------
+
+    def init_codebook_from_data(self, dataloader, device, num_samples=10000,
+                                method='kmeans', revin=None):
+        """从数据分通道初始化各自的码本。"""
+        self.eval()
+        # 每个通道单独收集 encoder 输出
+        z_per_channel = [[] for _ in range(self.n_channels)]
+        n_collected = [0] * self.n_channels
+        target = num_samples
+
+        print(f"\n收集 encoder 输出用于 per-channel 码本初始化（每通道目标: {target}）...")
+
+        with torch.no_grad():
+            for batch_x, _ in dataloader:
+                if all(n >= target for n in n_collected):
+                    break
+                batch_x = batch_x.to(device)
+                if revin is not None:
+                    batch_x = revin(batch_x, 'norm')
+
+                B, T, C = batch_x.shape
+                num_patches = T // self.patch_size
+                x = batch_x[:, :num_patches * self.patch_size, :]
+                x_patches = x.reshape(B, num_patches, self.patch_size, C)
+
+                for c in range(min(C, self.n_channels)):
+                    if n_collected[c] >= target:
+                        continue
+                    x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size)
+                    x_c = x_c.unsqueeze(1)  # [B*P, 1, patch_size]
+                    z = self.encoder(x_c, self.compression_factor)
+                    z_flat = z.reshape(B * num_patches, -1)
+                    z_per_channel[c].append(z_flat.cpu())
+                    n_collected[c] += z_flat.size(0)
+
+        for c in range(self.n_channels):
+            if not z_per_channel[c]:
+                print(f"  警告: 通道 {c} 未收集到样本，跳过初始化")
+                continue
+            z_samples = torch.cat(z_per_channel[c], dim=0)[:target].to(device)
+            print(f"  通道 {c}: {z_samples.size(0)} 个样本")
+            self.vqs[c].init_from_data(z_samples, method=method)
+
+        self.train()
+
+    # ------------------------------------------------------------------
+    # 前向接口（与 CodebookModel 完全相同，方便 train_epoch 复用）
+    # ------------------------------------------------------------------
+
+    def encode_to_indices(self, x):
+        """
+        Args:
+            x: [B, T, C]
+        Returns:
+            indices: [B, num_patches, C]
+            vq_loss: scalar
+            z_q: [B, num_patches, C, code_dim]
+        """
+        B, T, C = x.shape
+        num_patches = T // self.patch_size
+        x = x[:, :num_patches * self.patch_size, :]
+        x_patches = x.reshape(B, num_patches, self.patch_size, C)
+
+        # --- Encode (shared encoder, channel-independent) ---
+        z_list = []
+        for c in range(C):
+            x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size).unsqueeze(1)
+            z = self.encoder(x_c, self.compression_factor)
+            z_flat = z.reshape(B * num_patches, self.code_dim)
+            z_list.append(z_flat.reshape(B, num_patches, self.code_dim))
+
+        z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
+
+        # --- Quantize (per-channel independent VQ) ---
+        indices_list, z_q_list = [], []
+        vq_loss_sum = 0.0
+        for c in range(C):
+            z_c_flat = z_all[:, :, c, :].reshape(B * num_patches, self.code_dim)
+            vq_loss_c, z_q_flat_c, indices_c = self.vqs[c](z_c_flat)
+            vq_loss_sum += vq_loss_c
+            indices_list.append(indices_c.reshape(B, num_patches))
+            z_q_list.append(z_q_flat_c.reshape(B, num_patches, self.code_dim))
+
+        indices = torch.stack(indices_list, dim=2)   # [B, num_patches, C]
+        z_q = torch.stack(z_q_list, dim=2)           # [B, num_patches, C, code_dim]
+        vq_loss = vq_loss_sum / C
+        return indices, vq_loss, z_q
+
+    def decode_from_codes(self, z_q):
+        """
+        Args:
+            z_q: [B, num_patches, C, code_dim]
+        Returns:
+            x_recon: [B, num_patches * patch_size, C]
+        """
+        B, num_patches, C, _ = z_q.shape
+        x_recon_list = []
+        for c in range(C):
+            z_q_c = z_q[:, :, c, :].reshape(B * num_patches, self.embedding_dim, self.compressed_len)
+            x_c = self.decoder(z_q_c, self.compression_factor)   # [B*P, 1, patch_size]
+            x_recon_list.append(x_c.reshape(B, num_patches, self.patch_size))
+
+        x_recon = torch.stack(x_recon_list, dim=3)  # [B, num_patches, patch_size, C]
+        return x_recon.reshape(B, -1, C)

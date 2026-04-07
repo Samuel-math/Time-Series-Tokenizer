@@ -45,6 +45,9 @@ VALID_SAMPLE_RATIO=1.0  # 验证集采样比例 (0.0-1.0)，例如0.1表示只�
 SAVE_PATH="saved_models/vqvae_only/"
 MODEL_ID=1
 
+# Per-channel 码本（每通道独立 VQ）
+PER_CHANNEL_CODEBOOK=0  # 0=共享码本, 1=per-channel独立码本
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
@@ -75,4 +78,5 @@ python codebook_pretrain.py \
     --train_sample_ratio $TRAIN_SAMPLE_RATIO \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
     --save_path $SAVE_PATH \
-    --model_id $MODEL_ID
+    --model_id $MODEL_ID \
+    --per_channel_codebook $PER_CHANNEL_CODEBOOK
