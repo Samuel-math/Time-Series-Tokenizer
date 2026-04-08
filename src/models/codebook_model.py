@@ -11,7 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .vqvae import Encoder, Decoder
-from .patch_vqvae_transformer import FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA
+from .patch_vqvae_transformer import (
+    FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA, ResidualVQ,
+)
 
 
 class CodebookModel(nn.Module):
@@ -49,19 +51,23 @@ class CodebookModel(nn.Module):
             out_channels=1
         )
         
-        # VQ
+        # VQ（包裹在 ResidualVQ 中；n_rq_layers=1 时等价于原来的单层 VQ）
+        self.n_rq_layers = config.get('n_rq_layers', 1)
         init_method = config.get('vq_init_method', 'random')
-        if config.get('codebook_ema', False):
-            self.vq = FlattenedVectorQuantizerEMA(
+
+        def _make_single_vq():
+            if config.get('codebook_ema', False):
+                return FlattenedVectorQuantizerEMA(
+                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
+                    init_method=init_method,
+                )
+            return FlattenedVectorQuantizer(
                 self.codebook_size, self.code_dim, self.commitment_cost,
-                decay=config.get('ema_decay', 0.99), eps=config.get('ema_eps', 1e-5),
-                init_method=init_method
+                init_method=init_method,
             )
-        else:
-            self.vq = FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost,
-                init_method=init_method
-            )
+
+        self.vq = ResidualVQ(self.n_rq_layers, _make_single_vq)
     
     def init_codebook_from_data(self, dataloader, device, num_samples=10000, method='kmeans', revin=None):
         """
@@ -126,83 +132,63 @@ class CodebookModel(nn.Module):
     
     def encode_to_indices(self, x, return_distances=False):
         """
-        编码为码本索引和量化向量（channel-independent版本）
-        
         Args:
             x: [B, T, C]
-            return_distances: 是否返回到码本的距离（用于软索引计算）
+            return_distances: 是否返回到码本第 0 层的距离（用于软索引计算）
         Returns:
-            indices: [B, num_patches, C]
+            indices: [B, num_patches, C, n_rq_layers]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
-            distances (optional): [B*num_patches*C, codebook_size] 到码本的距离
+            distances (optional): [B*num_patches*C, codebook_size]
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
-        
-        # 重组为 patches: [B, num_patches, patch_size, C]
+
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
-        
-        # Channel-independent: 对每个通道独立编码
+
         z_list = []
-        
         for c in range(C):
-            # 提取第c个通道的patches: [B, num_patches, patch_size]
-            x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
-            x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
-            x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
-            
-            # VQVAE Encoder (单通道输入)
-            z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
-            z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
-            z_c = z_flat.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
-            
-            z_list.append(z_c)
-        
-        # 合并所有通道: [B, num_patches, C, code_dim]
+            x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size).unsqueeze(1)
+            z = self.encoder(x_c, self.compression_factor)
+            z_flat = z.reshape(B * num_patches, self.code_dim)
+            z_list.append(z_flat.reshape(B, num_patches, self.code_dim))
+
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
-        
-        # VQ量化（对每个通道独立进行）
-        indices_list = []
-        z_q_list = []
-        distances_list = []
+
+        indices_list, z_q_list, distances_list = [], [], []
         vq_loss_sum = 0
-        
+
         for c in range(C):
-            z_c = z_all[:, :, c, :]  # [B, num_patches, code_dim]
-            z_c_flat = z_c.reshape(B * num_patches, self.code_dim)  # [B*num_patches, code_dim]
-            
-            # 计算到码本的距离
+            z_c_flat = z_all[:, :, c, :].reshape(B * num_patches, self.code_dim)
+
             if return_distances:
+                w0 = self.vq.layers[0].embedding.weight
                 distances_c = (
-                    torch.sum(z_c_flat ** 2, dim=1, keepdim=True) +
-                    torch.sum(self.vq.embedding.weight ** 2, dim=1) -
-                    2 * torch.matmul(z_c_flat, self.vq.embedding.weight.t())
-                )  # [B*num_patches, codebook_size]
+                    torch.sum(z_c_flat ** 2, dim=1, keepdim=True)
+                    + torch.sum(w0 ** 2, dim=1)
+                    - 2 * torch.matmul(z_c_flat, w0.t())
+                )
                 distances_list.append(distances_c)
-            
-            # VQ
-            vq_loss_c, z_q_flat_c, indices_c = self.vq(z_c_flat)
+
+            vq_loss_c, z_q_sum_c, all_idx_c = self.vq(z_c_flat)
             vq_loss_sum += vq_loss_c
-            
-            # Reshape: [B*num_patches] -> [B, num_patches]
-            indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
-            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
-            
+
+            # [B*num_patches, n_rq_layers] → [B, num_patches, n_rq_layers]
+            indices_c = torch.stack(all_idx_c, dim=1).reshape(B, num_patches, self.n_rq_layers)
+            z_q_c = z_q_sum_c.reshape(B, num_patches, self.code_dim)
+
             indices_list.append(indices_c)
             z_q_list.append(z_q_c)
-        
-        # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
-        z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
-        vq_loss = vq_loss_sum / C  # 平均VQ损失
-        
+
+        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, n_rq_layers]
+        z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
+        vq_loss = vq_loss_sum / C
+
         if return_distances:
-            # 合并所有通道的距离: [C, B*num_patches, codebook_size] -> [B*num_patches*C, codebook_size]
-            distances = torch.cat(distances_list, dim=0)  # [B*num_patches*C, codebook_size]
+            distances = torch.cat(distances_list, dim=0)
             return indices, vq_loss, z_q, distances
-        
+
         return indices, vq_loss, z_q
     
     def decode_from_codes(self, z_q):
@@ -278,26 +264,26 @@ class PerChannelCodebookModel(nn.Module):
             out_channels=1,
         )
 
-        # 每个通道独立的 VQ（键名 vqs.{c}.* 与 PatchVQVAETransformer 保持一致）
+        # 每个通道独立的 RVQ（键名 vqs.{c}.* 与 PatchVQVAETransformer 保持一致）
+        self.n_rq_layers = config.get('n_rq_layers', 1)
         init_method = config.get('vq_init_method', 'random')
-        if config.get('codebook_ema', False):
-            self.vqs = nn.ModuleList([
-                FlattenedVectorQuantizerEMA(
+
+        def _make_single_vq():
+            if config.get('codebook_ema', False):
+                return FlattenedVectorQuantizerEMA(
                     self.codebook_size, self.code_dim, self.commitment_cost,
                     decay=config.get('ema_decay', 0.99),
                     eps=config.get('ema_eps', 1e-5),
                     init_method=init_method,
                 )
-                for _ in range(n_channels)
-            ])
-        else:
-            self.vqs = nn.ModuleList([
-                FlattenedVectorQuantizer(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
-                    init_method=init_method,
-                )
-                for _ in range(n_channels)
-            ])
+            return FlattenedVectorQuantizer(
+                self.codebook_size, self.code_dim, self.commitment_cost,
+                init_method=init_method,
+            )
+
+        self.vqs = nn.ModuleList([
+            ResidualVQ(self.n_rq_layers, _make_single_vq) for _ in range(n_channels)
+        ])
 
     # ------------------------------------------------------------------
     # 初始化
@@ -356,7 +342,7 @@ class PerChannelCodebookModel(nn.Module):
         Args:
             x: [B, T, C]
         Returns:
-            indices: [B, num_patches, C]
+            indices: [B, num_patches, C, n_rq_layers]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
         """
@@ -365,7 +351,6 @@ class PerChannelCodebookModel(nn.Module):
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
 
-        # --- Encode (shared encoder, channel-independent) ---
         z_list = []
         for c in range(C):
             x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size).unsqueeze(1)
@@ -375,18 +360,18 @@ class PerChannelCodebookModel(nn.Module):
 
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
 
-        # --- Quantize (per-channel independent VQ) ---
         indices_list, z_q_list = [], []
         vq_loss_sum = 0.0
         for c in range(C):
             z_c_flat = z_all[:, :, c, :].reshape(B * num_patches, self.code_dim)
-            vq_loss_c, z_q_flat_c, indices_c = self.vqs[c](z_c_flat)
+            vq_loss_c, z_q_sum_c, all_idx_c = self.vqs[c](z_c_flat)
             vq_loss_sum += vq_loss_c
-            indices_list.append(indices_c.reshape(B, num_patches))
-            z_q_list.append(z_q_flat_c.reshape(B, num_patches, self.code_dim))
+            indices_c = torch.stack(all_idx_c, dim=1).reshape(B, num_patches, self.n_rq_layers)
+            indices_list.append(indices_c)
+            z_q_list.append(z_q_sum_c.reshape(B, num_patches, self.code_dim))
 
-        indices = torch.stack(indices_list, dim=2)   # [B, num_patches, C]
-        z_q = torch.stack(z_q_list, dim=2)           # [B, num_patches, C, code_dim]
+        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, n_rq_layers]
+        z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C
         return indices, vq_loss, z_q
 

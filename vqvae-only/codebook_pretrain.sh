@@ -48,6 +48,11 @@ MODEL_ID=1
 # Per-channel 码本（每通道独立 VQ）
 PER_CHANNEL_CODEBOOK=0  # 0=共享码本, 1=per-channel独立码本
 
+# RVQ 层数
+# 1 = 普通 VQ（默认，与旧行为兼容）
+# 2 = 2层残差 VQ（RQVAE）
+N_RQ_LAYERS=1
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
@@ -79,4 +84,5 @@ python codebook_pretrain.py \
     --valid_sample_ratio $VALID_SAMPLE_RATIO \
     --save_path $SAVE_PATH \
     --model_id $MODEL_ID \
-    --per_channel_codebook $PER_CHANNEL_CODEBOOK
+    --per_channel_codebook $PER_CHANNEL_CODEBOOK \
+    --n_rq_layers $N_RQ_LAYERS

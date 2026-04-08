@@ -76,6 +76,13 @@ def build_arg_parser():
     p.add_argument('--per_channel_codebook', type=int, default=0,
                    help='每通道独立码本（1=启用，需与 vqvae-only 训练一致）')
 
+    # RVQ 层数
+    p.add_argument('--n_rq_layers', type=int, default=1,
+                   help='残差向量量化层数（1=普通VQ，2=2层RVQ）')
+    p.add_argument('--rq_layer_weights', type=float, nargs='+', default=None,
+                   help='各 RVQ 层 pred_loss 的权重，顺序对应第0层、第1层…'
+                        '（默认 None = 均等权重）。示例: --rq_layer_weights 1.0 0.5')
+
     # NMPP 模式
     p.add_argument('--use_raw_input', type=int, default=0,
                    help='1: NMPP 模式，Transformer 接收原始 patch，VQVAE 仅作为 teacher')
@@ -100,12 +107,31 @@ def build_arg_parser():
 # Loss helpers
 # ---------------------------------------------------------------------------
 
-def _progressive_loss(all_logits, all_target_indices):
-    losses = []
-    for logits_s, tgt_s in zip(all_logits, all_target_indices):
-        B, P, C, K = logits_s.shape
-        losses.append(F.cross_entropy(logits_s.reshape(-1, K), tgt_s.reshape(-1)))
-    return sum(losses) / len(losses)
+def _progressive_loss(all_logits, all_target_indices, rq_layer_weights=None):
+    """
+    all_logits:        List[stage] of List[rq_layer] of [B, step_size, C, codebook_size]
+    all_target_indices: List[stage] of List[rq_layer] of [B, step_size, C]
+    rq_layer_weights:  List[float] | None — 各 RVQ 层的损失权重（None 表示均等）
+    """
+    n_layers = len(all_logits[0])
+    if rq_layer_weights is None:
+        weights = [1.0] * n_layers
+    else:
+        if len(rq_layer_weights) != n_layers:
+            raise ValueError(
+                f"rq_layer_weights 长度 ({len(rq_layer_weights)}) 与 RVQ 层数 ({n_layers}) 不匹配"
+            )
+        weights = list(rq_layer_weights)
+
+    total_loss = 0.0
+    total_weight = 0.0
+    for logits_layers, tgt_layers in zip(all_logits, all_target_indices):
+        for l, (logits_l, tgt_l) in enumerate(zip(logits_layers, tgt_layers)):
+            B, P, C, K = logits_l.shape
+            total_loss += weights[l] * F.cross_entropy(logits_l.reshape(-1, K), tgt_l.reshape(-1))
+            total_weight += weights[l]
+
+    return total_loss / (total_weight * len(all_logits) / n_layers)
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +147,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     compute_recon = args.recon_weight > 0 and not use_raw
     vq_w    = 0. if use_raw else args.vq_weight
     recon_w = 0. if use_raw else args.recon_weight
+    rq_weights = getattr(args, 'rq_layer_weights', None)
 
     for batch_x, batch_y in dataloader:
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -136,7 +163,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
             compute_recon_loss=compute_recon,
             use_raw_input=use_raw,
         )
-        pred_loss = _progressive_loss(all_logits, all_tgt)
+        pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
         loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
         optimizer.zero_grad()
@@ -163,6 +190,7 @@ def validate_epoch(model, dataloader, revin, args, device):
     compute_recon = args.recon_weight > 0 and not use_raw
     vq_w    = 0. if use_raw else args.vq_weight
     recon_w = 0. if use_raw else args.recon_weight
+    rq_weights = getattr(args, 'rq_layer_weights', None)
 
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
@@ -179,7 +207,7 @@ def validate_epoch(model, dataloader, revin, args, device):
                 compute_recon_loss=compute_recon,
                 use_raw_input=use_raw,
             )
-            pred_loss = _progressive_loss(all_logits, all_tgt)
+            pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
             loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
             totals['loss']       += loss.item()
@@ -207,14 +235,18 @@ def _disable_flash_sdp():
 
 
 def _disable_ema(model):
-    """冻结所有 VQ 模块的 EMA 更新（兼容 shared / per-channel 两种模式）"""
+    """冻结所有 VQ 模块的 EMA 更新（兼容 shared / per-channel + 单层/RVQ 模式）"""
+    def _disable_rvq(rvq_mod):
+        for single_vq in rvq_mod.layers:
+            if isinstance(single_vq, FlattenedVectorQuantizerEMA):
+                single_vq._disable_ema_update = True
+
     if model.per_channel_codebook:
-        for vq_mod in model.vqs:
-            if isinstance(vq_mod, FlattenedVectorQuantizerEMA):
-                vq_mod._disable_ema_update = True
+        for rvq_mod in model.vqs:
+            _disable_rvq(rvq_mod)
         print('✓ 已禁用 EMA 更新（per-channel 模式）')
-    elif hasattr(model, 'vq') and isinstance(model.vq, FlattenedVectorQuantizerEMA):
-        model.vq._disable_ema_update = True
+    elif hasattr(model, 'vq'):
+        _disable_rvq(model.vq)
         print('✓ 已禁用 EMA 更新（shared 模式）')
 
 
@@ -244,11 +276,12 @@ def run_pretrain():
     step_size = args.progressive_step_size
     nmpp_sfx  = '_nmpp'  if args.use_raw_input        else ''
     perch_sfx = '_perch' if args.per_channel_codebook else ''
+    rvq_sfx   = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
     rid_sfx   = f'_run{args.run_id}' if args.run_id is not None else ''
     model_name = (
         f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}'
         f'_l{args.n_layers}_in{args.context_points}_step{step_size}'
-        f'{rid_sfx}_model{args.model_id}{perch_sfx}{nmpp_sfx}'
+        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{nmpp_sfx}'
     )
 
     # 数据

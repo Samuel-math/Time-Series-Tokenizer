@@ -84,7 +84,11 @@ def parse_args():
     # Per-channel 码本
     parser.add_argument('--per_channel_codebook', type=int, default=0,
                         help='每个通道使用独立码本 (1启用, 0共享码本)')
-    
+
+    # RVQ 层数
+    parser.add_argument('--n_rq_layers', type=int, default=1,
+                        help='残差向量量化层数（1=普通VQ，2=2层RVQ，以此类推）')
+
     return parser.parse_args()
 
 
@@ -103,7 +107,8 @@ def get_model_config(args):
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
-        'use_patch_attention': False,  # 码本预训练不使用patch attention
+        'use_patch_attention': False,
+        'n_rq_layers': int(getattr(args, 'n_rq_layers', 1)),
     }
     return config
 
@@ -111,67 +116,77 @@ def get_model_config(args):
 def compute_codebook_usage_stats(indices, codebook_size):
     """
     计算码本利用率统计信息（所有通道合并，适用于共享码本）
-    
+
     Args:
-        indices: [B, num_patches, C] 码本索引
+        indices: [B, num_patches, C, n_rq_layers] 码本索引
         codebook_size: 码本大小
     Returns:
-        dict: 包含利用率统计信息的字典
+        dict
     """
-    indices_flat = indices.reshape(-1).cpu()  # [N]
-    unique_indices = torch.unique(indices_flat)
-    num_used = len(unique_indices)
-    usage_rate = num_used / codebook_size
-    
-    # 计算每个码本元素的使用频率
-    counts = torch.bincount(indices_flat, minlength=codebook_size)
-    num_unused = (counts == 0).sum().item()
-    
-    # 最常用的前5个码本元素
-    top5_counts, top5_indices = torch.topk(counts, k=min(5, codebook_size))
-    top5_usage = [(idx.item(), count.item()) for idx, count in zip(top5_indices, top5_counts) if count > 0]
-    
+    # 对所有层取平均利用率
+    n_rq = indices.shape[-1]
+    all_usages, all_counts = [], []
+    for l in range(n_rq):
+        idx_l = indices[..., l].reshape(-1).cpu()
+        unique_l = torch.unique(idx_l)
+        all_usages.append(len(unique_l) / codebook_size)
+        all_counts.append(torch.bincount(idx_l, minlength=codebook_size))
+
+    avg_usage = sum(all_usages) / n_rq
+    # top5 based on layer 0
+    counts0 = all_counts[0]
+    num_unused = (counts0 == 0).sum().item()
+    top5_counts, top5_indices = torch.topk(counts0, k=min(5, codebook_size))
+    top5_usage = [(idx.item(), cnt.item()) for idx, cnt in zip(top5_indices, top5_counts) if cnt > 0]
+
+    per_layer_usage = [f'L{l}:{u*100:.1f}%' for l, u in enumerate(all_usages)]
+
     return {
-        'num_used': num_used,
+        'num_used': int(avg_usage * codebook_size),
         'num_unused': num_unused,
-        'usage_rate': usage_rate,
+        'usage_rate': avg_usage,
         'top5_usage': top5_usage,
-        'total_tokens': len(indices_flat),
+        'total_tokens': indices.numel(),
+        'per_layer_usage': per_layer_usage,
     }
 
 
 def compute_per_channel_usage_stats(indices, codebook_size):
     """
-    计算 per-channel 码本利用率统计信息（每个通道独立计算，适用于 per-channel 码本）
+    计算 per-channel 码本利用率统计信息
 
     Args:
-        indices: [B, num_patches, C] 码本索引
-        codebook_size: 码本大小（每个通道相同）
+        indices: [B, num_patches, C, n_rq_layers] 码本索引
+        codebook_size: 码本大小
     Returns:
-        dict: 包含各通道和平均利用率统计的字典
+        dict
     """
-    B, num_patches, C = indices.shape
+    B, num_patches, C, n_rq = indices.shape
     per_ch_usage = []
     per_ch_num_used = []
     per_ch_num_unused = []
 
+    # 对所有层取平均
     for c in range(C):
-        idx_c = indices[:, :, c].reshape(-1).cpu()
-        unique_c = torch.unique(idx_c)
-        num_used_c = len(unique_c)
-        per_ch_usage.append(num_used_c / codebook_size)
-        per_ch_num_used.append(num_used_c)
-        per_ch_num_unused.append(codebook_size - num_used_c)
+        layer_usages = []
+        for l in range(n_rq):
+            idx_cl = indices[:, :, c, l].reshape(-1).cpu()
+            unique_cl = torch.unique(idx_cl)
+            layer_usages.append(len(unique_cl) / codebook_size)
+        avg_u = sum(layer_usages) / n_rq
+        per_ch_usage.append(avg_u)
+        per_ch_num_used.append(int(avg_u * codebook_size))
+        per_ch_num_unused.append(codebook_size - int(avg_u * codebook_size))
 
     avg_usage = sum(per_ch_usage) / C
 
     return {
-        'usage_rate': avg_usage,          # 各通道平均利用率
+        'usage_rate': avg_usage,
         'num_used': sum(per_ch_num_used) / C,
         'num_unused': sum(per_ch_num_unused) / C,
-        'per_channel_usage': per_ch_usage,       # list of float, one per channel
+        'per_channel_usage': per_ch_usage,
         'per_channel_num_used': per_ch_num_used,
-        'top5_usage': [],  # 不适用于 per-channel 统计
+        'top5_usage': [],
         'total_tokens': indices.numel(),
     }
 
@@ -223,15 +238,15 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
         
-        # 计算 perplexity（per-channel 时取各通道平均）
+        # 计算 perplexity（per-channel 时取各通道平均；取第 0 层索引计算）
         if per_channel:
             ch_usages = [
-                len(torch.unique(indices[:, :, c])) / args.codebook_size
+                len(torch.unique(indices[:, :, c, 0])) / args.codebook_size
                 for c in range(indices.shape[2])
             ]
             perplexity = sum(ch_usages) / len(ch_usages)
         else:
-            unique_indices = torch.unique(indices.reshape(-1))
+            unique_indices = torch.unique(indices[:, :, :, 0].reshape(-1))
             perplexity = len(unique_indices) / args.codebook_size
         
         # 累积索引用于统计
@@ -295,12 +310,12 @@ def validate_epoch(model, dataloader, revin, args, device):
             # 计算 perplexity
             if per_channel:
                 ch_usages = [
-                    len(torch.unique(indices[:, :, c])) / args.codebook_size
+                    len(torch.unique(indices[:, :, c, 0])) / args.codebook_size
                     for c in range(indices.shape[2])
                 ]
                 perplexity = sum(ch_usages) / len(ch_usages)
             else:
-                unique_indices = torch.unique(indices.reshape(-1))
+                unique_indices = torch.unique(indices[:, :, :, 0].reshape(-1))
                 perplexity = len(unique_indices) / args.codebook_size
             
             # 累积索引用于统计
@@ -390,7 +405,8 @@ def main():
     # 模型文件名
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
     per_ch_suffix = '_perch' if args.per_channel_codebook else ''
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}_model{args.model_id}'
+    rvq_suffix = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -540,7 +556,12 @@ def main():
             
             print(f"  └─ 码本利用率(avg): Train {train_usage:.1f}% ({train_used:.0f}/{args.codebook_size}) | "
                   f"Valid {val_usage:.1f}% ({val_used:.0f}/{args.codebook_size})")
-            
+
+            # 多层 RVQ 时打印每层独立利用率
+            per_layer = train_stats.get('per_layer_usage', [])
+            if len(per_layer) > 1:
+                print(f"  └─ 各层利用率 (Train): {', '.join(per_layer)}")
+
             if args.per_channel_codebook:
                 per_ch_train = train_stats.get('per_channel_usage', [])
                 per_ch_val   = val_stats.get('per_channel_usage', [])

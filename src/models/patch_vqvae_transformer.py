@@ -227,6 +227,81 @@ class FlattenedVectorQuantizerEMA(nn.Module):
         return self.embedding(indices)
 
 
+class ResidualVQ(nn.Module):
+    """
+    残差向量量化（Residual Vector Quantization，RVQ）
+    逐层量化上一层的残差，每层有独立码本。
+    n_rq_layers=1 时退化为普通 VQ，与原有行为完全一致。
+    """
+    def __init__(self, n_layers, make_single_vq_fn):
+        super().__init__()
+        self.n_layers = n_layers
+        self.layers = nn.ModuleList([make_single_vq_fn() for _ in range(n_layers)])
+
+    @property
+    def codebook_size(self):
+        return self.layers[0].codebook_size
+
+    @property
+    def code_dim(self):
+        return self.layers[0].code_dim
+
+    # 为兼容旧代码中 `vq.embedding.weight` 的访问（n_rq_layers=1 时）
+    @property
+    def embedding(self):
+        return self.layers[0].embedding
+
+    def forward(self, z_flat):
+        """
+        Args:
+            z_flat: [N, code_dim]
+        Returns:
+            total_loss: scalar
+            z_q_sum: [N, code_dim]  各层量化之和
+            all_indices: List[[N]]  每层的索引
+        """
+        residual = z_flat
+        z_q_sum = torch.zeros_like(z_flat)
+        total_loss = z_flat.new_tensor(0.0)
+        all_indices = []
+
+        for vq in self.layers:
+            loss, z_q, idx = vq(residual)
+            residual = residual - z_q.detach()
+            z_q_sum = z_q_sum + z_q
+            total_loss = total_loss + loss
+            all_indices.append(idx)
+
+        return total_loss, z_q_sum, all_indices
+
+    def get_embedding(self, indices_list):
+        """
+        indices_list: List[[N]] (length = n_rq_layers)
+        Returns: [N, code_dim]，各层 embedding 之和
+        """
+        dtype = self.layers[0].embedding.weight.dtype
+        z_q = torch.zeros(indices_list[0].shape[0], self.code_dim,
+                          device=indices_list[0].device, dtype=dtype)
+        for i, idx in enumerate(indices_list):
+            z_q = z_q + self.layers[i].get_embedding(idx)
+        return z_q
+
+    def init_from_data(self, z_samples, method='kmeans'):
+        """逐层用残差初始化码本"""
+        residual = z_samples.detach().clone()
+        for layer in self.layers:
+            layer.init_from_data(residual, method)
+            with torch.no_grad():
+                distances = (
+                    torch.sum(residual ** 2, dim=1, keepdim=True)
+                    + torch.sum(layer.embedding.weight ** 2, dim=1)
+                    - 2 * torch.matmul(residual, layer.embedding.weight.t())
+                )
+                idx = torch.argmin(distances, dim=1)
+                z_q = layer.embedding(idx)
+                residual = residual - z_q
+
+
 class CausalTransformer(nn.Module):
     """轻量级 Causal Transformer，支持独立的 hidden_dim 参数"""
     def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_dim=None):
@@ -338,10 +413,11 @@ class PatchVQVAETransformer(nn.Module):
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'random')
         self.per_channel_codebook = config.get('per_channel_codebook', False)
+        self.n_rq_layers = config.get('n_rq_layers', 1)
         n_channels = config.get('n_channels', None)
         self._n_channels = n_channels
 
-        def _make_vq():
+        def _make_single_vq():
             if self.use_codebook_ema:
                 return FlattenedVectorQuantizerEMA(
                     self.codebook_size, self.code_dim, self.commitment_cost,
@@ -352,23 +428,27 @@ class PatchVQVAETransformer(nn.Module):
                 self.codebook_size, self.code_dim, self.commitment_cost,
                 init_method=vq_init_method
             )
-        
+
+        def _make_rvq():
+            return ResidualVQ(self.n_rq_layers, _make_single_vq)
+
         if self.per_channel_codebook:
             if n_channels is None:
                 raise ValueError("per_channel_codebook=True 需要在 config 中提供 n_channels")
-            self.vqs = nn.ModuleList([_make_vq() for _ in range(n_channels)])
+            self.vqs = nn.ModuleList([_make_rvq() for _ in range(n_channels)])
         else:
-            self.vq = _make_vq()
-        
+            self.vq = _make_rvq()
+
         # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
         self.transformer = CausalTransformer(
-            self.code_dim, self.n_heads, self.n_layers, 
+            self.code_dim, self.n_heads, self.n_layers,
             self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
         )
-        
-        # 输出头: code_dim -> codebook_size (预测码本索引)
-        # 注意：Transformer输出始终是code_dim（通过输出投影），所以output_head输入维度是code_dim
-        self.output_head = nn.Linear(self.code_dim, self.codebook_size)
+
+        # 每层 RVQ 独立一个预测头；n_rq_layers=1 时等价于原来的 output_head
+        self.output_heads = nn.ModuleList([
+            nn.Linear(self.code_dim, self.codebook_size) for _ in range(self.n_rq_layers)
+        ])
 
         # NMPP 模式 (use_raw_input=True): 将原始 patch 投影到 Transformer 输入维度
         self.patch_embedding = nn.Linear(self.patch_size, self.code_dim)
@@ -447,27 +527,29 @@ class PatchVQVAETransformer(nn.Module):
         indices_list = []
         z_q_list = []
         vq_loss_sum = 0
-        
+
         for c in range(C):
             z_c = z_all[:, :, c, :]  # [B, num_patches, code_dim]
-            z_c_flat = z_c.reshape(B * num_patches, self.code_dim)  # [B*num_patches, code_dim]
-            
-            # VQ（每通道独立码本或共享码本）
-            vq_loss_c, z_q_flat_c, indices_c = self._get_vq(c)(z_c_flat)
+            z_c_flat = z_c.reshape(B * num_patches, self.code_dim)
+
+            # RVQ（每通道独立码本或共享码本）
+            vq_loss_c, z_q_sum_c, all_idx_c = self._get_vq(c)(z_c_flat)
             vq_loss_sum += vq_loss_c
-            
-            # Reshape: [B*num_patches] -> [B, num_patches]
-            indices_c = indices_c.reshape(B, num_patches)  # [B, num_patches]
-            z_q_c = z_q_flat_c.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
-            
+
+            # all_idx_c: List[n_rq_layers] of [B*num_patches]
+            # Stack → [B*num_patches, n_rq_layers] → [B, num_patches, n_rq_layers]
+            indices_c = torch.stack(all_idx_c, dim=1).reshape(B, num_patches, self.n_rq_layers)
+            z_q_c = z_q_sum_c.reshape(B, num_patches, self.code_dim)
+
             indices_list.append(indices_c)
             z_q_list.append(z_q_c)
-        
-        # 合并所有通道: [B, num_patches, C] 和 [B, num_patches, C, code_dim]
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C]
-        z_q = torch.stack(z_q_list, dim=2)  # [B, num_patches, C, code_dim]
-        vq_loss = vq_loss_sum / C  # 平均VQ损失
-        
+
+        # indices: [B, num_patches, C, n_rq_layers]
+        # z_q:     [B, num_patches, C, code_dim]
+        indices = torch.stack(indices_list, dim=2)
+        z_q = torch.stack(z_q_list, dim=2)
+        vq_loss = vq_loss_sum / C
+
         return indices, vq_loss, z_q
     
     def decode_from_codes(self, z_q):
@@ -563,12 +645,20 @@ class PatchVQVAETransformer(nn.Module):
             h_full = self.transformer(full_sequence_stage)
             h_target = h_full[:, context_size:context_size + step_size, :]
 
-            target_indices_stage = full_indices[:, target_start:target_end, :]
-            logits_flat = self.output_head(h_target)
-            logits_stage = logits_flat.reshape(B, C, step_size, -1).permute(0, 2, 1, 3)
+            # target_indices_stage: [B, step_size, C, n_rq_layers]
+            target_indices_stage = full_indices[:, target_start:target_end, :, :]
 
-            all_logits.append(logits_stage)
-            all_target_indices.append(target_indices_stage)
+            # 对每层 RVQ 独立预测
+            logits_layers, tgt_layers = [], []
+            for l, head in enumerate(self.output_heads):
+                logits_flat = head(h_target)  # [B*C, step_size, codebook_size]
+                logits_l = logits_flat.reshape(B, C, step_size, -1).permute(0, 2, 1, 3)
+                # [B, step_size, C, codebook_size]
+                logits_layers.append(logits_l)
+                tgt_layers.append(target_indices_stage[:, :, :, l])  # [B, step_size, C]
+
+            all_logits.append(logits_layers)
+            all_target_indices.append(tgt_layers)
 
         if not all_logits:
             raise ValueError(
@@ -612,11 +702,13 @@ class PatchVQVAETransformer(nn.Module):
             B, num_patches, C, code_dim = z_q.shape
             context_flat = z_q.permute(0, 2, 1, 3).reshape(B * C, num_patches, code_dim)
 
-        # 预先准备 per-channel / 共享码本查找
+        # 预先准备 per-channel / 共享码本查找（使用第 0 层 RVQ 码本做 Gumbel 解码）
         if self.per_channel_codebook:
-            stacked_codebooks = torch.stack([self.vqs[c].embedding.weight for c in range(C)], dim=0)
+            stacked_codebooks = torch.stack(
+                [self.vqs[c].layers[0].embedding.weight for c in range(C)], dim=0
+            )
         else:
-            shared_codebook = self.vq.embedding.weight
+            shared_codebook = self.vq.layers[0].embedding.weight
 
         def _lookup_codebook(weights_bc):
             """weights_bc: [B*C, P, K] → [B*C, P, code_dim]"""
@@ -635,7 +727,7 @@ class PatchVQVAETransformer(nn.Module):
 
             h_full = self.transformer(full_sequence)
             h_pred = h_full[:, num_input_patches:, :]
-            logits = self.output_head(h_pred)
+            logits = self.output_heads[0](h_pred)
 
             if self.use_gumbel_softmax and self.training:
                 weights = F.gumbel_softmax(logits, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1)
@@ -662,7 +754,7 @@ class PatchVQVAETransformer(nn.Module):
 
                 context_len = current_context.shape[1]
                 h_pred_step = h_full[:, context_len:, :]
-                logits_step = self.output_head(h_pred_step)
+                logits_step = self.output_heads[0](h_pred_step)
 
                 if self.use_gumbel_softmax and self.training:
                     weights_step = F.gumbel_softmax(logits_step, tau=self.gumbel_temperature,
@@ -702,20 +794,19 @@ class PatchVQVAETransformer(nn.Module):
     @torch.no_grad()
     def get_codebook_usage(self, x):
         indices, _, _ = self.encode_to_indices(x)
-        # indices: [B, num_patches, C]
-        if self.per_channel_codebook:
-            # 分通道计算利用率，返回平均值
-            B, num_patches, C = indices.shape
-            usage_per_channel = []
-            all_unique = set()
-            for c in range(C):
-                unique_c = torch.unique(indices[:, :, c])
-                usage_per_channel.append(len(unique_c) / self.codebook_size)
-                all_unique.update(unique_c.tolist())
-            avg_usage = sum(usage_per_channel) / C
-            return avg_usage, torch.tensor(list(all_unique))
-        unique = torch.unique(indices.reshape(-1))
-        return len(unique) / self.codebook_size, unique
+        # indices: [B, num_patches, C, n_rq_layers]
+        B, num_patches, C, n_rq = indices.shape
+        all_usages = []
+        for l in range(n_rq):
+            if self.per_channel_codebook:
+                for c in range(C):
+                    unique_c = torch.unique(indices[:, :, c, l])
+                    all_usages.append(len(unique_c) / self.codebook_size)
+            else:
+                unique = torch.unique(indices[:, :, :, l].reshape(-1))
+                all_usages.append(len(unique) / self.codebook_size)
+        avg_usage = sum(all_usages) / len(all_usages)
+        return avg_usage, torch.tensor(all_usages)
     
     def load_vqvae_weights(self, checkpoint_path, device='cpu', load_vq=True, freeze=False):
         """
@@ -790,29 +881,19 @@ class PatchVQVAETransformer(nn.Module):
             
             if load_vq:
                 if self.per_channel_codebook:
-                    # 尝试加载 per-channel VQ（格式：vqs.{c}.）
+                    # 尝试加载 per-channel RVQ（格式：vqs.{c}.）
                     any_vq_loaded = False
-                    for c, vq_mod in enumerate(self.vqs):
+                    for c, rvq_mod in enumerate(self.vqs):
                         per_ch_prefix = f'vqs.{c}'
-                        if try_load_module(vq_mod, f'VQ[{c}]', None, per_ch_prefix):
+                        if try_load_module(rvq_mod, f'VQ[{c}]', None, per_ch_prefix):
                             any_vq_loaded = True
-                    
+
                     if not any_vq_loaded:
                         # 回退：从共享 VQ checkpoint 初始化所有通道码本
                         shared_loaded = False
-                        for vq_mod in self.vqs:
-                            if try_load_module(vq_mod, 'VQ', 'vq_state_dict', 'vq'):
+                        for rvq_mod in self.vqs:
+                            if try_load_module(rvq_mod, 'VQ', 'vq_state_dict', 'vq'):
                                 shared_loaded = True
-                            elif state_dict is not None:
-                                for key in state_dict.keys():
-                                    if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
-                                        if hasattr(vq_mod, 'embedding'):
-                                            try:
-                                                vq_mod.embedding.weight.data.copy_(state_dict[key])
-                                                shared_loaded = True
-                                                break
-                                            except Exception:
-                                                continue
                         if shared_loaded:
                             loaded_components.append('VQ')
                     else:
@@ -821,12 +902,13 @@ class PatchVQVAETransformer(nn.Module):
                     if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
                         loaded_components.append('VQ')
                     elif state_dict is not None:
-                        # 尝试直接加载embedding权重
+                        # 尝试直接加载 layers.0.embedding 权重（兼容旧单层格式）
                         for key in state_dict.keys():
                             if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
-                                if hasattr(self.vq, 'embedding'):
+                                target = self.vq.layers[0]
+                                if hasattr(target, 'embedding'):
                                     try:
-                                        self.vq.embedding.weight.data.copy_(state_dict[key])
+                                        target.embedding.weight.data.copy_(state_dict[key])
                                         loaded_components.append('VQ')
                                         break
                                     except Exception:
@@ -871,11 +953,12 @@ class PatchVQVAETransformer(nn.Module):
         
         if 'VQ' in components:
             vq_modules = list(self.vqs) if self.per_channel_codebook else [self.vq]
-            for vq_mod in vq_modules:
-                for param in vq_mod.parameters():
+            for rvq_mod in vq_modules:
+                for param in rvq_mod.parameters():
                     param.requires_grad = False
-                if isinstance(vq_mod, FlattenedVectorQuantizerEMA):
-                    vq_mod._disable_ema_update = True
+                for single_vq in rvq_mod.layers:
+                    if isinstance(single_vq, FlattenedVectorQuantizerEMA):
+                        single_vq._disable_ema_update = True
             frozen.append('VQ')
         
         if frozen:
@@ -907,11 +990,12 @@ class PatchVQVAETransformer(nn.Module):
         
         if 'VQ' in components:
             vq_modules = list(self.vqs) if self.per_channel_codebook else [self.vq]
-            for vq_mod in vq_modules:
-                for param in vq_mod.parameters():
+            for rvq_mod in vq_modules:
+                for param in rvq_mod.parameters():
                     param.requires_grad = True
-                if isinstance(vq_mod, FlattenedVectorQuantizerEMA):
-                    vq_mod._disable_ema_update = False
+                for single_vq in rvq_mod.layers:
+                    if isinstance(single_vq, FlattenedVectorQuantizerEMA):
+                        single_vq._disable_ema_update = False
             unfrozen.append('VQ')
         
         if unfrozen:
@@ -954,6 +1038,8 @@ def get_model_config(args):
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
         # 每通道独立码本（默认False，与旧行为兼容）
         'per_channel_codebook': bool(getattr(args, 'per_channel_codebook', False)),
+        # RVQ 层数（默认1，与旧行为兼容）
+        'n_rq_layers': int(getattr(args, 'n_rq_layers', 1)),
     }
     
     # 注意: n_channels 需要从数据加载器获取，应在调用此函数后添加:

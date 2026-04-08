@@ -26,7 +26,7 @@ fi
 DSET=$1
 PRETRAIN_CONTEXT_POINTS=$2
 PROGRESSIVE_STEP_SIZE=$3
-MODEL_ID=1
+MODEL_ID=101
 
 # =====================================================
 # Patch / VQVAE 参数（自动从 checkpoint 读取，这里作为备用）
@@ -34,7 +34,7 @@ MODEL_ID=1
 PATCH_SIZE=16
 COMPRESSION_FACTOR=8
 EMBEDDING_DIM=32
-CODEBOOK_SIZE=64
+CODEBOOK_SIZE=256
 NUM_HIDDENS=64
 NUM_RESIDUAL_LAYERS=2
 NUM_RESIDUAL_HIDDENS=64
@@ -44,7 +44,17 @@ NUM_RESIDUAL_HIDDENS=64
 # 0 = 所有通道共享同一码本
 # 1 = 每通道独立码本（需由 codebook_pretrain.py --per_channel_codebook 1 训练）
 # =====================================================
-PER_CHANNEL_CODEBOOK=1
+PER_CHANNEL_CODEBOOK=0
+
+# =====================================================
+# RVQ 层数
+# 1 = 普通 VQ（与原有行为兼容）
+# 2 = 2层残差 VQ（需与 vqvae-only 训练时保持一致）
+# =====================================================
+N_RQ_LAYERS=2
+# 各 RVQ 层 pred_loss 权重（空字符串 = 均等权重）
+# 例：第0层权重1.0，第1层权重0.5 → RQ_LAYER_WEIGHTS="1.0 0.5"
+RQ_LAYER_WEIGHTS=""
 
 # =====================================================
 # NMPP 模式（Next Masked Patch Prediction with Raw Input）
@@ -61,10 +71,14 @@ USE_RAW_INPUT=0
 # per-channel 模式自动优先匹配 *_perch*.pth
 # =====================================================
 CODE_DIM_CB=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
+# 构造码本路径时须与 vqvae-only/codebook_pretrain.py 的命名保持一致：
+#   codebook_ps{P}_cb{C}_cd{D}{_perch}{_rvqN}_model{ID}.pth
+CB_RVQ_SUFFIX=""
+[ "${N_RQ_LAYERS:-1}" -gt 1 ] && CB_RVQ_SUFFIX="_rvq${N_RQ_LAYERS}"
 if [ "${PER_CHANNEL_CODEBOOK}" -eq 1 ]; then
-    CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM_CB}_perch_model${MODEL_ID}.pth"
+    CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM_CB}_perch${CB_RVQ_SUFFIX}_model${MODEL_ID}.pth"
 else
-    CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM_CB}_model${MODEL_ID}.pth"
+    CODEBOOK_CHECKPOINT="../vqvae-only/saved_models/vqvae_only/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM_CB}${CB_RVQ_SUFFIX}_model${MODEL_ID}.pth"
 fi
 # 也可手动覆盖，例如：
 # CODEBOOK_CHECKPOINT="/absolute/path/to/your_codebook.pth"
@@ -165,10 +179,12 @@ PERCH_SUFFIX=""
 [ "${PER_CHANNEL_CODEBOOK}" -eq 1 ] && PERCH_SUFFIX="_perch"
 NMPP_SUFFIX=""
 [ "${USE_RAW_INPUT}" -eq 1 ] && NMPP_SUFFIX="_nmpp"
+RVQ_SUFFIX=""
+[ "${N_RQ_LAYERS:-1}" -gt 1 ] && RVQ_SUFFIX="_rvq${N_RQ_LAYERS}"
 
 # 注意：后缀顺序须与 patch_vqvae_pretrain_common.py 的命名保持一致
-# Python 保存格式：..._step{N}_model{ID}{_perch}{_nmpp}.pth
-MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${NMPP_SUFFIX}"
+# Python 保存格式：..._step{N}_model{ID}{_perch}{_rvqN}{_nmpp}.pth
+MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${NMPP_SUFFIX}"
 
 echo "================================================="
 echo "NTP 预训练 → 微调 流程"
@@ -216,6 +232,7 @@ PRETRAIN_ARGS=(
     --load_vq_weights 1
     --per_channel_codebook "${PER_CHANNEL_CODEBOOK}"
     --use_raw_input "${USE_RAW_INPUT}"
+    --n_rq_layers "${N_RQ_LAYERS:-1}"
     --n_epochs "${PRETRAIN_EPOCHS}"
     --lr "${PRETRAIN_LR}"
     --weight_decay "${WEIGHT_DECAY}"
@@ -225,6 +242,8 @@ PRETRAIN_ARGS=(
     --model_id "${MODEL_ID}"
 )
 [ -n "${TRANSFORMER_HIDDEN_DIM}" ] && PRETRAIN_ARGS+=(--transformer_hidden_dim "${TRANSFORMER_HIDDEN_DIM}")
+# nargs='+' 参数需展开为多个独立值
+[ -n "${RQ_LAYER_WEIGHTS}" ] && PRETRAIN_ARGS+=(--rq_layer_weights ${RQ_LAYER_WEIGHTS})
 
 python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
 
