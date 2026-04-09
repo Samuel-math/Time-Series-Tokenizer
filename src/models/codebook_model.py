@@ -10,7 +10,7 @@ PerChannelCodebookModel — 每个通道拥有独立 VQ（nn.ModuleList self.vqs
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .vqvae import Encoder, Decoder
+from .vqvae import Encoder, Decoder, SparseNet
 from .patch_vqvae_transformer import (
     FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA, ResidualVQ,
 )
@@ -68,7 +68,31 @@ class CodebookModel(nn.Module):
             )
 
         self.vq = ResidualVQ(self.n_rq_layers, _make_single_vq)
-    
+
+        # Robust VQVAE: 稀疏异常分量网络（sparse_weight=0 时不实例化）
+        self.sparse_net: SparseNet | None = None
+        if config.get('sparse_weight', 0) > 0:
+            self.sparse_net = SparseNet(
+                patch_size=self.patch_size,
+                num_hiddens=config['num_hiddens'],
+                amplitude=config.get('sparse_amplitude', 0.5),
+            )
+
+    def _apply_sparse(self, x_c: torch.Tensor):
+        """
+        对单通道 patch 做稀疏分解。
+
+        Args:
+            x_c: [N, 1, patch_size]
+        Returns:
+            x_clean: [N, 1, patch_size]  — 去掉稀疏分量后送 Encoder
+            s:       [N, patch_size] or None
+        """
+        if self.sparse_net is None:
+            return x_c, None
+        s = self.sparse_net(x_c)              # [N, 1, patch_size]
+        return x_c - s, s.squeeze(1)          # x_clean [N,1,P], s [N,P]
+
     def init_codebook_from_data(self, dataloader, device, num_samples=10000, method='kmeans', revin=None):
         """
         从数据初始化码本（数据驱动初始化）
@@ -108,8 +132,10 @@ class CodebookModel(nn.Module):
                     x_c_flat = x_c.reshape(B * num_patches, self.patch_size)
                     x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size]
                     
+                    # Robust: 用 x_clean 送 Encoder
+                    x_c_clean, _ = self._apply_sparse(x_c_flat)
                     # Encoder输出
-                    z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
+                    z = self.encoder(x_c_clean, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
                     z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
                     
                     z_samples_list.append(z_flat)
@@ -130,16 +156,18 @@ class CodebookModel(nn.Module):
         
         self.train()  # 恢复训练模式
     
-    def encode_to_indices(self, x, return_distances=False):
+    def encode_to_indices(self, x, return_distances=False, return_sparse=False):
         """
         Args:
             x: [B, T, C]
             return_distances: 是否返回到码本第 0 层的距离（用于软索引计算）
+            return_sparse: 是否返回稀疏分量 s [B, num_patches*patch_size, C]
         Returns:
             indices: [B, num_patches, C, n_rq_layers]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
-            distances (optional): [B*num_patches*C, codebook_size]
+            distances (optional)
+            s_tensor (optional): [B, num_patches*patch_size, C] or None
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
@@ -147,12 +175,15 @@ class CodebookModel(nn.Module):
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
 
-        z_list = []
+        z_list, s_list = [], []
         for c in range(C):
             x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size).unsqueeze(1)
-            z = self.encoder(x_c, self.compression_factor)
+            x_c_clean, s_c = self._apply_sparse(x_c)
+            z = self.encoder(x_c_clean, self.compression_factor)
             z_flat = z.reshape(B * num_patches, self.code_dim)
             z_list.append(z_flat.reshape(B, num_patches, self.code_dim))
+            if return_sparse and s_c is not None:
+                s_list.append(s_c.reshape(B, num_patches, self.patch_size))
 
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
 
@@ -184,6 +215,18 @@ class CodebookModel(nn.Module):
         indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, n_rq_layers]
         z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C
+
+        # 组装稀疏分量张量
+        if return_sparse:
+            if s_list:
+                s_tensor = torch.stack(s_list, dim=3)   # [B, num_patches, patch_size, C]
+                s_tensor = s_tensor.reshape(B, -1, C)   # [B, num_patches*patch_size, C]
+            else:
+                s_tensor = None
+            if return_distances:
+                distances = torch.cat(distances_list, dim=0)
+                return indices, vq_loss, z_q, distances, s_tensor
+            return indices, vq_loss, z_q, s_tensor
 
         if return_distances:
             distances = torch.cat(distances_list, dim=0)
@@ -285,8 +328,22 @@ class PerChannelCodebookModel(nn.Module):
             ResidualVQ(self.n_rq_layers, _make_single_vq) for _ in range(n_channels)
         ])
 
-    # ------------------------------------------------------------------
-    # 初始化
+        # Robust VQVAE: 稀疏异常分量网络（与共享 Encoder 搭配，所有通道共用一个 SparseNet）
+        self.sparse_net: SparseNet | None = None
+        if config.get('sparse_weight', 0) > 0:
+            self.sparse_net = SparseNet(
+                patch_size=self.patch_size,
+                num_hiddens=config['num_hiddens'],
+                amplitude=config.get('sparse_amplitude', 0.5),
+            )
+
+    def _apply_sparse(self, x_c: torch.Tensor):
+        """见 CodebookModel._apply_sparse。"""
+        if self.sparse_net is None:
+            return x_c, None
+        s = self.sparse_net(x_c)
+        return x_c - s, s.squeeze(1)
+
     # ------------------------------------------------------------------
 
     def init_codebook_from_data(self, dataloader, device, num_samples=10000,
@@ -318,7 +375,8 @@ class PerChannelCodebookModel(nn.Module):
                         continue
                     x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size)
                     x_c = x_c.unsqueeze(1)  # [B*P, 1, patch_size]
-                    z = self.encoder(x_c, self.compression_factor)
+                    x_c_clean, _ = self._apply_sparse(x_c)
+                    z = self.encoder(x_c_clean, self.compression_factor)
                     z_flat = z.reshape(B * num_patches, -1)
                     z_per_channel[c].append(z_flat.cpu())
                     n_collected[c] += z_flat.size(0)
@@ -337,26 +395,31 @@ class PerChannelCodebookModel(nn.Module):
     # 前向接口（与 CodebookModel 完全相同，方便 train_epoch 复用）
     # ------------------------------------------------------------------
 
-    def encode_to_indices(self, x):
+    def encode_to_indices(self, x, return_sparse=False):
         """
         Args:
             x: [B, T, C]
+            return_sparse: 是否返回稀疏分量 s [B, num_patches*patch_size, C]
         Returns:
             indices: [B, num_patches, C, n_rq_layers]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
+            s_tensor (optional): [B, num_patches*patch_size, C] or None
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
 
-        z_list = []
+        z_list, s_list = [], []
         for c in range(C):
             x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size).unsqueeze(1)
-            z = self.encoder(x_c, self.compression_factor)
+            x_c_clean, s_c = self._apply_sparse(x_c)
+            z = self.encoder(x_c_clean, self.compression_factor)
             z_flat = z.reshape(B * num_patches, self.code_dim)
             z_list.append(z_flat.reshape(B, num_patches, self.code_dim))
+            if return_sparse and s_c is not None:
+                s_list.append(s_c.reshape(B, num_patches, self.patch_size))
 
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
 
@@ -373,6 +436,15 @@ class PerChannelCodebookModel(nn.Module):
         indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, n_rq_layers]
         z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C
+
+        if return_sparse:
+            if s_list:
+                s_tensor = torch.stack(s_list, dim=3)  # [B, num_patches, patch_size, C]
+                s_tensor = s_tensor.reshape(B, -1, C)
+            else:
+                s_tensor = None
+            return indices, vq_loss, z_q, s_tensor
+
         return indices, vq_loss, z_q
 
     def decode_from_codes(self, z_q):

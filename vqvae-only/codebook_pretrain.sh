@@ -53,6 +53,14 @@ PER_CHANNEL_CODEBOOK=0  # 0=共享码本, 1=per-channel独立码本
 # 2 = 2层残差 VQ（RQVAE）
 N_RQ_LAYERS=1
 
+# Robust VQVAE: 稀疏分量
+# SPARSE_WEIGHT=0 表示不启用 Robust 分解（标准 VQVAE 行为）
+# 建议初始值: 0.01；调大可让码本更专注干净主体结构，调小则减弱稀疏约束
+SPARSE_WEIGHT=0.0
+# SparseNet 输出 tanh 振幅上界（防止异常分量学走主体结构）
+# 建议范围: 0.2 ~ 1.0（相对归一化后的 patch 值域）
+SPARSE_AMPLITUDE=0.5
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
@@ -85,4 +93,6 @@ python codebook_pretrain.py \
     --save_path $SAVE_PATH \
     --model_id $MODEL_ID \
     --per_channel_codebook $PER_CHANNEL_CODEBOOK \
-    --n_rq_layers $N_RQ_LAYERS
+    --n_rq_layers $N_RQ_LAYERS \
+    --sparse_weight $SPARSE_WEIGHT \
+    --sparse_amplitude $SPARSE_AMPLITUDE

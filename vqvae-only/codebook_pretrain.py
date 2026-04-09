@@ -89,6 +89,12 @@ def parse_args():
     parser.add_argument('--n_rq_layers', type=int, default=1,
                         help='残差向量量化层数（1=普通VQ，2=2层RVQ，以此类推）')
 
+    # Robust VQVAE: 稀疏分量
+    parser.add_argument('--sparse_weight', type=float, default=0.0,
+                        help='稀疏分量 L1 惩罚权重 λ（0=不启用 Robust 分解，建议初始值 0.01）')
+    parser.add_argument('--sparse_amplitude', type=float, default=0.5,
+                        help='SparseNet tanh 振幅上界（限制 s 的最大绝对值，建议 0.3~1.0）')
+
     return parser.parse_args()
 
 
@@ -109,6 +115,8 @@ def get_model_config(args):
         'num_residual_hiddens': args.num_residual_hiddens,
         'use_patch_attention': False,
         'n_rq_layers': int(getattr(args, 'n_rq_layers', 1)),
+        'sparse_weight': float(getattr(args, 'sparse_weight', 0.0)),
+        'sparse_amplitude': float(getattr(args, 'sparse_amplitude', 0.5)),
     }
     return config
 
@@ -198,11 +206,13 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     total_vq_loss = 0
     total_recon_loss = 0
     total_perplexity = 0
+    total_sparse_norm = 0
     n_batches = 0
     
     # 用于累积码本使用统计
     all_indices_list = []
     per_channel = bool(args.per_channel_codebook)
+    use_sparse = getattr(args, 'sparse_weight', 0.0) > 0
     
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
@@ -211,17 +221,30 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             batch_x = revin(batch_x, 'norm')
         
         # 编码和解码（只训练encoder、vq、decoder）
-        indices, vq_loss, z_q = model.encode_to_indices(batch_x)
+        if use_sparse:
+            indices, vq_loss, z_q, s = model.encode_to_indices(batch_x, return_sparse=True)
+        else:
+            indices, vq_loss, z_q = model.encode_to_indices(batch_x)
+            s = None
         x_recon = model.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
+        if s is not None:
+            recon_len = x_recon.shape[1]
+            x_recon = x_recon + s[:, :recon_len, :]  # add sparse component back
         
         # 计算重构损失
         B, T, C = batch_x.shape
         num_patches = indices.shape[1]
         recon_len = num_patches * model.patch_size
         recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
-        
-        # 总损失
-        loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+
+        # 稀疏 L1 惩罚
+        if s is not None:
+            sparse_norm = s.abs().mean()
+            loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss + args.sparse_weight * sparse_norm
+        else:
+            sparse_norm = torch.tensor(0.0)
+            # 总损失
+            loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
         
         # 反向传播（只对可训练参数）
         optimizer.zero_grad()
@@ -256,6 +279,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
         total_perplexity += perplexity
+        total_sparse_norm += sparse_norm.item()
         n_batches += 1
     
     # 计算整个epoch的码本利用率统计
@@ -270,6 +294,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
+        'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
     }
 
@@ -281,11 +306,13 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_vq_loss = 0
     total_recon_loss = 0
     total_perplexity = 0
+    total_sparse_norm = 0
     n_batches = 0
     
     # 用于累积码本使用统计
     all_indices_list = []
     per_channel = bool(args.per_channel_codebook)
+    use_sparse = getattr(args, 'sparse_weight', 0.0) > 0
     
     with torch.no_grad():
         for batch_x, _ in dataloader:
@@ -295,17 +322,29 @@ def validate_epoch(model, dataloader, revin, args, device):
                 batch_x = revin(batch_x, 'norm')
             
             # 编码和解码
-            indices, vq_loss, z_q = model.encode_to_indices(batch_x)
+            if use_sparse:
+                indices, vq_loss, z_q, s = model.encode_to_indices(batch_x, return_sparse=True)
+            else:
+                indices, vq_loss, z_q = model.encode_to_indices(batch_x)
+                s = None
             x_recon = model.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
+            if s is not None:
+                recon_len = x_recon.shape[1]
+                x_recon = x_recon + s[:, :recon_len, :]
             
             # 计算重构损失
             B, T, C = batch_x.shape
             num_patches = indices.shape[1]
             recon_len = num_patches * model.patch_size
             recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
-            
-            # 总损失
-            loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+
+            if s is not None:
+                sparse_norm = s.abs().mean()
+                loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss + args.sparse_weight * sparse_norm
+            else:
+                sparse_norm = torch.tensor(0.0)
+                # 总损失
+                loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
             
             # 计算 perplexity
             if per_channel:
@@ -325,6 +364,7 @@ def validate_epoch(model, dataloader, revin, args, device):
             total_vq_loss += vq_loss.item()
             total_recon_loss += recon_loss.item()
             total_perplexity += perplexity
+            total_sparse_norm += sparse_norm.item()
             n_batches += 1
     
     # 计算整个epoch的码本利用率统计
@@ -339,6 +379,7 @@ def validate_epoch(model, dataloader, revin, args, device):
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
+        'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
         'codebook_stats': codebook_stats,
     }
 
@@ -543,6 +584,11 @@ def main():
               f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
               f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
               f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
+
+        # Robust VQVAE: 打印稀疏分量统计
+        if getattr(args, 'sparse_weight', 0.0) > 0:
+            print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
+                  f"Valid {val_metrics['sparse_norm']:.5f}")
         
         # 定期报告码本利用率（每5个epoch或每10个epoch）
         report_interval = getattr(args, 'codebook_report_interval', 5)

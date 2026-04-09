@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+
+
 from abc import ABC, abstractmethod
 
 
@@ -510,4 +513,40 @@ class vqvae(BaseModel):
             loss, vq_loss, recon_error, data_recon,
             perplexity, embedding_weight, encoding_indices, encodings
         )
+
+
+class SparseNet(nn.Module):
+    """
+    轻量稀疏分量预测网络（Robust VQVAE 输入分解模块）
+
+    输入:  x_patch [N, 1, patch_size]
+    输出:  s       [N, 1, patch_size]  — 稀疏异常分量
+
+    x_clean = x_patch - s  送入 Encoder，
+    重构时: recon = Decoder(z_q) + s
+
+    tanh + amplitude 上界防止网络学走主体结构：
+        s = tanh(f(x_patch)) × amplitude
+    """
+    def __init__(self, patch_size: int, num_hiddens: int, amplitude: float = 0.5):
+        super().__init__()
+        self.amplitude = amplitude
+        hidden = max(1, num_hiddens // 4)
+        self.net = nn.Sequential(
+            nn.Conv1d(1, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, 1, kernel_size=3, padding=1),
+        )
+        # 初始化偏向零，让初始 s ≈ 0（等价于标准 VQVAE 起点）
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [N, 1, patch_size]
+        Returns:
+            s: [N, 1, patch_size]，值域 (-amplitude, amplitude)
+        """
+        return torch.tanh(self.net(x)) * self.amplitude
 
