@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from .vqvae import Encoder, Decoder
+from .vqvae import Encoder, Decoder, TrendExtractor, StochasticVAE
 
 
 class FlattenedVectorQuantizer(nn.Module):
@@ -414,64 +414,95 @@ class PatchVQVAETransformer(nn.Module):
         vq_init_method = config.get('vq_init_method', 'random')
         self.per_channel_codebook = config.get('per_channel_codebook', False)
         self.n_rq_layers = config.get('n_rq_layers', 1)
+        self.use_decomposition = config.get('use_decomposition', False)
         n_channels = config.get('n_channels', None)
         self._n_channels = n_channels
 
-        def _make_single_vq():
+        enc_kw = dict(
+            in_channels=1, num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            embedding_dim=self.embedding_dim,
+            compression_factor=self.compression_factor,
+        )
+        dec_kw = dict(
+            in_channels=self.embedding_dim, num_hiddens=self.num_hiddens,
+            num_residual_layers=self.num_residual_layers,
+            num_residual_hiddens=self.num_residual_hiddens,
+            compression_factor=self.compression_factor, out_channels=1,
+        )
+
+        def _make_single_vq(cb_size=None):
+            sz = cb_size or self.codebook_size
             if self.use_codebook_ema:
                 return FlattenedVectorQuantizerEMA(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    sz, self.code_dim, self.commitment_cost,
                     decay=self.ema_decay, eps=self.ema_eps,
                     init_method=vq_init_method
                 )
             return FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost,
+                sz, self.code_dim, self.commitment_cost,
                 init_method=vq_init_method
             )
 
-        def _make_rvq():
-            return ResidualVQ(self.n_rq_layers, _make_single_vq)
+        if self.use_decomposition:
+            # ── TSO 分解模式 ──────────────────────────────────────
+            self.codebook_size_trend = config.get('codebook_size_trend', self.codebook_size)
+            self.codebook_size_osc = config.get('codebook_size_osc', self.codebook_size)
 
-        if self.per_channel_codebook:
-            if n_channels is None:
-                raise ValueError("per_channel_codebook=True 需要在 config 中提供 n_channels")
-            self.vqs = nn.ModuleList([_make_rvq() for _ in range(n_channels)])
+            self.trend_extractor = TrendExtractor(config.get('trend_kernel_size', 5))
+            self.trend_encoder = Encoder(**enc_kw)
+            self.trend_decoder = Decoder(**dec_kw)
+            self.trend_vq = ResidualVQ(self.n_rq_layers,
+                                       lambda: _make_single_vq(self.codebook_size_trend))
+            self.stochastic_vae = StochasticVAE(
+                self.patch_size,
+                latent_dim=config.get('stochastic_latent_dim', 4),
+                num_hiddens=self.num_hiddens,
+            )
+            self.osc_encoder = Encoder(**enc_kw)
+            self.osc_decoder = Decoder(**dec_kw)
+            self.osc_vq = ResidualVQ(self.n_rq_layers,
+                                     lambda: _make_single_vq(self.codebook_size_osc))
+
+            self.trend_heads = nn.ModuleList([
+                nn.Linear(self.code_dim, self.codebook_size_trend)
+                for _ in range(self.n_rq_layers)
+            ])
+            self.osc_heads = nn.ModuleList([
+                nn.Linear(self.code_dim, self.codebook_size_osc)
+                for _ in range(self.n_rq_layers)
+            ])
+
+            # 可学习加权：softmax([logit_trend, logit_osc]) → [w_t, w_o]
+            # 初始化为 [0, 0] → softmax → [0.5, 0.5]（等权）
+            self.tso_fusion_logits = nn.Parameter(torch.zeros(2))
         else:
-            self.vq = _make_rvq()
+            # ── 标准模式 ──────────────────────────────────────────
+            def _make_rvq():
+                return ResidualVQ(self.n_rq_layers, _make_single_vq)
 
-        # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
+            if self.per_channel_codebook:
+                if n_channels is None:
+                    raise ValueError("per_channel_codebook=True 需要在 config 中提供 n_channels")
+                self.vqs = nn.ModuleList([_make_rvq() for _ in range(n_channels)])
+            else:
+                self.vq = _make_rvq()
+
+            self.output_heads = nn.ModuleList([
+                nn.Linear(self.code_dim, self.codebook_size)
+                for _ in range(self.n_rq_layers)
+            ])
+
+            self.encoder = Encoder(**enc_kw)
+            self.decoder = Decoder(**dec_kw)
+
+        # Transformer（两种模式共享）
         self.transformer = CausalTransformer(
             self.code_dim, self.n_heads, self.n_layers,
             self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
         )
-
-        # 每层 RVQ 独立一个预测头；n_rq_layers=1 时等价于原来的 output_head
-        self.output_heads = nn.ModuleList([
-            nn.Linear(self.code_dim, self.codebook_size) for _ in range(self.n_rq_layers)
-        ])
-
-        # NMPP 模式 (use_raw_input=True): 将原始 patch 投影到 Transformer 输入维度
         self.patch_embedding = nn.Linear(self.patch_size, self.code_dim)
-
-        # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
-        self.encoder = Encoder(
-            in_channels=1,  # 单通道输入
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            embedding_dim=self.embedding_dim,
-            compression_factor=self.compression_factor
-        )
-        self.decoder = Decoder(
-            in_channels=self.embedding_dim,
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            compression_factor=self.compression_factor,
-            out_channels=1  # 单通道输出
-        )
-        
-        # Channel Attention 已移除
     
     def _get_vq(self, c: int):
         """返回通道 c 对应的 VQ 模块（per_channel_codebook=True 时每通道独立，否则共享）"""
@@ -581,7 +612,207 @@ class PatchVQVAETransformer(nn.Module):
         x_recon = x_recon_reshaped.permute(0, 2, 3, 1).reshape(B, -1, C)
         
         return x_recon
-    
+
+    # ==================================================================
+    # TSO 分解模式
+    # ==================================================================
+
+    def _encode_decomposed(self, x):
+        """
+        TSO 分解编码：trend + stochastic + oscillatory。
+
+        Returns:
+            trend_indices: [B, P, C, n_rq_layers]
+            osc_indices:   [B, P, C, n_rq_layers]
+            vq_loss:       scalar (trend + osc 平均)
+            z_q_combined:  [B*C, P, code_dim]  (trend + osc，已 reshape 为 Transformer 输入)
+        """
+        B, T, C = x.shape
+        P = T // self.patch_size
+        x = x[:, :P * self.patch_size, :]
+        x_patches = x.reshape(B, P, self.patch_size, C)
+
+        t_idx_l, o_idx_l, zqt_l, zqo_l = [], [], [], []
+        t_vq = o_vq = x.new_tensor(0.0)
+
+        for c in range(C):
+            xc = x_patches[:, :, :, c].reshape(B * P, self.patch_size).unsqueeze(1)
+
+            x_trend = self.trend_extractor(xc)
+            r = xc - x_trend
+
+            # Trend VQ
+            zt = self.trend_encoder(x_trend, self.compression_factor)
+            zt_flat = zt.reshape(B * P, self.code_dim)
+            tvl, zqt, tidx = self.trend_vq(zt_flat)
+            t_vq = t_vq + tvl
+
+            # Stochastic (no VQ, just produce s_hat for subtraction)
+            s_hat, _, _ = self.stochastic_vae(r)
+            o = r - s_hat.detach()
+
+            # Oscillatory VQ
+            zo = self.osc_encoder(o, self.compression_factor)
+            zo_flat = zo.reshape(B * P, self.code_dim)
+            ovl, zqo, oidx = self.osc_vq(zo_flat)
+            o_vq = o_vq + ovl
+
+            t_idx_l.append(torch.stack(tidx, dim=1).reshape(B, P, self.n_rq_layers))
+            o_idx_l.append(torch.stack(oidx, dim=1).reshape(B, P, self.n_rq_layers))
+            zqt_l.append(zqt.reshape(B, P, self.code_dim))
+            zqo_l.append(zqo.reshape(B, P, self.code_dim))
+
+        trend_indices = torch.stack(t_idx_l, dim=2)   # [B, P, C, n_rq]
+        osc_indices = torch.stack(o_idx_l, dim=2)
+        z_q_trend = torch.stack(zqt_l, dim=2)          # [B, P, C, code_dim]
+        z_q_osc = torch.stack(zqo_l, dim=2)
+
+        w = F.softmax(self.tso_fusion_logits, dim=0)      # [2]
+        z_q_fused = w[0] * z_q_trend + w[1] * z_q_osc   # [B, P, C, code_dim]
+        seq = z_q_fused.permute(0, 2, 1, 3).reshape(B * C, P, self.code_dim)
+
+        vq_loss = (t_vq + o_vq) / C
+        return trend_indices, osc_indices, vq_loss, seq
+
+    def forward_progressive_pretrain_decomposed(
+        self, x_full, step_size, max_stages=None
+    ):
+        """
+        TSO 分解模式的渐进式 NTP 预训练。
+
+        Returns:
+            all_trend_logits:  List[stage] of List[rq_layer] of [B, step, C, K_t]
+            all_trend_targets: List[stage] of List[rq_layer] of [B, step, C]
+            all_osc_logits:    同上 (K_o)
+            all_osc_targets:   同上
+            vq_loss:           scalar
+        """
+        B, total_len, C = x_full.shape
+        P = total_len // self.patch_size
+        x_full = x_full[:, :P * self.patch_size, :]
+
+        with torch.no_grad():
+            trend_idx, osc_idx, vq_loss, seq_full = self._encode_decomposed(x_full)
+
+        if max_stages is None:
+            max_stages = (P - step_size) // step_size
+        else:
+            max_stages = min(max_stages, (P - step_size) // step_size)
+        if max_stages <= 0:
+            raise ValueError(f"序列不足: P={P}, step={step_size}")
+
+        all_tl, all_tt, all_ol, all_ot = [], [], [], []
+
+        for stage in range(1, max_stages + 1):
+            ctx = stage * step_size
+            tgt_s = (stage - 1) * step_size
+            tgt_e = stage * step_size
+            if tgt_e > P:
+                break
+
+            ph = torch.zeros(B * C, step_size, self.code_dim,
+                             device=seq_full.device, dtype=seq_full.dtype)
+            inp = torch.cat([seq_full[:, :ctx, :], ph], dim=1)
+            h = self.transformer(inp)
+            h_tgt = h[:, ctx:ctx + step_size, :]
+
+            # Trend heads
+            tl_layers, tt_layers = [], []
+            for l, head in enumerate(self.trend_heads):
+                logits = head(h_tgt).reshape(B, C, step_size, -1).permute(0, 2, 1, 3)
+                tl_layers.append(logits)
+                tt_layers.append(trend_idx[:, tgt_s:tgt_e, :, l])
+
+            # Osc heads
+            ol_layers, ot_layers = [], []
+            for l, head in enumerate(self.osc_heads):
+                logits = head(h_tgt).reshape(B, C, step_size, -1).permute(0, 2, 1, 3)
+                ol_layers.append(logits)
+                ot_layers.append(osc_idx[:, tgt_s:tgt_e, :, l])
+
+            all_tl.append(tl_layers); all_tt.append(tt_layers)
+            all_ol.append(ol_layers); all_ot.append(ot_layers)
+
+        return all_tl, all_tt, all_ol, all_ot, vq_loss
+
+    def forward_finetune_decomposed(self, x, target_len, step_size=None):
+        """
+        TSO 分解模式的微调前向：预测 trend + osc tokens，采样 stochastic，解码合成。
+        """
+        B, T, C = x.shape
+        num_pred = (target_len + self.patch_size - 1) // self.patch_size
+        num_input = T // self.patch_size
+        x_aligned = x[:, :num_input * self.patch_size, :]
+
+        with torch.no_grad():
+            _, _, vq_loss, ctx_flat = self._encode_decomposed(x_aligned)
+
+        code_dim = self.code_dim
+        trend_cb = self.trend_vq.layers[0].embedding.weight
+        osc_cb = self.osc_vq.layers[0].embedding.weight
+
+        if step_size is None or step_size >= num_pred:
+            ph = torch.zeros(B * C, num_pred, code_dim,
+                             device=ctx_flat.device, dtype=ctx_flat.dtype)
+            full = torch.cat([ctx_flat, ph], dim=1)
+            h = self.transformer(full)[:, num_input:, :]
+
+            t_w = F.softmax(self.trend_heads[0](h), dim=-1)
+            o_w = F.softmax(self.osc_heads[0](h), dim=-1)
+            if self.use_gumbel_softmax and self.training:
+                t_w = F.gumbel_softmax(self.trend_heads[0](h), tau=self.gumbel_temperature, hard=self.gumbel_hard)
+                o_w = F.gumbel_softmax(self.osc_heads[0](h), tau=self.gumbel_temperature, hard=self.gumbel_hard)
+
+            pred_trend = torch.matmul(t_w, trend_cb)  # [B*C, num_pred, cd]
+            pred_osc = torch.matmul(o_w, osc_cb)
+        else:
+            cur = ctx_flat
+            trend_parts, osc_parts = [], []
+            rem = num_pred
+            for _ in range((num_pred + step_size - 1) // step_size):
+                pp = min(step_size, rem)
+                ph = torch.zeros(B * C, pp, code_dim, device=cur.device, dtype=cur.dtype)
+                full = torch.cat([cur, ph], dim=1)
+                h = self.transformer(full)[:, cur.shape[1]:, :]
+                t_w = F.softmax(self.trend_heads[0](h), dim=-1)
+                o_w = F.softmax(self.osc_heads[0](h), dim=-1)
+                tc = torch.matmul(t_w, trend_cb)
+                oc = torch.matmul(o_w, osc_cb)
+                trend_parts.append(tc); osc_parts.append(oc)
+                fw = F.softmax(self.tso_fusion_logits, dim=0)
+                cur = torch.cat([cur, fw[0] * tc + fw[1] * oc], dim=1)
+                rem -= pp
+            pred_trend = torch.cat(trend_parts, dim=1)
+            pred_osc = torch.cat(osc_parts, dim=1)
+
+        # Decode trend
+        pt = pred_trend.reshape(B, C, num_pred, code_dim).permute(0, 2, 1, 3)
+        po = pred_osc.reshape(B, C, num_pred, code_dim).permute(0, 2, 1, 3)
+
+        def _dec_batch(decoder, z_q_4d):
+            B2, P2, C2, _ = z_q_4d.shape
+            zf = z_q_4d.permute(0, 2, 1, 3).reshape(B2 * C2 * P2,
+                                                      self.embedding_dim, self.compressed_len)
+            out = decoder(zf, self.compression_factor)
+            return out.reshape(B2, C2, P2, self.patch_size).permute(0, 2, 3, 1).reshape(B2, -1, C2)
+
+        trend_recon = _dec_batch(self.trend_decoder, pt)
+        osc_recon = _dec_batch(self.osc_decoder, po)
+
+        # Sample stochastic from prior
+        z_s = torch.randn(B * num_pred * C, self.stochastic_vae.latent_dim,
+                          device=x.device)
+        s_recon = (
+            self.stochastic_vae.decode(z_s).squeeze(1)
+            .reshape(B, num_pred, C, self.patch_size)
+            .permute(0, 1, 3, 2).reshape(B, -1, C)
+        )
+
+        pred = (trend_recon + osc_recon + s_recon)[:, :target_len, :]
+        return pred, vq_loss
+
+    # ==================================================================
+
     def forward_progressive_pretrain(self, x_full, step_size, max_stages=None,
                                       compute_recon_loss=True, use_raw_input=False):
         """
@@ -868,51 +1099,60 @@ class PatchVQVAETransformer(nn.Module):
                 
                 return False
             
-            # 加载encoder、decoder、VQ
-            # 注意：TFCPatchVQVAE使用time_encoder，需要兼容两种前缀
-            if try_load_module(self.encoder, 'Encoder', 'encoder_state_dict', 'encoder'):
-                loaded_components.append('Encoder')
-            elif try_load_module(self.encoder, 'Encoder', None, 'time_encoder'):
-                # 兼容TFCPatchVQVAE的time_encoder
-                loaded_components.append('Encoder')
-            
-            if try_load_module(self.decoder, 'Decoder', 'decoder_state_dict', 'decoder'):
-                loaded_components.append('Decoder')
-            
-            if load_vq:
-                if self.per_channel_codebook:
-                    # 尝试加载 per-channel RVQ（格式：vqs.{c}.）
-                    any_vq_loaded = False
-                    for c, rvq_mod in enumerate(self.vqs):
-                        per_ch_prefix = f'vqs.{c}'
-                        if try_load_module(rvq_mod, f'VQ[{c}]', None, per_ch_prefix):
-                            any_vq_loaded = True
+            if self.use_decomposition:
+                # ── TSO 分解模式：加载全部 model_state_dict ────────
+                for name_attr, prefix in [
+                    ('trend_extractor', 'trend_extractor'),
+                    ('trend_encoder', 'trend_encoder'),
+                    ('trend_decoder', 'trend_decoder'),
+                    ('trend_vq', 'trend_vq'),
+                    ('stochastic_vae', 'stochastic_vae'),
+                    ('osc_encoder', 'osc_encoder'),
+                    ('osc_decoder', 'osc_decoder'),
+                    ('osc_vq', 'osc_vq'),
+                ]:
+                    mod = getattr(self, name_attr)
+                    if try_load_module(mod, name_attr, None, prefix):
+                        loaded_components.append(name_attr)
+            else:
+                # ── 标准模式 ──────────────────────────────────────
+                if try_load_module(self.encoder, 'Encoder', 'encoder_state_dict', 'encoder'):
+                    loaded_components.append('Encoder')
+                elif try_load_module(self.encoder, 'Encoder', None, 'time_encoder'):
+                    loaded_components.append('Encoder')
 
-                    if not any_vq_loaded:
-                        # 回退：从共享 VQ checkpoint 初始化所有通道码本
-                        shared_loaded = False
-                        for rvq_mod in self.vqs:
-                            if try_load_module(rvq_mod, 'VQ', 'vq_state_dict', 'vq'):
-                                shared_loaded = True
-                        if shared_loaded:
+                if try_load_module(self.decoder, 'Decoder', 'decoder_state_dict', 'decoder'):
+                    loaded_components.append('Decoder')
+
+                if load_vq:
+                    if self.per_channel_codebook:
+                        any_vq_loaded = False
+                        for c, rvq_mod in enumerate(self.vqs):
+                            if try_load_module(rvq_mod, f'VQ[{c}]', None, f'vqs.{c}'):
+                                any_vq_loaded = True
+                        if not any_vq_loaded:
+                            shared_loaded = False
+                            for rvq_mod in self.vqs:
+                                if try_load_module(rvq_mod, 'VQ', 'vq_state_dict', 'vq'):
+                                    shared_loaded = True
+                            if shared_loaded:
+                                loaded_components.append('VQ')
+                        else:
                             loaded_components.append('VQ')
                     else:
-                        loaded_components.append('VQ')
-                else:
-                    if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
-                        loaded_components.append('VQ')
-                    elif state_dict is not None:
-                        # 尝试直接加载 layers.0.embedding 权重（兼容旧单层格式）
-                        for key in state_dict.keys():
-                            if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
-                                target = self.vq.layers[0]
-                                if hasattr(target, 'embedding'):
-                                    try:
-                                        target.embedding.weight.data.copy_(state_dict[key])
-                                        loaded_components.append('VQ')
-                                        break
-                                    except Exception:
-                                        continue
+                        if try_load_module(self.vq, 'VQ', 'vq_state_dict', 'vq'):
+                            loaded_components.append('VQ')
+                        elif state_dict is not None:
+                            for key in state_dict.keys():
+                                if 'vq' in key.lower() and 'embedding' in key.lower() and 'weight' in key.lower():
+                                    target = self.vq.layers[0]
+                                    if hasattr(target, 'embedding'):
+                                        try:
+                                            target.embedding.weight.data.copy_(state_dict[key])
+                                            loaded_components.append('VQ')
+                                            break
+                                        except Exception:
+                                            continue
             
             if loaded_components:
                 print(f"成功加载: {', '.join(loaded_components)}")
@@ -931,26 +1171,42 @@ class PatchVQVAETransformer(nn.Module):
     
     def freeze_vqvae(self, components=None):
         """
-        冻结VQVAE组件（encoder、decoder、VQ）
-        
-        Args:
-            components: 要冻结的组件列表，如 ['Encoder', 'Decoder', 'VQ']。
-                       如果为None，则冻结所有VQVAE组件
+        冻结VQVAE组件。
+        分解模式下冻结全部 trend/stochastic/osc 路径；标准模式冻结 encoder/decoder/VQ。
         """
+        if self.use_decomposition:
+            frozen = []
+            for name_attr in ['trend_extractor', 'trend_encoder', 'trend_decoder',
+                              'trend_vq', 'stochastic_vae',
+                              'osc_encoder', 'osc_decoder', 'osc_vq']:
+                mod = getattr(self, name_attr, None)
+                if mod is None:
+                    continue
+                for p in mod.parameters():
+                    p.requires_grad = False
+                if 'vq' in name_attr:
+                    for sv in mod.layers:
+                        if isinstance(sv, FlattenedVectorQuantizerEMA):
+                            sv._disable_ema_update = True
+                frozen.append(name_attr)
+            if frozen:
+                print(f"✓ 已冻结: {', '.join(frozen)}")
+            return frozen
+
         if components is None:
             components = ['Encoder', 'Decoder', 'VQ']
-        
+
         frozen = []
         if 'Encoder' in components:
             for param in self.encoder.parameters():
                 param.requires_grad = False
             frozen.append('Encoder')
-        
+
         if 'Decoder' in components:
             for param in self.decoder.parameters():
                 param.requires_grad = False
             frozen.append('Decoder')
-        
+
         if 'VQ' in components:
             vq_modules = list(self.vqs) if self.per_channel_codebook else [self.vq]
             for rvq_mod in vq_modules:
@@ -960,34 +1216,46 @@ class PatchVQVAETransformer(nn.Module):
                     if isinstance(single_vq, FlattenedVectorQuantizerEMA):
                         single_vq._disable_ema_update = True
             frozen.append('VQ')
-        
+
         if frozen:
             print(f"✓ 已冻结: {', '.join(frozen)}")
-        
         return frozen
     
     def unfreeze_vqvae(self, components=None):
-        """
-        解冻VQVAE组件（encoder、decoder、VQ）
-        
-        Args:
-            components: 要解冻的组件列表，如 ['Encoder', 'Decoder', 'VQ']。
-                       如果为None，则解冻所有VQVAE组件
-        """
+        """解冻VQVAE组件。"""
+        if self.use_decomposition:
+            unfrozen = []
+            for name_attr in ['trend_extractor', 'trend_encoder', 'trend_decoder',
+                              'trend_vq', 'stochastic_vae',
+                              'osc_encoder', 'osc_decoder', 'osc_vq']:
+                mod = getattr(self, name_attr, None)
+                if mod is None:
+                    continue
+                for p in mod.parameters():
+                    p.requires_grad = True
+                if 'vq' in name_attr:
+                    for sv in mod.layers:
+                        if isinstance(sv, FlattenedVectorQuantizerEMA):
+                            sv._disable_ema_update = False
+                unfrozen.append(name_attr)
+            if unfrozen:
+                print(f"✓ 已解冻: {', '.join(unfrozen)}")
+            return unfrozen
+
         if components is None:
             components = ['Encoder', 'Decoder', 'VQ']
-        
+
         unfrozen = []
         if 'Encoder' in components:
             for param in self.encoder.parameters():
                 param.requires_grad = True
             unfrozen.append('Encoder')
-        
+
         if 'Decoder' in components:
             for param in self.decoder.parameters():
                 param.requires_grad = True
             unfrozen.append('Decoder')
-        
+
         if 'VQ' in components:
             vq_modules = list(self.vqs) if self.per_channel_codebook else [self.vq]
             for rvq_mod in vq_modules:
@@ -997,10 +1265,9 @@ class PatchVQVAETransformer(nn.Module):
                     if isinstance(single_vq, FlattenedVectorQuantizerEMA):
                         single_vq._disable_ema_update = False
             unfrozen.append('VQ')
-        
+
         if unfrozen:
             print(f"✓ 已解冻: {', '.join(unfrozen)}")
-        
         return unfrozen
 
 

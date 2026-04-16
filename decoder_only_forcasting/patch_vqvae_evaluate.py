@@ -126,7 +126,7 @@ def main():
     print('✓ 模型加载成功')
     
     # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    revin = RevIN(dls.vars, eps=1e-5, affine=True).to(device) if args.revin else None
     if revin:
         print('✓ RevIN已启用')
     

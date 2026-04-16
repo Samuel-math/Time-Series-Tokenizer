@@ -22,7 +22,7 @@ import random
 
 # 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.models.codebook_model import CodebookModel, PerChannelCodebookModel
+from src.models.codebook_model import CodebookModel, DecomposedCodebookModel
 from src.models.layers.revin import RevIN
 from src.basics import set_device
 from datautils import get_dls
@@ -95,6 +95,26 @@ def parse_args():
     parser.add_argument('--sparse_amplitude', type=float, default=0.5,
                         help='SparseNet tanh 振幅上界（限制 s 的最大绝对值，建议 0.3~1.0）')
 
+    # Trend–Stochastic–Oscillatory 分解
+    parser.add_argument('--use_decomposition', type=int, default=0,
+                        help='启用 TSO 三分量分解模式（1=启用）')
+    parser.add_argument('--codebook_size_trend', type=int, default=0,
+                        help='趋势码本大小（0=与 codebook_size 相同）')
+    parser.add_argument('--codebook_size_osc', type=int, default=0,
+                        help='振荡码本大小（0=与 codebook_size 相同）')
+    parser.add_argument('--stochastic_latent_dim', type=int, default=4,
+                        help='随机分量 VAE 隐变量维度')
+    parser.add_argument('--trend_kernel_size', type=int, default=5,
+                        help='趋势提取低通滤波器核大小')
+    parser.add_argument('--lambda_kl', type=float, default=0.01,
+                        help='KL 散度损失权重')
+    parser.add_argument('--lambda_shape', type=float, default=0.1,
+                        help='形状正则损失权重（L1+L2 混合）')
+    parser.add_argument('--lambda_vq', type=float, default=1.0,
+                        help='VQ commitment 损失权重（分解模式下）')
+    parser.add_argument('--shape_alpha', type=float, default=0.5,
+                        help='shape loss 中 L1 的占比（0~1）')
+
     return parser.parse_args()
 
 
@@ -117,6 +137,12 @@ def get_model_config(args):
         'n_rq_layers': int(getattr(args, 'n_rq_layers', 1)),
         'sparse_weight': float(getattr(args, 'sparse_weight', 0.0)),
         'sparse_amplitude': float(getattr(args, 'sparse_amplitude', 0.5)),
+        # TSO 分解
+        'codebook_size_trend': args.codebook_size_trend if args.codebook_size_trend > 0 else args.codebook_size,
+        'codebook_size_osc': args.codebook_size_osc if args.codebook_size_osc > 0 else args.codebook_size,
+        'stochastic_latent_dim': int(getattr(args, 'stochastic_latent_dim', 4)),
+        'trend_kernel_size': int(getattr(args, 'trend_kernel_size', 5)),
+        'shape_alpha': float(getattr(args, 'shape_alpha', 0.5)),
     }
     return config
 
@@ -384,6 +410,86 @@ def validate_epoch(model, dataloader, revin, args, device):
     }
 
 
+# =====================================================================
+# TSO 分解模式的训练 / 验证
+# =====================================================================
+
+def _run_decomposed(model, batch_x, args, training=True):
+    """DecomposedCodebookModel 的单 batch 前向 + 损失计算。"""
+    result = model.forward(batch_x)
+    vq_loss = result['trend_vq_loss'] + result['osc_vq_loss']
+    loss = (result['trend_recon_loss']
+            + result['recon_loss']
+            + args.lambda_kl * result['kl_loss']
+            + args.lambda_shape * result['shape_loss']
+            + args.lambda_vq * vq_loss)
+    return loss, result
+
+
+def train_epoch_decomposed(model, dataloader, optimizer, revin, args, device, scaler):
+    model.train()
+    sums = dict(loss=0., vq=0., rec=0., trec=0., kl=0., shape=0.)
+    t_idx_all, o_idx_all = [], []
+    n = 0
+    for batch_x, _ in dataloader:
+        batch_x = batch_x.to(device)
+        if revin:
+            batch_x = revin(batch_x, 'norm')
+        loss, res = _run_decomposed(model, batch_x, args, training=True)
+        optimizer.zero_grad()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
+            optimizer.step()
+        sums['loss'] += loss.item(); sums['vq'] += (res['trend_vq_loss'] + res['osc_vq_loss']).item()
+        sums['rec'] += res['recon_loss'].item(); sums['trec'] += res['trend_recon_loss'].item()
+        sums['kl'] += res['kl_loss'].item(); sums['shape'] += res['shape_loss'].item()
+        t_idx_all.append(res['trend_indices'].detach().cpu())
+        o_idx_all.append(res['osc_indices'].detach().cpu())
+        n += 1
+    cb_t = model.codebook_size_trend
+    cb_o = model.codebook_size_osc
+    return {k: v / max(n, 1) for k, v in sums.items()} | {
+        'trend_cb_stats': compute_codebook_usage_stats(torch.cat(t_idx_all, 0), cb_t),
+        'osc_cb_stats': compute_codebook_usage_stats(torch.cat(o_idx_all, 0), cb_o),
+    }
+
+
+def validate_epoch_decomposed(model, dataloader, revin, args, device):
+    model.eval()
+    sums = dict(loss=0., vq=0., rec=0., trec=0., kl=0., shape=0.)
+    t_idx_all, o_idx_all = [], []
+    n = 0
+    with torch.no_grad():
+        for batch_x, _ in dataloader:
+            batch_x = batch_x.to(device)
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+            loss, res = _run_decomposed(model, batch_x, args, training=False)
+            sums['loss'] += loss.item(); sums['vq'] += (res['trend_vq_loss'] + res['osc_vq_loss']).item()
+            sums['rec'] += res['recon_loss'].item(); sums['trec'] += res['trend_recon_loss'].item()
+            sums['kl'] += res['kl_loss'].item(); sums['shape'] += res['shape_loss'].item()
+            t_idx_all.append(res['trend_indices'].cpu())
+            o_idx_all.append(res['osc_indices'].cpu())
+            n += 1
+    cb_t = model.codebook_size_trend
+    cb_o = model.codebook_size_osc
+    return {k: v / max(n, 1) for k, v in sums.items()} | {
+        'trend_cb_stats': compute_codebook_usage_stats(torch.cat(t_idx_all, 0), cb_t),
+        'osc_cb_stats': compute_codebook_usage_stats(torch.cat(o_idx_all, 0), cb_o),
+    }
+
+
+# =====================================================================
+
 def set_seed(seed):
     """
     设置随机数种子以确保训练可复现性
@@ -444,10 +550,12 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
     
     # 模型文件名
+    use_decomp = bool(getattr(args, 'use_decomposition', 0))
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
     per_ch_suffix = '_perch' if args.per_channel_codebook else ''
     rvq_suffix = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}_model{args.model_id}'
+    tso_suffix = '_tso' if use_decomp else ''
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}{tso_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -495,9 +603,12 @@ def main():
     
     # 创建轻量级码本模型（只包含encoder、vq、decoder）
     config = get_model_config(args)
-    if args.per_channel_codebook:
-        model = PerChannelCodebookModel(config, dls.vars).to(device)
-        print(f'\n模式: Per-Channel 码本（每通道独立 VQ，共 {dls.vars} 个码本）')
+    if use_decomp:
+        model = DecomposedCodebookModel(config, dls.vars).to(device)
+        print(f'\n模式: TSO 分解码本（Trend CB={model.codebook_size_trend}, '
+              f'Osc CB={model.codebook_size_osc}, StochDim={config["stochastic_latent_dim"]}）')
+    elif args.per_channel_codebook:
+        raise ValueError("Per-channel 码本已弃用，请使用共享码本 (--per_channel_codebook 0)")
     else:
         model = CodebookModel(config, dls.vars).to(device)
         print(f'\n模式: 共享码本（所有通道使用同一 VQ）')
@@ -506,27 +617,11 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
-    
-    # 检查各层的可训练参数
-    encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-    encoder_total = sum(p.numel() for p in model.encoder.parameters())
-    decoder_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
-    decoder_total = sum(p.numel() for p in model.decoder.parameters())
-    
-    if args.per_channel_codebook:
-        vq_trainable = sum(p.numel() for vq in model.vqs for p in vq.parameters() if p.requires_grad)
-        vq_total = sum(p.numel() for vq in model.vqs for p in vq.parameters())
-    else:
-        vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
-        vq_total = sum(p.numel() for p in model.vq.parameters())
-    
+
     print(f'\n码本模型参数统计:')
     print(f'  总参数: {total_params:,}')
     print(f'  可训练参数: {trainable_params:,}')
     print(f'  冻结参数: {frozen_params:,}')
-    print(f'  Encoder: {encoder_total:,} (可训练: {encoder_trainable:,})')
-    print(f'  Decoder: {decoder_total:,} (可训练: {decoder_trainable:,})')
-    print(f'  VQ层: {vq_total:,} (可训练: {vq_trainable:,})')
     print(f'  码本初始化方法: {args.vq_init_method}')
     print(f'  使用EMA: {bool(args.codebook_ema)}')
     
@@ -563,107 +658,89 @@ def main():
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
-        # 训练
-        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
-        scheduler.step()
-        
-        # 验证
-        val_metrics = validate_epoch(model, dls.valid, revin, args, device)
-        
-        train_losses.append(train_metrics['loss'])
-        valid_losses.append(val_metrics['loss'])
-        train_recon_losses.append(train_metrics['recon_loss'])
-        valid_recon_losses.append(val_metrics['recon_loss'])
-        
-        # 打印进度
-        train_stats = train_metrics.get('codebook_stats', {})
-        val_stats = val_metrics.get('codebook_stats', {})
-        
-        print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
-              f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
-              f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
-              f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
+        if use_decomp:
+            # ── TSO 分解模式 ──────────────────────────────────────────
+            train_metrics = train_epoch_decomposed(model, dls.train, optimizer, revin, args, device, scaler)
+            scheduler.step()
+            val_metrics = validate_epoch_decomposed(model, dls.valid, revin, args, device)
 
-        # Robust VQVAE: 打印稀疏分量统计
-        if getattr(args, 'sparse_weight', 0.0) > 0:
-            print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
-                  f"Valid {val_metrics['sparse_norm']:.5f}")
-        
-        # 定期报告码本利用率（每5个epoch或每10个epoch）
-        report_interval = getattr(args, 'codebook_report_interval', 5)
-        if (epoch + 1) % report_interval == 0 or epoch == 0:
-            train_usage = train_stats.get('usage_rate', 0.0) * 100
-            val_usage = val_stats.get('usage_rate', 0.0) * 100
-            train_used = train_stats.get('num_used', 0)
-            val_used = val_stats.get('num_used', 0)
-            train_unused = train_stats.get('num_unused', 0)
-            val_unused = val_stats.get('num_unused', 0)
-            
-            print(f"  └─ 码本利用率(avg): Train {train_usage:.1f}% ({train_used:.0f}/{args.codebook_size}) | "
-                  f"Valid {val_usage:.1f}% ({val_used:.0f}/{args.codebook_size})")
+            train_losses.append(train_metrics['loss'])
+            valid_losses.append(val_metrics['loss'])
+            train_recon_losses.append(train_metrics['rec'])
+            valid_recon_losses.append(val_metrics['rec'])
 
-            # 多层 RVQ 时打印每层独立利用率
-            per_layer = train_stats.get('per_layer_usage', [])
-            if len(per_layer) > 1:
-                print(f"  └─ 各层利用率 (Train): {', '.join(per_layer)}")
+            print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
+                  f"Train Loss:{train_metrics['loss']:.4f} "
+                  f"(TRec:{train_metrics['trec']:.4f} Rec:{train_metrics['rec']:.4f} "
+                  f"VQ:{train_metrics['vq']:.4f} KL:{train_metrics['kl']:.4f} "
+                  f"Shape:{train_metrics['shape']:.4f}) | "
+                  f"Val Loss:{val_metrics['loss']:.4f}")
 
-            if args.per_channel_codebook:
-                per_ch_train = train_stats.get('per_channel_usage', [])
-                per_ch_val   = val_stats.get('per_channel_usage', [])
-                if per_ch_train:
-                    ch_strs = [f"ch{c}:{u*100:.0f}%" for c, u in enumerate(per_ch_train)]
-                    print(f"  └─ 各通道利用率 (Train): {', '.join(ch_strs)}")
-            else:
-                # 显示最常用的码本元素（仅训练集）
+            report_interval = getattr(args, 'codebook_report_interval', 5)
+            if (epoch + 1) % report_interval == 0 or epoch == 0:
+                t_st = train_metrics['trend_cb_stats']
+                o_st = train_metrics['osc_cb_stats']
+                print(f"  └─ Trend CB: {t_st['usage_rate']*100:.1f}%  "
+                      f"Osc CB: {o_st['usage_rate']*100:.1f}%  "
+                      f"({', '.join(t_st.get('per_layer_usage', []))} | "
+                      f"{', '.join(o_st.get('per_layer_usage', []))})")
+        else:
+            # ── 标准模式 ─────────────────────────────────────────────
+            train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
+            scheduler.step()
+            val_metrics = validate_epoch(model, dls.valid, revin, args, device)
+
+            train_losses.append(train_metrics['loss'])
+            valid_losses.append(val_metrics['loss'])
+            train_recon_losses.append(train_metrics['recon_loss'])
+            valid_recon_losses.append(val_metrics['recon_loss'])
+
+            train_stats = train_metrics.get('codebook_stats', {})
+            print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
+                  f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
+                  f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
+                  f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
+                  f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
+
+            if getattr(args, 'sparse_weight', 0.0) > 0:
+                print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
+                      f"Valid {val_metrics['sparse_norm']:.5f}")
+
+            report_interval = getattr(args, 'codebook_report_interval', 5)
+            if (epoch + 1) % report_interval == 0 or epoch == 0:
+                val_stats = val_metrics.get('codebook_stats', {})
+                train_usage = train_stats.get('usage_rate', 0.0) * 100
+                val_usage = val_stats.get('usage_rate', 0.0) * 100
+                print(f"  └─ 码本利用率(avg): Train {train_usage:.1f}% | Valid {val_usage:.1f}%")
+                per_layer = train_stats.get('per_layer_usage', [])
+                if len(per_layer) > 1:
+                    print(f"  └─ 各层利用率 (Train): {', '.join(per_layer)}")
                 if train_stats.get('top5_usage'):
-                    top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
+                    top5_str = ', '.join([f"#{i}({c})" for i, c in train_stats['top5_usage'][:5]])
                     print(f"  └─ 最常用码本元素 (Train): {top5_str}")
-        
-        # 基于val_loss保存最佳模型
-        if epoch >= 5:  # 前5个epoch不保存
+
+        # ── 早停 & 保存 ─────────────────────────────────────────────
+        if epoch >= 5:
             current_val_loss = val_metrics['loss']
-            
-            # 如果val_loss下降，保存模型
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
                 no_improve_count = 0
                 model_saved = True
-                
-                # 只保存encoder、decoder和vq的权重
-                if args.per_channel_codebook:
-                    checkpoint = {
-                        'encoder_state_dict': model.encoder.state_dict(),
-                        'decoder_state_dict': model.decoder.state_dict(),
-                        # model_state_dict 包含 vqs.0.*, vqs.1.*, ...
-                        # 可被 PatchVQVAETransformer.load_vqvae_weights() 直接加载
-                        'model_state_dict': model.state_dict(),
-                        'n_channels': dls.vars,
-                        'config': config,
-                        'args': vars(args),
-                        'epoch': epoch,
-                        'train_loss': train_metrics['loss'],
-                        'val_loss': val_metrics['loss'],
-                        'train_recon_loss': train_metrics['recon_loss'],
-                        'val_recon_loss': val_metrics['recon_loss'],
-                    }
-                else:
-                    checkpoint = {
-                        'encoder_state_dict': model.encoder.state_dict(),
-                        'decoder_state_dict': model.decoder.state_dict(),
-                        'vq_state_dict': model.vq.state_dict(),
-                        'config': config,
-                        'args': vars(args),
-                        'epoch': epoch,
-                        'train_loss': train_metrics['loss'],
-                        'val_loss': val_metrics['loss'],
-                        'train_recon_loss': train_metrics['recon_loss'],
-                        'val_recon_loss': val_metrics['recon_loss'],
-                    }
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'config': config,
+                    'args': vars(args),
+                    'epoch': epoch,
+                    'val_loss': val_metrics['loss'],
+                    'use_decomposition': use_decomp,
+                }
+                if not use_decomp:
+                    checkpoint['encoder_state_dict'] = model.encoder.state_dict()
+                    checkpoint['decoder_state_dict'] = model.decoder.state_dict()
+                    checkpoint['vq_state_dict'] = model.vq.state_dict()
                 torch.save(checkpoint, save_dir / f'{model_name}.pth')
                 print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
             else:
-                # val_loss不再下降，不再保存模型
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
                     print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")

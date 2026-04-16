@@ -87,6 +87,18 @@ def build_arg_parser():
     p.add_argument('--use_raw_input', type=int, default=0,
                    help='1: NMPP 模式，Transformer 接收原始 patch，VQVAE 仅作为 teacher')
 
+    # TSO 分解模式
+    p.add_argument('--use_decomposition', type=int, default=0,
+                   help='启用 Trend-Stochastic-Oscillatory 分解（1=启用）')
+    p.add_argument('--codebook_size_trend', type=int, default=0,
+                   help='趋势码本大小（0=与 codebook_size 相同）')
+    p.add_argument('--codebook_size_osc', type=int, default=0,
+                   help='振荡码本大小（0=与 codebook_size 相同）')
+    p.add_argument('--stochastic_latent_dim', type=int, default=4,
+                   help='随机分量 VAE 隐变量维度')
+    p.add_argument('--trend_kernel_size', type=int, default=5,
+                   help='趋势低通滤波器核大小')
+
     # 训练超参
     p.add_argument('--n_epochs', type=int, default=100)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -140,11 +152,12 @@ def _progressive_loss(all_logits, all_target_indices, rq_layer_weights=None):
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, trainable_params):
     model.train()
+    use_decomp = getattr(model, 'use_decomposition', False)
     totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0.)
     n = 0
 
-    use_raw = bool(args.use_raw_input)
-    compute_recon = args.recon_weight > 0 and not use_raw
+    use_raw = bool(args.use_raw_input) and not use_decomp
+    compute_recon = args.recon_weight > 0 and not use_raw and not use_decomp
     vq_w    = 0. if use_raw else args.vq_weight
     recon_w = 0. if use_raw else args.recon_weight
     rq_weights = getattr(args, 'rq_layer_weights', None)
@@ -154,17 +167,28 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         if revin:
             batch_x = revin(batch_x, 'norm')
             batch_y = revin(batch_y, 'norm')
-
         batch_full = torch.cat([batch_x, batch_y], dim=1)
-        all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
-            batch_full,
-            step_size=args.progressive_step_size,
-            max_stages=args.progressive_max_stages,
-            compute_recon_loss=compute_recon,
-            use_raw_input=use_raw,
-        )
-        pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
-        loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
+
+        if use_decomp:
+            tl, tt, ol, ot, vq_loss = model.forward_progressive_pretrain_decomposed(
+                batch_full, step_size=args.progressive_step_size,
+                max_stages=args.progressive_max_stages,
+            )
+            t_pred = _progressive_loss(tl, tt, rq_weights)
+            o_pred = _progressive_loss(ol, ot, rq_weights)
+            pred_loss = t_pred + o_pred
+            recon_loss = batch_x.new_tensor(0.0)
+            loss = pred_loss + vq_w * vq_loss
+        else:
+            all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
+                batch_full,
+                step_size=args.progressive_step_size,
+                max_stages=args.progressive_max_stages,
+                compute_recon_loss=compute_recon,
+                use_raw_input=use_raw,
+            )
+            pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
+            loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -183,11 +207,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
 
 def validate_epoch(model, dataloader, revin, args, device):
     model.eval()
+    use_decomp = getattr(model, 'use_decomposition', False)
     totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0.)
     n = 0
 
-    use_raw = bool(args.use_raw_input)
-    compute_recon = args.recon_weight > 0 and not use_raw
+    use_raw = bool(args.use_raw_input) and not use_decomp
+    compute_recon = args.recon_weight > 0 and not use_raw and not use_decomp
     vq_w    = 0. if use_raw else args.vq_weight
     recon_w = 0. if use_raw else args.recon_weight
     rq_weights = getattr(args, 'rq_layer_weights', None)
@@ -198,17 +223,28 @@ def validate_epoch(model, dataloader, revin, args, device):
             if revin:
                 batch_x = revin(batch_x, 'norm')
                 batch_y = revin(batch_y, 'norm')
-
             batch_full = torch.cat([batch_x, batch_y], dim=1)
-            all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
-                batch_full,
-                step_size=args.progressive_step_size,
-                max_stages=args.progressive_max_stages,
-                compute_recon_loss=compute_recon,
-                use_raw_input=use_raw,
-            )
-            pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
-            loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
+
+            if use_decomp:
+                tl, tt, ol, ot, vq_loss = model.forward_progressive_pretrain_decomposed(
+                    batch_full, step_size=args.progressive_step_size,
+                    max_stages=args.progressive_max_stages,
+                )
+                t_pred = _progressive_loss(tl, tt, rq_weights)
+                o_pred = _progressive_loss(ol, ot, rq_weights)
+                pred_loss = t_pred + o_pred
+                recon_loss = batch_x.new_tensor(0.0)
+                loss = pred_loss + vq_w * vq_loss
+            else:
+                all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
+                    batch_full,
+                    step_size=args.progressive_step_size,
+                    max_stages=args.progressive_max_stages,
+                    compute_recon_loss=compute_recon,
+                    use_raw_input=use_raw,
+                )
+                pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
+                loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
             totals['loss']       += loss.item()
             totals['pred_loss']  += pred_loss.item()
@@ -235,13 +271,18 @@ def _disable_flash_sdp():
 
 
 def _disable_ema(model):
-    """冻结所有 VQ 模块的 EMA 更新（兼容 shared / per-channel + 单层/RVQ 模式）"""
+    """冻结所有 VQ 模块的 EMA 更新"""
     def _disable_rvq(rvq_mod):
         for single_vq in rvq_mod.layers:
             if isinstance(single_vq, FlattenedVectorQuantizerEMA):
                 single_vq._disable_ema_update = True
 
-    if model.per_channel_codebook:
+    if getattr(model, 'use_decomposition', False):
+        for attr in ('trend_vq', 'osc_vq'):
+            if hasattr(model, attr):
+                _disable_rvq(getattr(model, attr))
+        print('✓ 已禁用 EMA 更新（分解模式：trend_vq + osc_vq）')
+    elif model.per_channel_codebook:
         for rvq_mod in model.vqs:
             _disable_rvq(rvq_mod)
         print('✓ 已禁用 EMA 更新（per-channel 模式）')
@@ -258,11 +299,13 @@ def run_pretrain():
     args = build_arg_parser().parse_args()
     print('Args:', args)
 
-    # NMPP 校验
-    if args.use_raw_input:
+    # NMPP / 分解模式校验
+    if args.use_raw_input and not getattr(args, 'use_decomposition', 0):
         if not args.vqvae_checkpoint:
             raise ValueError('NMPP (--use_raw_input=1) 需要指定 --vqvae_checkpoint')
         args.freeze_vqvae = 1
+    if getattr(args, 'use_decomposition', 0) and not args.vqvae_checkpoint:
+        raise ValueError('分解模式 (--use_decomposition=1) 需要指定 --vqvae_checkpoint')
 
     _disable_flash_sdp()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -272,16 +315,18 @@ def run_pretrain():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # 模型命名
+    use_decomp = bool(getattr(args, 'use_decomposition', 0))
     code_dim  = args.embedding_dim * (args.patch_size // args.compression_factor)
     step_size = args.progressive_step_size
-    nmpp_sfx  = '_nmpp'  if args.use_raw_input        else ''
-    perch_sfx = '_perch' if args.per_channel_codebook else ''
-    rvq_sfx   = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
-    rid_sfx   = f'_run{args.run_id}' if args.run_id is not None else ''
+    nmpp_sfx   = '_nmpp'  if args.use_raw_input         else ''
+    perch_sfx  = '_perch' if args.per_channel_codebook  else ''
+    rvq_sfx    = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
+    decomp_sfx = '_tso' if use_decomp else ''
+    rid_sfx    = f'_run{args.run_id}' if args.run_id is not None else ''
     model_name = (
         f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}'
         f'_l{args.n_layers}_in{args.context_points}_step{step_size}'
-        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{nmpp_sfx}'
+        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{nmpp_sfx}{decomp_sfx}'
     )
 
     # 数据
@@ -300,6 +345,8 @@ def run_pretrain():
                 'codebook_size', 'num_hiddens', 'num_residual_layers',
                 'num_residual_hiddens', 'commitment_cost',
                 'codebook_ema', 'ema_decay', 'ema_eps',
+                'codebook_size_trend', 'codebook_size_osc',
+                'stochastic_latent_dim', 'trend_kernel_size', 'shape_alpha',
             ]
             overridden = []
             for k in vqvae_keys:
@@ -319,6 +366,19 @@ def run_pretrain():
     # 模型
     config = get_model_config(args)
     config['n_channels'] = dls.vars
+    use_decomp = bool(getattr(args, 'use_decomposition', 0))
+    if use_decomp:
+        config['use_decomposition'] = True
+        config['codebook_size_trend'] = (
+            args.codebook_size_trend if getattr(args, 'codebook_size_trend', 0) > 0
+            else args.codebook_size
+        )
+        config['codebook_size_osc'] = (
+            args.codebook_size_osc if getattr(args, 'codebook_size_osc', 0) > 0
+            else args.codebook_size
+        )
+        config['stochastic_latent_dim'] = int(getattr(args, 'stochastic_latent_dim', 4))
+        config['trend_kernel_size'] = int(getattr(args, 'trend_kernel_size', 5))
     model = PatchVQVAETransformer(config).to(device)
 
     # 加载预训练 VQVAE
@@ -339,7 +399,7 @@ def run_pretrain():
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'\n参数: 总计 {total_p:,} | 可训练 {train_p:,} | 冻结 {total_p - train_p:,}')
 
-    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    revin = RevIN(dls.vars, eps=1e-5, affine=True).to(device) if args.revin else None
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)

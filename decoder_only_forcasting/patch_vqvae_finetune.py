@@ -301,7 +301,7 @@ def main():
     print(f'AMP enabled: {use_amp}')
     
     # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    revin = RevIN(dls.vars, eps=1e-5, affine=True).to(device) if args.revin else None
     
     # 模型文件名
     # 如果提供了 run_id，则使用它；否则尝试从预训练模型路径中提取

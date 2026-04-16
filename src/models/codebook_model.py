@@ -2,15 +2,14 @@
 轻量级码本模型：只包含Encoder、VQ和Decoder
 用于码本预训练，不包含Transformer等重型模块
 
-CodebookModel          — 所有通道共享一个 VQ
-PerChannelCodebookModel — 每个通道拥有独立 VQ（nn.ModuleList self.vqs），
-                          编码器/解码器仍然共享
+CodebookModel              — 标准 VQVAE（所有通道共享一个 VQ）
+DecomposedCodebookModel    — Trend–Stochastic–Oscillatory 三分量分解
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .vqvae import Encoder, Decoder, SparseNet
+from .vqvae import Encoder, Decoder, SparseNet, TrendExtractor, StochasticVAE
 from .patch_vqvae_transformer import (
     FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA, ResidualVQ,
 )
@@ -268,13 +267,24 @@ class CodebookModel(nn.Module):
         return x_recon
 
 
-class PerChannelCodebookModel(nn.Module):
+class DecomposedCodebookModel(nn.Module):
     """
-    Per-channel 码本模型：共享 Encoder/Decoder，每个通道拥有独立 VQ。
+    Trend–Stochastic–Oscillatory 三分量分解码本模型。
 
-    VQ 模块存放在 self.vqs = nn.ModuleList(...)，保存时的 state_dict 键名为
-    vqs.0.*, vqs.1.*, ...，与 PatchVQVAETransformer(per_channel_codebook=True)
-    的命名完全一致，因此可以直接被 load_vqvae_weights() 加载。
+    数据流:
+        x_patch → TrendExtractor → x_trend ──→ Enc_T → VQ_T → Dec_T → x̂_trend
+                                    │
+                               r = x − x_trend
+                                    │
+                                    ├─→ StochasticVAE → ŝ  (低维 VAE)
+                                    │
+                               o = r − ŝ
+                                    │
+                                    └─→ Enc_O → VQ_O → Dec_O → ô
+
+        最终重构: x̂ = x̂_trend + ŝ + ô
+
+    损失: L = L_trend_rec + L_rec + λ₁·L_KL + λ₂·L_shape + λ₃·L_vq
     """
 
     def __init__(self, config, n_channels):
@@ -282,15 +292,16 @@ class PerChannelCodebookModel(nn.Module):
         self.patch_size = config['patch_size']
         self.embedding_dim = config['embedding_dim']
         self.compression_factor = config['compression_factor']
-        self.codebook_size = config['codebook_size']
         self.commitment_cost = config['commitment_cost']
-        self.n_channels = n_channels
-
         self.compressed_len = self.patch_size // self.compression_factor
         self.code_dim = self.embedding_dim * self.compressed_len
+        self.n_rq_layers = config.get('n_rq_layers', 1)
 
-        # 共享 Encoder / Decoder（channel-independent：单通道输入/输出）
-        self.encoder = Encoder(
+        self.codebook_size_trend = config.get('codebook_size_trend', config['codebook_size'])
+        self.codebook_size_osc = config.get('codebook_size_osc', config['codebook_size'])
+        self.shape_alpha = config.get('shape_alpha', 0.5)
+
+        enc_kw = dict(
             in_channels=1,
             num_hiddens=config['num_hiddens'],
             num_residual_layers=config['num_residual_layers'],
@@ -298,7 +309,7 @@ class PerChannelCodebookModel(nn.Module):
             embedding_dim=self.embedding_dim,
             compression_factor=self.compression_factor,
         )
-        self.decoder = Decoder(
+        dec_kw = dict(
             in_channels=self.embedding_dim,
             num_hiddens=config['num_hiddens'],
             num_residual_layers=config['num_residual_layers'],
@@ -307,159 +318,198 @@ class PerChannelCodebookModel(nn.Module):
             out_channels=1,
         )
 
-        # 每个通道独立的 RVQ（键名 vqs.{c}.* 与 PatchVQVAETransformer 保持一致）
-        self.n_rq_layers = config.get('n_rq_layers', 1)
-        init_method = config.get('vq_init_method', 'random')
+        # ── Trend path ───────────────────────────────────────────────
+        self.trend_extractor = TrendExtractor(
+            kernel_size=config.get('trend_kernel_size', 5)
+        )
+        self.trend_encoder = Encoder(**enc_kw)
+        self.trend_decoder = Decoder(**dec_kw)
+        self.trend_vq = self._build_rvq(self.codebook_size_trend, config)
 
-        def _make_single_vq():
+        # ── Stochastic VAE ───────────────────────────────────────────
+        self.stochastic_vae = StochasticVAE(
+            patch_size=self.patch_size,
+            latent_dim=config.get('stochastic_latent_dim', 4),
+            num_hiddens=config['num_hiddens'],
+        )
+
+        # ── Oscillatory path ─────────────────────────────────────────
+        self.osc_encoder = Encoder(**enc_kw)
+        self.osc_decoder = Decoder(**dec_kw)
+        self.osc_vq = self._build_rvq(self.codebook_size_osc, config)
+
+    # ------------------------------------------------------------------
+    def _build_rvq(self, codebook_size, config):
+        init_method = config.get('vq_init_method', 'random')
+        def _make():
             if config.get('codebook_ema', False):
                 return FlattenedVectorQuantizerEMA(
-                    self.codebook_size, self.code_dim, self.commitment_cost,
+                    codebook_size, self.code_dim, self.commitment_cost,
                     decay=config.get('ema_decay', 0.99),
                     eps=config.get('ema_eps', 1e-5),
                     init_method=init_method,
                 )
             return FlattenedVectorQuantizer(
-                self.codebook_size, self.code_dim, self.commitment_cost,
+                codebook_size, self.code_dim, self.commitment_cost,
                 init_method=init_method,
             )
-
-        self.vqs = nn.ModuleList([
-            ResidualVQ(self.n_rq_layers, _make_single_vq) for _ in range(n_channels)
-        ])
-
-        # Robust VQVAE: 稀疏异常分量网络（与共享 Encoder 搭配，所有通道共用一个 SparseNet）
-        self.sparse_net: SparseNet | None = None
-        if config.get('sparse_weight', 0) > 0:
-            self.sparse_net = SparseNet(
-                patch_size=self.patch_size,
-                num_hiddens=config['num_hiddens'],
-                amplitude=config.get('sparse_amplitude', 0.5),
-            )
-
-    def _apply_sparse(self, x_c: torch.Tensor):
-        """见 CodebookModel._apply_sparse。"""
-        if self.sparse_net is None:
-            return x_c, None
-        s = self.sparse_net(x_c)
-        return x_c - s, s.squeeze(1)
+        return ResidualVQ(self.n_rq_layers, _make)
 
     # ------------------------------------------------------------------
-
-    def init_codebook_from_data(self, dataloader, device, num_samples=10000,
-                                method='kmeans', revin=None):
-        """从数据分通道初始化各自的码本。"""
+    def init_codebook_from_data(self, dataloader, device,
+                                num_samples=10000, method='kmeans', revin=None):
+        """从数据初始化 trend_vq 和 osc_vq 两个码本。"""
         self.eval()
-        # 每个通道单独收集 encoder 输出
-        z_per_channel = [[] for _ in range(self.n_channels)]
-        n_collected = [0] * self.n_channels
-        target = num_samples
+        z_trend_list, z_osc_list = [], []
+        n_collected = 0
 
-        print(f"\n收集 encoder 输出用于 per-channel 码本初始化（每通道目标: {target}）...")
-
+        print(f"\n收集 encoder 输出用于双码本初始化（目标: {num_samples}）...")
         with torch.no_grad():
             for batch_x, _ in dataloader:
-                if all(n >= target for n in n_collected):
+                if n_collected >= num_samples:
                     break
                 batch_x = batch_x.to(device)
                 if revin is not None:
                     batch_x = revin(batch_x, 'norm')
 
                 B, T, C = batch_x.shape
-                num_patches = T // self.patch_size
-                x = batch_x[:, :num_patches * self.patch_size, :]
-                x_patches = x.reshape(B, num_patches, self.patch_size, C)
+                P = T // self.patch_size
+                x_patches = batch_x[:, :P * self.patch_size, :].reshape(
+                    B, P, self.patch_size, C
+                )
+                for c in range(C):
+                    if n_collected >= num_samples:
+                        break
+                    x_c = x_patches[:, :, :, c].reshape(B * P, self.patch_size).unsqueeze(1)
 
-                for c in range(min(C, self.n_channels)):
-                    if n_collected[c] >= target:
-                        continue
-                    x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size)
-                    x_c = x_c.unsqueeze(1)  # [B*P, 1, patch_size]
-                    x_c_clean, _ = self._apply_sparse(x_c)
-                    z = self.encoder(x_c_clean, self.compression_factor)
-                    z_flat = z.reshape(B * num_patches, -1)
-                    z_per_channel[c].append(z_flat.cpu())
-                    n_collected[c] += z_flat.size(0)
+                    x_trend = self.trend_extractor(x_c)
+                    r = x_c - x_trend
 
-        for c in range(self.n_channels):
-            if not z_per_channel[c]:
-                print(f"  警告: 通道 {c} 未收集到样本，跳过初始化")
-                continue
-            z_samples = torch.cat(z_per_channel[c], dim=0)[:target].to(device)
-            print(f"  通道 {c}: {z_samples.size(0)} 个样本")
-            self.vqs[c].init_from_data(z_samples, method=method)
+                    z_t = self.trend_encoder(x_trend, self.compression_factor)
+                    z_trend_list.append(z_t.reshape(B * P, -1))
+
+                    s_hat, _, _ = self.stochastic_vae(r)
+                    o = r - s_hat
+                    z_o = self.osc_encoder(o, self.compression_factor)
+                    z_osc_list.append(z_o.reshape(B * P, -1))
+
+                    n_collected += B * P
+
+        z_trend_all = torch.cat(z_trend_list, dim=0)[:num_samples]
+        z_osc_all = torch.cat(z_osc_list, dim=0)[:num_samples]
+        print(f"  Trend  码本: {z_trend_all.size(0)} 个样本")
+        self.trend_vq.init_from_data(z_trend_all, method=method)
+        print(f"  Oscillatory 码本: {z_osc_all.size(0)} 个样本")
+        self.osc_vq.init_from_data(z_osc_all, method=method)
 
         self.train()
 
     # ------------------------------------------------------------------
-    # 前向接口（与 CodebookModel 完全相同，方便 train_epoch 复用）
-    # ------------------------------------------------------------------
-
-    def encode_to_indices(self, x, return_sparse=False):
+    def forward(self, x):
         """
+        完整前向传播（训练用）。逐通道处理以保持 EMA 更新语义一致。
+
         Args:
             x: [B, T, C]
-            return_sparse: 是否返回稀疏分量 s [B, num_patches*patch_size, C]
         Returns:
-            indices: [B, num_patches, C, n_rq_layers]
-            vq_loss: scalar
-            z_q: [B, num_patches, C, code_dim]
-            s_tensor (optional): [B, num_patches*patch_size, C] or None
+            dict: trend_indices, osc_indices, z_q_trend, z_q_osc,
+                  trend_vq_loss, osc_vq_loss, kl_loss, recon_loss,
+                  trend_recon_loss, shape_loss
         """
         B, T, C = x.shape
-        num_patches = T // self.patch_size
-        x = x[:, :num_patches * self.patch_size, :]
-        x_patches = x.reshape(B, num_patches, self.patch_size, C)
+        P = T // self.patch_size
+        x = x[:, :P * self.patch_size, :]
+        x_patches = x.reshape(B, P, self.patch_size, C)
 
-        z_list, s_list = [], []
+        t_idx_l, o_idx_l, zqt_l, zqo_l = [], [], [], []
+        t_vq = osc_vq = kl = rec = t_rec = shape = x.new_tensor(0.0)
+
         for c in range(C):
-            x_c = x_patches[:, :, :, c].reshape(B * num_patches, self.patch_size).unsqueeze(1)
-            x_c_clean, s_c = self._apply_sparse(x_c)
-            z = self.encoder(x_c_clean, self.compression_factor)
-            z_flat = z.reshape(B * num_patches, self.code_dim)
-            z_list.append(z_flat.reshape(B, num_patches, self.code_dim))
-            if return_sparse and s_c is not None:
-                s_list.append(s_c.reshape(B, num_patches, self.patch_size))
+            xc = x_patches[:, :, :, c].reshape(B * P, self.patch_size).unsqueeze(1)
 
-        z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
+            # 1. Trend
+            x_trend = self.trend_extractor(xc)
+            r = xc - x_trend
 
-        indices_list, z_q_list = [], []
-        vq_loss_sum = 0.0
+            z_t = self.trend_encoder(x_trend, self.compression_factor)
+            z_t_flat = z_t.reshape(B * P, self.code_dim)
+            tvl, zqt, tidx = self.trend_vq(z_t_flat)
+            x_trend_hat = self.trend_decoder(
+                zqt.reshape(B * P, self.embedding_dim, self.compressed_len),
+                self.compression_factor,
+            )
+            t_vq = t_vq + tvl
+            t_rec = t_rec + F.mse_loss(x_trend_hat, x_trend)
+
+            # 2. Stochastic VAE
+            s_hat, mu, logvar = self.stochastic_vae(r)
+            kl = kl + (-0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp()))
+
+            # 3. Oscillatory
+            o = r - s_hat.detach()
+            z_o = self.osc_encoder(o, self.compression_factor)
+            z_o_flat = z_o.reshape(B * P, self.code_dim)
+            ovl, zqo, oidx = self.osc_vq(z_o_flat)
+            o_hat = self.osc_decoder(
+                zqo.reshape(B * P, self.embedding_dim, self.compressed_len),
+                self.compression_factor,
+            )
+            osc_vq = osc_vq + ovl
+
+            # 4. Losses
+            rec = rec + F.mse_loss(o_hat + s_hat, r)
+            s_flat = s_hat.reshape(-1)
+            shape = shape + (
+                self.shape_alpha * s_flat.abs().mean()
+                + (1 - self.shape_alpha) * s_flat.pow(2).mean()
+            )
+
+            # collect
+            t_idx_l.append(torch.stack(tidx, dim=1).reshape(B, P, self.n_rq_layers))
+            o_idx_l.append(torch.stack(oidx, dim=1).reshape(B, P, self.n_rq_layers))
+            zqt_l.append(zqt.reshape(B, P, self.code_dim))
+            zqo_l.append(zqo.reshape(B, P, self.code_dim))
+
+        return {
+            'trend_indices': torch.stack(t_idx_l, dim=2),       # [B, P, C, n_rq]
+            'osc_indices': torch.stack(o_idx_l, dim=2),         # [B, P, C, n_rq]
+            'z_q_trend': torch.stack(zqt_l, dim=2),             # [B, P, C, cd]
+            'z_q_osc': torch.stack(zqo_l, dim=2),               # [B, P, C, cd]
+            'trend_vq_loss': t_vq / C,
+            'osc_vq_loss': osc_vq / C,
+            'kl_loss': kl / C,
+            'recon_loss': rec / C,
+            'trend_recon_loss': t_rec / C,
+            'shape_loss': shape / C,
+        }
+
+    # ------------------------------------------------------------------
+    def decode_trend(self, z_q_trend):
+        """z_q_trend: [B, P, C, code_dim] → [B, P*ps, C]"""
+        B, P, C, _ = z_q_trend.shape
+        out = []
         for c in range(C):
-            z_c_flat = z_all[:, :, c, :].reshape(B * num_patches, self.code_dim)
-            vq_loss_c, z_q_sum_c, all_idx_c = self.vqs[c](z_c_flat)
-            vq_loss_sum += vq_loss_c
-            indices_c = torch.stack(all_idx_c, dim=1).reshape(B, num_patches, self.n_rq_layers)
-            indices_list.append(indices_c)
-            z_q_list.append(z_q_sum_c.reshape(B, num_patches, self.code_dim))
+            zt = z_q_trend[:, :, c, :].reshape(B * P, self.embedding_dim, self.compressed_len)
+            out.append(self.trend_decoder(zt, self.compression_factor).reshape(B, P, self.patch_size))
+        return torch.stack(out, dim=3).reshape(B, -1, C)
 
-        indices = torch.stack(indices_list, dim=2)  # [B, num_patches, C, n_rq_layers]
-        z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
-        vq_loss = vq_loss_sum / C
-
-        if return_sparse:
-            if s_list:
-                s_tensor = torch.stack(s_list, dim=3)  # [B, num_patches, patch_size, C]
-                s_tensor = s_tensor.reshape(B, -1, C)
-            else:
-                s_tensor = None
-            return indices, vq_loss, z_q, s_tensor
-
-        return indices, vq_loss, z_q
-
-    def decode_from_codes(self, z_q):
-        """
-        Args:
-            z_q: [B, num_patches, C, code_dim]
-        Returns:
-            x_recon: [B, num_patches * patch_size, C]
-        """
-        B, num_patches, C, _ = z_q.shape
-        x_recon_list = []
+    def decode_osc(self, z_q_osc):
+        """z_q_osc: [B, P, C, code_dim] → [B, P*ps, C]"""
+        B, P, C, _ = z_q_osc.shape
+        out = []
         for c in range(C):
-            z_q_c = z_q[:, :, c, :].reshape(B * num_patches, self.embedding_dim, self.compressed_len)
-            x_c = self.decoder(z_q_c, self.compression_factor)   # [B*P, 1, patch_size]
-            x_recon_list.append(x_c.reshape(B, num_patches, self.patch_size))
+            zo = z_q_osc[:, :, c, :].reshape(B * P, self.embedding_dim, self.compressed_len)
+            out.append(self.osc_decoder(zo, self.compression_factor).reshape(B, P, self.patch_size))
+        return torch.stack(out, dim=3).reshape(B, -1, C)
 
-        x_recon = torch.stack(x_recon_list, dim=3)  # [B, num_patches, patch_size, C]
-        return x_recon.reshape(B, -1, C)
+    def sample_stochastic(self, B, num_patches, C, device):
+        """从先验 N(0,I) 采样 stochastic 分量 → [B, P*ps, C]"""
+        N = B * num_patches * C
+        z_s = torch.randn(N, self.stochastic_vae.latent_dim, device=device)
+        s = self.stochastic_vae.decode(z_s)  # [N, 1, ps]
+        return (
+            s.squeeze(1)
+             .reshape(B, num_patches, C, self.patch_size)
+             .permute(0, 1, 3, 2)
+             .reshape(B, -1, C)
+        )

@@ -61,6 +61,17 @@ SPARSE_WEIGHT=0.0
 # 建议范围: 0.2 ~ 1.0（相对归一化后的 patch 值域）
 SPARSE_AMPLITUDE=0.5
 
+# TSO 分解模式参数
+USE_DECOMPOSITION=0      # 0=标准 VQVAE, 1=TSO 分解
+CODEBOOK_SIZE_TREND=0    # 趋势码本大小（0=与 CODEBOOK_SIZE 相同）
+CODEBOOK_SIZE_OSC=0      # 振荡码本大小（0=与 CODEBOOK_SIZE 相同）
+STOCHASTIC_LATENT_DIM=4  # 随机分量 VAE 隐变量维度
+TREND_KERNEL_SIZE=5      # 趋势提取低通滤波器核大小
+LAMBDA_KL=0.01           # KL 散度损失权重
+LAMBDA_SHAPE=0.1         # 形状正则损失权重
+LAMBDA_VQ=1.0            # VQ commitment 损失权重（分解模式）
+SHAPE_ALPHA=0.5          # shape loss 中 L1 的占比
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
@@ -95,4 +106,13 @@ python codebook_pretrain.py \
     --per_channel_codebook $PER_CHANNEL_CODEBOOK \
     --n_rq_layers $N_RQ_LAYERS \
     --sparse_weight $SPARSE_WEIGHT \
-    --sparse_amplitude $SPARSE_AMPLITUDE
+    --sparse_amplitude $SPARSE_AMPLITUDE \
+    --use_decomposition $USE_DECOMPOSITION \
+    --codebook_size_trend $CODEBOOK_SIZE_TREND \
+    --codebook_size_osc $CODEBOOK_SIZE_OSC \
+    --stochastic_latent_dim $STOCHASTIC_LATENT_DIM \
+    --trend_kernel_size $TREND_KERNEL_SIZE \
+    --lambda_kl $LAMBDA_KL \
+    --lambda_shape $LAMBDA_SHAPE \
+    --lambda_vq $LAMBDA_VQ \
+    --shape_alpha $SHAPE_ALPHA

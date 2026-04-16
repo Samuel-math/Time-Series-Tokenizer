@@ -57,13 +57,20 @@ N_RQ_LAYERS=2
 RQ_LAYER_WEIGHTS=""
 
 # =====================================================
-# NMPP 模式（Next Masked Patch Prediction with Raw Input）
-# 0 = 标准 NTP：Transformer 输入为 VQ 编码 embedding
-# 1 = NMPP：Transformer 输入为原始 patch 的线性投影，
-#            VQVAE 仅作为 teacher 提供目标 token ID
-#            （需要同时设置 FREEZE_VQVAE=1 且指定有效的 CODEBOOK_CHECKPOINT）
+# NMPP 模式
 # =====================================================
 USE_RAW_INPUT=0
+
+# =====================================================
+# TSO 分解模式
+# 0 = 标准 NTP
+# 1 = Trend–Stochastic–Oscillatory 分解（需由对应 codebook_pretrain 训练）
+# =====================================================
+USE_DECOMPOSITION=0
+CODEBOOK_SIZE_TREND=0        # 0=与 CODEBOOK_SIZE 相同
+CODEBOOK_SIZE_OSC=0
+STOCHASTIC_LATENT_DIM=4
+TREND_KERNEL_SIZE=5
 
 # =====================================================
 # 码本模型路径
@@ -181,10 +188,10 @@ NMPP_SUFFIX=""
 [ "${USE_RAW_INPUT}" -eq 1 ] && NMPP_SUFFIX="_nmpp"
 RVQ_SUFFIX=""
 [ "${N_RQ_LAYERS:-1}" -gt 1 ] && RVQ_SUFFIX="_rvq${N_RQ_LAYERS}"
+TSO_SUFFIX=""
+[ "${USE_DECOMPOSITION}" -eq 1 ] && TSO_SUFFIX="_tso"
 
-# 注意：后缀顺序须与 patch_vqvae_pretrain_common.py 的命名保持一致
-# Python 保存格式：..._step{N}_model{ID}{_perch}{_rvqN}{_nmpp}.pth
-MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${NMPP_SUFFIX}"
+MODEL_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${NMPP_SUFFIX}${TSO_SUFFIX}"
 
 echo "================================================="
 echo "NTP 预训练 → 微调 流程"
@@ -242,8 +249,16 @@ PRETRAIN_ARGS=(
     --model_id "${MODEL_ID}"
 )
 [ -n "${TRANSFORMER_HIDDEN_DIM}" ] && PRETRAIN_ARGS+=(--transformer_hidden_dim "${TRANSFORMER_HIDDEN_DIM}")
-# nargs='+' 参数需展开为多个独立值
 [ -n "${RQ_LAYER_WEIGHTS}" ] && PRETRAIN_ARGS+=(--rq_layer_weights ${RQ_LAYER_WEIGHTS})
+
+# TSO 分解参数
+PRETRAIN_ARGS+=(--use_decomposition "${USE_DECOMPOSITION}")
+[ "${USE_DECOMPOSITION}" -eq 1 ] && PRETRAIN_ARGS+=(
+    --codebook_size_trend "${CODEBOOK_SIZE_TREND}"
+    --codebook_size_osc "${CODEBOOK_SIZE_OSC}"
+    --stochastic_latent_dim "${STOCHASTIC_LATENT_DIM}"
+    --trend_kernel_size "${TREND_KERNEL_SIZE}"
+)
 
 python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
 

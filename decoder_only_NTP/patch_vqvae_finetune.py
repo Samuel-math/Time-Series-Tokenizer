@@ -144,8 +144,10 @@ def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
         batch_x = revin(batch_x, 'norm')
     
     with amp.autocast(enabled=scaler.is_enabled()):
-        # 前向传播: 预测码本索引 -> 解码（支持自回归步长）
-        pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
+        if getattr(model, 'use_decomposition', False):
+            pred, _ = model.forward_finetune_decomposed(batch_x, args.target_points, step_size=args.ar_step_size)
+        else:
+            pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
         
         # RevIN反归一化
         if revin:
@@ -182,17 +184,18 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
                 batch_x = revin(batch_x, 'norm')
             
             with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
-            
+                if getattr(model, 'use_decomposition', False):
+                    pred, _ = model.forward_finetune_decomposed(batch_x, args.target_points, step_size=args.ar_step_size)
+                else:
+                    pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
+
             if revin:
                 pred = revin(pred, 'denorm')
-            
-            # 使用mean
+
             mse_loss = F.mse_loss(pred, batch_y, reduction='mean')
             total_loss += mse_loss.item()
             n_batches += 1
-    
-    # 按batch数平均
+
     return total_loss / n_batches if n_batches > 0 else 0.0
 
 
@@ -201,7 +204,7 @@ def test_model(model, dataloader, revin, args, device, use_amp):
     model.eval()
     all_preds = []
     all_targets = []
-    
+
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x = batch_x.to(device)
@@ -211,8 +214,11 @@ def test_model(model, dataloader, revin, args, device, use_amp):
                 batch_x = revin(batch_x, 'norm')
             
             with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
-            
+                if getattr(model, 'use_decomposition', False):
+                    pred, _ = model.forward_finetune_decomposed(batch_x, args.target_points, step_size=args.ar_step_size)
+                else:
+                    pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
+
             # 验证预测长度与目标长度一致
             assert pred.shape[1] == batch_y.shape[1] == args.target_points, \
                 f"预测长度 {pred.shape[1]} 与目标长度 {batch_y.shape[1]} 或 args.target_points {args.target_points} 不匹配"
@@ -300,7 +306,7 @@ def main():
     print(f'AMP enabled: {use_amp}')
     
     # RevIN
-    revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
+    revin = RevIN(dls.vars, eps=1e-5, affine=True).to(device) if args.revin else None
     
     # 模型文件名
     # 如果提供了 run_id，则使用它；否则尝试从预训练模型路径中提取

@@ -550,3 +550,84 @@ class SparseNet(nn.Module):
         """
         return torch.tanh(self.net(x)) * self.amplitude
 
+
+# =====================================================================
+# Trend-Stochastic-Oscillatory 分解组件
+# =====================================================================
+
+class TrendExtractor(nn.Module):
+    """
+    可学习因果低通滤波器：提取 patch 内的局部趋势。
+
+    权重经 softmax 归一化为正且和为 1，等效于加权移动平均。
+    因果（左填充）保证不泄露未来信息。
+    """
+    def __init__(self, kernel_size: int = 5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.raw_weights = nn.Parameter(torch.ones(kernel_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:  x: [N, 1, patch_size]
+        Returns: x_trend: [N, 1, patch_size]
+        """
+        w = F.softmax(self.raw_weights, dim=0).view(1, 1, -1)
+        x_pad = F.pad(x, (self.kernel_size - 1, 0), mode='replicate')
+        return F.conv1d(x_pad, w)
+
+
+class StochasticVAE(nn.Module):
+    """
+    微型 VAE：将残差 r 映射到极低维随机隐变量 z_s，
+    再解码为随机分量 s_hat。
+
+    训练时使用重参数化技巧采样，推理时直接使用均值。
+    """
+    def __init__(self, patch_size: int, latent_dim: int = 4, num_hiddens: int = 32):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.patch_size = patch_size
+        hidden = max(8, num_hiddens // 2)
+
+        self.enc = nn.Sequential(
+            nn.Conv1d(1, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.fc_mu = nn.Linear(hidden, latent_dim)
+        self.fc_logvar = nn.Linear(hidden, latent_dim)
+
+        self.dec_fc = nn.Linear(latent_dim, hidden * patch_size)
+        self.dec_conv = nn.Sequential(
+            nn.Conv1d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, 1, 3, padding=1),
+        )
+        self._hidden = hidden
+
+        nn.init.zeros_(self.dec_conv[-1].weight)
+        nn.init.zeros_(self.dec_conv[-1].bias)
+
+    def encode(self, x: torch.Tensor):
+        """x: [N, 1, P] → mu, logvar: [N, latent_dim]"""
+        h = self.enc(x).squeeze(-1)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor):
+        if self.training:
+            return mu + torch.randn_like(mu) * (0.5 * logvar).exp()
+        return mu
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """z: [N, latent_dim] → [N, 1, P]"""
+        h = self.dec_fc(z).reshape(-1, self._hidden, self.patch_size)
+        return self.dec_conv(h)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:  x: [N, 1, P]
+        Returns: s_hat [N, 1, P], mu [N, D], logvar [N, D]
+        """
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
