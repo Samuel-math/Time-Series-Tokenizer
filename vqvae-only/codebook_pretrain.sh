@@ -61,6 +61,26 @@ SPARSE_WEIGHT=0.0
 # 建议范围: 0.2 ~ 1.0（相对归一化后的 patch 值域）
 SPARSE_AMPLITUDE=0.5
 
+# ===== 趋势-残差双码本分解（TrendResidualCodebookModel）=====
+# 1 启用：X_patch = X_trend + X_residual（低通滤波）
+#          - X_trend    用 Codebook_T 重构
+#          - X_residual 用 Codebook_R + SparseNet(s) 重构
+#          - 两套独立的 Encoder/Decoder/VQ
+# 0 禁用：使用标准 CodebookModel / PerChannelCodebookModel
+USE_TREND_DECOMP=1
+# 低通滤波（移动平均）核长度：越大趋势越平滑，建议 3~9；patch_size 较小可取 3
+TREND_KERNEL_SIZE=5
+# 低通滤波核是否可学习
+#   1 = 可学习：权重经 softmax 归一化为非负且和为 1，起点等价于均值核（推荐）
+#   0 = 固定移动平均（无参数）
+TREND_LEARNABLE_FILTER=1
+# 两个码本的大小（设为 0 则各自使用 CODEBOOK_SIZE）
+CODEBOOK_SIZE_TREND=0
+CODEBOOK_SIZE_RES=0
+# 两个重构损失的相对权重
+TREND_RECON_WEIGHT=1.0
+RES_RECON_WEIGHT=1.0
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \
@@ -95,4 +115,11 @@ python codebook_pretrain.py \
     --per_channel_codebook $PER_CHANNEL_CODEBOOK \
     --n_rq_layers $N_RQ_LAYERS \
     --sparse_weight $SPARSE_WEIGHT \
-    --sparse_amplitude $SPARSE_AMPLITUDE
+    --sparse_amplitude $SPARSE_AMPLITUDE \
+    --use_trend_decomp $USE_TREND_DECOMP \
+    --trend_kernel_size $TREND_KERNEL_SIZE \
+    --trend_learnable_filter $TREND_LEARNABLE_FILTER \
+    --codebook_size_trend $CODEBOOK_SIZE_TREND \
+    --codebook_size_res $CODEBOOK_SIZE_RES \
+    --trend_recon_weight $TREND_RECON_WEIGHT \
+    --res_recon_weight $RES_RECON_WEIGHT

@@ -550,3 +550,52 @@ class SparseNet(nn.Module):
         """
         return torch.tanh(self.net(x)) * self.amplitude
 
+
+class TrendExtractor(nn.Module):
+    """
+    因果低通滤波器。
+
+    输入:  x [N, 1, L]
+    输出:  x_trend [N, 1, L] — 低频趋势分量
+
+    特性:
+      1. 输出长度与输入一致（左侧 replicate padding）
+      2. 因果性（仅依赖当前及过去的值）
+      3. 两种模式:
+         - learnable=False: 固定移动平均核（无参数）
+         - learnable=True : 可学习权重，通过 softmax 归一化为非负且和为 1，
+                            初始 = softmax(0) = 均匀分布，起点与固定 MA 完全一致
+    """
+    def __init__(self, kernel_size: int = 5, learnable: bool = False):
+        super().__init__()
+        assert kernel_size >= 1, "kernel_size 必须 >= 1"
+        self.kernel_size = kernel_size
+        self.learnable = bool(learnable)
+
+        if self.learnable:
+            # softmax(logits) → 归一化为非负概率分布，保证仍是低通性质
+            # 初始化为 0 → softmax(0) 为均匀分布 1/K，与固定 MA 等价
+            self.logits = nn.Parameter(torch.zeros(kernel_size))
+        else:
+            weight = torch.ones(1, 1, kernel_size) / kernel_size
+            self.register_buffer('weight', weight)
+
+    def _get_kernel(self) -> torch.Tensor:
+        """返回 [1, 1, K] 的卷积核。"""
+        if self.learnable:
+            w = F.softmax(self.logits, dim=0)          # [K], 非负且和为 1
+            return w.view(1, 1, self.kernel_size)
+        return self.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [N, 1, L]
+        Returns:
+            x_trend: [N, 1, L]
+        """
+        if self.kernel_size == 1:
+            return x
+        x_pad = F.pad(x, (self.kernel_size - 1, 0), mode='replicate')
+        return F.conv1d(x_pad, self._get_kernel())
+

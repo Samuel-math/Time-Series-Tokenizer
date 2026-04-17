@@ -22,7 +22,9 @@ import random
 
 # 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.models.codebook_model import CodebookModel, PerChannelCodebookModel
+from src.models.codebook_model import (
+    CodebookModel, PerChannelCodebookModel, TrendResidualCodebookModel,
+)
 from src.models.layers.revin import RevIN
 from src.basics import set_device
 from datautils import get_dls
@@ -95,6 +97,22 @@ def parse_args():
     parser.add_argument('--sparse_amplitude', type=float, default=0.5,
                         help='SparseNet tanh 振幅上界（限制 s 的最大绝对值，建议 0.3~1.0）')
 
+    # 趋势-残差双码本分解（TrendResidualCodebookModel）
+    parser.add_argument('--use_trend_decomp', type=int, default=0,
+                        help='启用低通滤波趋势分解 + 双码本（1启用）。启用后会覆盖 per_channel_codebook。')
+    parser.add_argument('--trend_kernel_size', type=int, default=5,
+                        help='低通滤波器（移动平均）核长度，越大趋势越平滑，建议 3~9')
+    parser.add_argument('--trend_learnable_filter', type=int, default=0,
+                        help='低通滤波核是否可学习（1=可学习，softmax 归一化保持低通；0=固定 MA）')
+    parser.add_argument('--codebook_size_trend', type=int, default=0,
+                        help='趋势码本大小（0=使用 --codebook_size）')
+    parser.add_argument('--codebook_size_res', type=int, default=0,
+                        help='残差码本大小（0=使用 --codebook_size）')
+    parser.add_argument('--trend_recon_weight', type=float, default=1.0,
+                        help='趋势重构损失权重')
+    parser.add_argument('--res_recon_weight', type=float, default=1.0,
+                        help='残差重构损失权重')
+
     return parser.parse_args()
 
 
@@ -117,6 +135,12 @@ def get_model_config(args):
         'n_rq_layers': int(getattr(args, 'n_rq_layers', 1)),
         'sparse_weight': float(getattr(args, 'sparse_weight', 0.0)),
         'sparse_amplitude': float(getattr(args, 'sparse_amplitude', 0.5)),
+        # 趋势-残差分解相关
+        'use_trend_decomp': bool(getattr(args, 'use_trend_decomp', 0)),
+        'trend_kernel_size': int(getattr(args, 'trend_kernel_size', 5)),
+        'trend_learnable_filter': bool(getattr(args, 'trend_learnable_filter', 0)),
+        'codebook_size_trend': int(getattr(args, 'codebook_size_trend', 0)),
+        'codebook_size_res': int(getattr(args, 'codebook_size_res', 0)),
     }
     return config
 
@@ -384,6 +408,160 @@ def validate_epoch(model, dataloader, revin, args, device):
     }
 
 
+def train_epoch_tr(model, dataloader, optimizer, revin, args, device, scaler):
+    """训练一个 epoch（趋势-残差双码本）。"""
+    model.train()
+    stats = {
+        'loss': 0.0, 'recon_loss': 0.0, 'vq_loss': 0.0,
+        'trend_rec': 0.0, 'res_rec': 0.0,
+        'trend_vq': 0.0, 'res_vq': 0.0, 'sparse_norm': 0.0,
+        'trend_perp': 0.0, 'res_perp': 0.0,
+    }
+    trend_idx_list, res_idx_list = [], []
+    n_batches = 0
+    use_sparse = getattr(args, 'sparse_weight', 0.0) > 0
+
+    for batch_x, _ in dataloader:
+        batch_x = batch_x.to(device)
+        if revin:
+            batch_x = revin(batch_x, 'norm')
+
+        out = model(batch_x)
+
+        trend_rec = out['trend_recon_loss']
+        res_rec = out['res_recon_loss']
+        trend_vq = out['trend_vq_loss']
+        res_vq = out['res_vq_loss']
+        sparse_norm = out['sparse_norm']
+
+        recon_loss = args.trend_recon_weight * trend_rec + args.res_recon_weight * res_rec
+        vq_loss = trend_vq + res_vq
+
+        loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+        if use_sparse:
+            loss = loss + args.sparse_weight * sparse_norm
+
+        optimizer.zero_grad()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            optimizer.step()
+
+        t_idx = out['trend_indices']
+        r_idx = out['res_indices']
+        cb_t = args.codebook_size_trend or args.codebook_size
+        cb_r = args.codebook_size_res or args.codebook_size
+        t_perp = len(torch.unique(t_idx[:, :, :, 0].reshape(-1))) / cb_t
+        r_perp = len(torch.unique(r_idx[:, :, :, 0].reshape(-1))) / cb_r
+
+        trend_idx_list.append(t_idx.detach().cpu())
+        res_idx_list.append(r_idx.detach().cpu())
+
+        stats['loss'] += loss.item()
+        stats['recon_loss'] += recon_loss.item()
+        stats['vq_loss'] += vq_loss.item()
+        stats['trend_rec'] += trend_rec.item()
+        stats['res_rec'] += res_rec.item()
+        stats['trend_vq'] += trend_vq.item()
+        stats['res_vq'] += res_vq.item()
+        stats['sparse_norm'] += sparse_norm.item()
+        stats['trend_perp'] += t_perp
+        stats['res_perp'] += r_perp
+        n_batches += 1
+
+    for k in stats:
+        stats[k] = stats[k] / n_batches if n_batches else 0.0
+
+    trend_idx_epoch = torch.cat(trend_idx_list, dim=0)
+    res_idx_epoch = torch.cat(res_idx_list, dim=0)
+    stats['trend_codebook_stats'] = compute_codebook_usage_stats(
+        trend_idx_epoch, args.codebook_size_trend or args.codebook_size
+    )
+    stats['res_codebook_stats'] = compute_codebook_usage_stats(
+        res_idx_epoch, args.codebook_size_res or args.codebook_size
+    )
+    # 与共享模型保持一致的字段名（用于外层打印/early-stop）
+    stats['perplexity'] = 0.5 * (stats['trend_perp'] + stats['res_perp'])
+    return stats
+
+
+def validate_epoch_tr(model, dataloader, revin, args, device):
+    """验证一个 epoch（趋势-残差双码本）。"""
+    model.eval()
+    stats = {
+        'loss': 0.0, 'recon_loss': 0.0, 'vq_loss': 0.0,
+        'trend_rec': 0.0, 'res_rec': 0.0,
+        'trend_vq': 0.0, 'res_vq': 0.0, 'sparse_norm': 0.0,
+        'trend_perp': 0.0, 'res_perp': 0.0,
+    }
+    trend_idx_list, res_idx_list = [], []
+    n_batches = 0
+    use_sparse = getattr(args, 'sparse_weight', 0.0) > 0
+
+    with torch.no_grad():
+        for batch_x, _ in dataloader:
+            batch_x = batch_x.to(device)
+            if revin:
+                batch_x = revin(batch_x, 'norm')
+
+            out = model(batch_x)
+            trend_rec = out['trend_recon_loss']
+            res_rec = out['res_recon_loss']
+            trend_vq = out['trend_vq_loss']
+            res_vq = out['res_vq_loss']
+            sparse_norm = out['sparse_norm']
+
+            recon_loss = args.trend_recon_weight * trend_rec + args.res_recon_weight * res_rec
+            vq_loss = trend_vq + res_vq
+            loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+            if use_sparse:
+                loss = loss + args.sparse_weight * sparse_norm
+
+            t_idx = out['trend_indices']
+            r_idx = out['res_indices']
+            cb_t = args.codebook_size_trend or args.codebook_size
+            cb_r = args.codebook_size_res or args.codebook_size
+            t_perp = len(torch.unique(t_idx[:, :, :, 0].reshape(-1))) / cb_t
+            r_perp = len(torch.unique(r_idx[:, :, :, 0].reshape(-1))) / cb_r
+
+            trend_idx_list.append(t_idx.cpu())
+            res_idx_list.append(r_idx.cpu())
+
+            stats['loss'] += loss.item()
+            stats['recon_loss'] += recon_loss.item()
+            stats['vq_loss'] += vq_loss.item()
+            stats['trend_rec'] += trend_rec.item()
+            stats['res_rec'] += res_rec.item()
+            stats['trend_vq'] += trend_vq.item()
+            stats['res_vq'] += res_vq.item()
+            stats['sparse_norm'] += sparse_norm.item()
+            stats['trend_perp'] += t_perp
+            stats['res_perp'] += r_perp
+            n_batches += 1
+
+    for k in stats:
+        stats[k] = stats[k] / n_batches if n_batches else 0.0
+
+    trend_idx_epoch = torch.cat(trend_idx_list, dim=0)
+    res_idx_epoch = torch.cat(res_idx_list, dim=0)
+    stats['trend_codebook_stats'] = compute_codebook_usage_stats(
+        trend_idx_epoch, args.codebook_size_trend or args.codebook_size
+    )
+    stats['res_codebook_stats'] = compute_codebook_usage_stats(
+        res_idx_epoch, args.codebook_size_res or args.codebook_size
+    )
+    stats['perplexity'] = 0.5 * (stats['trend_perp'] + stats['res_perp'])
+    return stats
+
+
 def set_seed(seed):
     """
     设置随机数种子以确保训练可复现性
@@ -445,9 +623,15 @@ def main():
     
     # 模型文件名
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
+    use_tr = bool(args.use_trend_decomp)
+    # 启用 trend-residual 分解时，per-channel 码本模式不生效
+    if use_tr and args.per_channel_codebook:
+        print('⚠️  use_trend_decomp=1 时忽略 per_channel_codebook 标志')
+        args.per_channel_codebook = 0
     per_ch_suffix = '_perch' if args.per_channel_codebook else ''
     rvq_suffix = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}_model{args.model_id}'
+    tr_suffix = '_tr' if use_tr else ''
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}{tr_suffix}_model{args.model_id}'
     
     # 获取数据
     args.dset_pretrain = args.dset
@@ -495,7 +679,15 @@ def main():
     
     # 创建轻量级码本模型（只包含encoder、vq、decoder）
     config = get_model_config(args)
-    if args.per_channel_codebook:
+    if use_tr:
+        model = TrendResidualCodebookModel(config, dls.vars).to(device)
+        cb_t = args.codebook_size_trend or args.codebook_size
+        cb_r = args.codebook_size_res or args.codebook_size
+        print(f'\n模式: 趋势-残差双码本（low-pass + 两套独立 Enc/VQ/Dec）')
+        print(f'  趋势码本大小: {cb_t}  |  残差码本大小: {cb_r}')
+        filter_mode = '可学习 (softmax 归一化)' if args.trend_learnable_filter else '固定移动平均'
+        print(f'  低通滤波核长度: {args.trend_kernel_size}  |  模式: {filter_mode}')
+    elif args.per_channel_codebook:
         model = PerChannelCodebookModel(config, dls.vars).to(device)
         print(f'\n模式: Per-Channel 码本（每通道独立 VQ，共 {dls.vars} 个码本）')
     else:
@@ -507,28 +699,57 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     
-    # 检查各层的可训练参数
-    encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-    encoder_total = sum(p.numel() for p in model.encoder.parameters())
-    decoder_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
-    decoder_total = sum(p.numel() for p in model.decoder.parameters())
-    
-    if args.per_channel_codebook:
-        vq_trainable = sum(p.numel() for vq in model.vqs for p in vq.parameters() if p.requires_grad)
-        vq_total = sum(p.numel() for vq in model.vqs for p in vq.parameters())
+    if use_tr:
+        # 趋势-残差双路参数
+        t_enc_total = sum(p.numel() for p in model.trend_encoder.parameters())
+        t_enc_trn = sum(p.numel() for p in model.trend_encoder.parameters() if p.requires_grad)
+        t_dec_total = sum(p.numel() for p in model.trend_decoder.parameters())
+        t_dec_trn = sum(p.numel() for p in model.trend_decoder.parameters() if p.requires_grad)
+        r_enc_total = sum(p.numel() for p in model.res_encoder.parameters())
+        r_enc_trn = sum(p.numel() for p in model.res_encoder.parameters() if p.requires_grad)
+        r_dec_total = sum(p.numel() for p in model.res_decoder.parameters())
+        r_dec_trn = sum(p.numel() for p in model.res_decoder.parameters() if p.requires_grad)
+        t_vq_total = sum(p.numel() for p in model.trend_vq.parameters())
+        t_vq_trn = sum(p.numel() for p in model.trend_vq.parameters() if p.requires_grad)
+        r_vq_total = sum(p.numel() for p in model.res_vq.parameters())
+        r_vq_trn = sum(p.numel() for p in model.res_vq.parameters() if p.requires_grad)
+        vq_total = t_vq_total + r_vq_total
+        vq_trainable = t_vq_trn + r_vq_trn
+
+        print(f'\n码本模型参数统计:')
+        print(f'  总参数: {total_params:,}')
+        print(f'  可训练参数: {trainable_params:,}')
+        print(f'  冻结参数: {frozen_params:,}')
+        print(f'  TrendEnc: {t_enc_total:,} (可训练: {t_enc_trn:,})  |  TrendDec: {t_dec_total:,} (可训练: {t_dec_trn:,})')
+        print(f'  ResEnc:   {r_enc_total:,} (可训练: {r_enc_trn:,})  |  ResDec:   {r_dec_total:,} (可训练: {r_dec_trn:,})')
+        print(f'  TrendVQ:  {t_vq_total:,} (可训练: {t_vq_trn:,})  |  ResVQ:    {r_vq_total:,} (可训练: {r_vq_trn:,})')
+        if model.sparse_net is not None:
+            sp_total = sum(p.numel() for p in model.sparse_net.parameters())
+            print(f'  SparseNet(作用于残差): {sp_total:,}')
+        print(f'  码本初始化方法: {args.vq_init_method}')
+        print(f'  使用EMA: {bool(args.codebook_ema)}')
     else:
-        vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
-        vq_total = sum(p.numel() for p in model.vq.parameters())
-    
-    print(f'\n码本模型参数统计:')
-    print(f'  总参数: {total_params:,}')
-    print(f'  可训练参数: {trainable_params:,}')
-    print(f'  冻结参数: {frozen_params:,}')
-    print(f'  Encoder: {encoder_total:,} (可训练: {encoder_trainable:,})')
-    print(f'  Decoder: {decoder_total:,} (可训练: {decoder_trainable:,})')
-    print(f'  VQ层: {vq_total:,} (可训练: {vq_trainable:,})')
-    print(f'  码本初始化方法: {args.vq_init_method}')
-    print(f'  使用EMA: {bool(args.codebook_ema)}')
+        encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+        encoder_total = sum(p.numel() for p in model.encoder.parameters())
+        decoder_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
+        decoder_total = sum(p.numel() for p in model.decoder.parameters())
+
+        if args.per_channel_codebook:
+            vq_trainable = sum(p.numel() for vq in model.vqs for p in vq.parameters() if p.requires_grad)
+            vq_total = sum(p.numel() for vq in model.vqs for p in vq.parameters())
+        else:
+            vq_trainable = sum(p.numel() for p in model.vq.parameters() if p.requires_grad)
+            vq_total = sum(p.numel() for p in model.vq.parameters())
+
+        print(f'\n码本模型参数统计:')
+        print(f'  总参数: {total_params:,}')
+        print(f'  可训练参数: {trainable_params:,}')
+        print(f'  冻结参数: {frozen_params:,}')
+        print(f'  Encoder: {encoder_total:,} (可训练: {encoder_trainable:,})')
+        print(f'  Decoder: {decoder_total:,} (可训练: {decoder_trainable:,})')
+        print(f'  VQ层: {vq_total:,} (可训练: {vq_trainable:,})')
+        print(f'  码本初始化方法: {args.vq_init_method}')
+        print(f'  使用EMA: {bool(args.codebook_ema)}')
     
     # 检查是否有可训练参数
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
@@ -563,80 +784,134 @@ def main():
     print('=' * 80)
     
     for epoch in range(args.n_epochs):
-        # 训练
-        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
-        scheduler.step()
-        
-        # 验证
-        val_metrics = validate_epoch(model, dls.valid, revin, args, device)
-        
+        # 训练 / 验证
+        if use_tr:
+            train_metrics = train_epoch_tr(model, dls.train, optimizer, revin, args, device, scaler)
+            scheduler.step()
+            val_metrics = validate_epoch_tr(model, dls.valid, revin, args, device)
+        else:
+            train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
+            scheduler.step()
+            val_metrics = validate_epoch(model, dls.valid, revin, args, device)
+
         train_losses.append(train_metrics['loss'])
         valid_losses.append(val_metrics['loss'])
         train_recon_losses.append(train_metrics['recon_loss'])
         valid_recon_losses.append(val_metrics['recon_loss'])
-        
-        # 打印进度
-        train_stats = train_metrics.get('codebook_stats', {})
-        val_stats = val_metrics.get('codebook_stats', {})
-        
-        print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
-              f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
-              f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
-              f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
 
-        # Robust VQVAE: 打印稀疏分量统计
-        if getattr(args, 'sparse_weight', 0.0) > 0:
-            print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
-                  f"Valid {val_metrics['sparse_norm']:.5f}")
-        
-        # 定期报告码本利用率（每5个epoch或每10个epoch）
-        report_interval = getattr(args, 'codebook_report_interval', 5)
-        if (epoch + 1) % report_interval == 0 or epoch == 0:
-            train_usage = train_stats.get('usage_rate', 0.0) * 100
-            val_usage = val_stats.get('usage_rate', 0.0) * 100
-            train_used = train_stats.get('num_used', 0)
-            val_used = val_stats.get('num_used', 0)
-            train_unused = train_stats.get('num_unused', 0)
-            val_unused = val_stats.get('num_unused', 0)
-            
-            print(f"  └─ 码本利用率(avg): Train {train_usage:.1f}% ({train_used:.0f}/{args.codebook_size}) | "
-                  f"Valid {val_usage:.1f}% ({val_used:.0f}/{args.codebook_size})")
+        if use_tr:
+            # 趋势-残差分解模式：分别打印两个码本指标
+            print(
+                f"Epoch {epoch+1:3d}/{args.n_epochs} | "
+                f"Train L:{train_metrics['loss']:.4f} "
+                f"(T-Rec:{train_metrics['trend_rec']:.4f} R-Rec:{train_metrics['res_rec']:.4f} "
+                f"T-VQ:{train_metrics['trend_vq']:.4f} R-VQ:{train_metrics['res_vq']:.4f} "
+                f"T-P:{train_metrics['trend_perp']:.3f} R-P:{train_metrics['res_perp']:.3f}) | "
+                f"Val L:{val_metrics['loss']:.4f} "
+                f"(T-Rec:{val_metrics['trend_rec']:.4f} R-Rec:{val_metrics['res_rec']:.4f} "
+                f"T-P:{val_metrics['trend_perp']:.3f} R-P:{val_metrics['res_perp']:.3f})"
+            )
+            if getattr(args, 'sparse_weight', 0.0) > 0:
+                print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
+                      f"Valid {val_metrics['sparse_norm']:.5f}")
 
-            # 多层 RVQ 时打印每层独立利用率
-            per_layer = train_stats.get('per_layer_usage', [])
-            if len(per_layer) > 1:
-                print(f"  └─ 各层利用率 (Train): {', '.join(per_layer)}")
+            report_interval = getattr(args, 'codebook_report_interval', 5)
+            if (epoch + 1) % report_interval == 0 or epoch == 0:
+                cb_t = args.codebook_size_trend or args.codebook_size
+                cb_r = args.codebook_size_res or args.codebook_size
+                ts = train_metrics['trend_codebook_stats']
+                rs = train_metrics['res_codebook_stats']
+                vts = val_metrics['trend_codebook_stats']
+                vrs = val_metrics['res_codebook_stats']
+                print(
+                    f"  └─ 趋势码本利用率: Train {ts['usage_rate']*100:.1f}% "
+                    f"({ts['num_used']}/{cb_t}) | Valid {vts['usage_rate']*100:.1f}% "
+                    f"({vts['num_used']}/{cb_t})"
+                )
+                print(
+                    f"  └─ 残差码本利用率: Train {rs['usage_rate']*100:.1f}% "
+                    f"({rs['num_used']}/{cb_r}) | Valid {vrs['usage_rate']*100:.1f}% "
+                    f"({vrs['num_used']}/{cb_r})"
+                )
+                if ts.get('top5_usage'):
+                    top5_t = ', '.join([f"#{i}({c})" for i, c in ts['top5_usage'][:5]])
+                    print(f"  └─ 趋势码本高频元素 (Train): {top5_t}")
+                if rs.get('top5_usage'):
+                    top5_r = ', '.join([f"#{i}({c})" for i, c in rs['top5_usage'][:5]])
+                    print(f"  └─ 残差码本高频元素 (Train): {top5_r}")
+        else:
+            train_stats = train_metrics.get('codebook_stats', {})
+            val_stats = val_metrics.get('codebook_stats', {})
 
-            if args.per_channel_codebook:
-                per_ch_train = train_stats.get('per_channel_usage', [])
-                per_ch_val   = val_stats.get('per_channel_usage', [])
-                if per_ch_train:
-                    ch_strs = [f"ch{c}:{u*100:.0f}%" for c, u in enumerate(per_ch_train)]
-                    print(f"  └─ 各通道利用率 (Train): {', '.join(ch_strs)}")
-            else:
-                # 显示最常用的码本元素（仅训练集）
-                if train_stats.get('top5_usage'):
-                    top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
-                    print(f"  └─ 最常用码本元素 (Train): {top5_str}")
-        
+            print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
+                  f"Train Loss: {train_metrics['loss']:.4f} (Recon: {train_metrics['recon_loss']:.4f}, "
+                  f"VQ: {train_metrics['vq_loss']:.4f}, Perplexity: {train_metrics['perplexity']:.3f}) | "
+                  f"Valid Loss: {val_metrics['loss']:.4f} (Recon: {val_metrics['recon_loss']:.4f}, "
+                  f"VQ: {val_metrics['vq_loss']:.4f}, Perplexity: {val_metrics['perplexity']:.3f})")
+
+            if getattr(args, 'sparse_weight', 0.0) > 0:
+                print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
+                      f"Valid {val_metrics['sparse_norm']:.5f}")
+
+            report_interval = getattr(args, 'codebook_report_interval', 5)
+            if (epoch + 1) % report_interval == 0 or epoch == 0:
+                train_usage = train_stats.get('usage_rate', 0.0) * 100
+                val_usage = val_stats.get('usage_rate', 0.0) * 100
+                train_used = train_stats.get('num_used', 0)
+                val_used = val_stats.get('num_used', 0)
+
+                print(f"  └─ 码本利用率(avg): Train {train_usage:.1f}% ({train_used:.0f}/{args.codebook_size}) | "
+                      f"Valid {val_usage:.1f}% ({val_used:.0f}/{args.codebook_size})")
+
+                per_layer = train_stats.get('per_layer_usage', [])
+                if len(per_layer) > 1:
+                    print(f"  └─ 各层利用率 (Train): {', '.join(per_layer)}")
+
+                if args.per_channel_codebook:
+                    per_ch_train = train_stats.get('per_channel_usage', [])
+                    if per_ch_train:
+                        ch_strs = [f"ch{c}:{u*100:.0f}%" for c, u in enumerate(per_ch_train)]
+                        print(f"  └─ 各通道利用率 (Train): {', '.join(ch_strs)}")
+                else:
+                    if train_stats.get('top5_usage'):
+                        top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
+                        print(f"  └─ 最常用码本元素 (Train): {top5_str}")
+
         # 基于val_loss保存最佳模型
-        if epoch >= 5:  # 前5个epoch不保存
+        if epoch >= 5:
             current_val_loss = val_metrics['loss']
-            
-            # 如果val_loss下降，保存模型
+
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
                 no_improve_count = 0
                 model_saved = True
-                
-                # 只保存encoder、decoder和vq的权重
-                if args.per_channel_codebook:
+
+                if use_tr:
+                    checkpoint = {
+                        # 整体 state_dict，键名形如 trend_encoder.*, trend_decoder.*,
+                        # trend_vq.*, res_encoder.*, res_decoder.*, res_vq.*, sparse_net.*
+                        'model_state_dict': model.state_dict(),
+                        'trend_encoder_state_dict': model.trend_encoder.state_dict(),
+                        'trend_decoder_state_dict': model.trend_decoder.state_dict(),
+                        'trend_vq_state_dict': model.trend_vq.state_dict(),
+                        'res_encoder_state_dict': model.res_encoder.state_dict(),
+                        'res_decoder_state_dict': model.res_decoder.state_dict(),
+                        'res_vq_state_dict': model.res_vq.state_dict(),
+                        'n_channels': dls.vars,
+                        'config': config,
+                        'args': vars(args),
+                        'epoch': epoch,
+                        'train_loss': train_metrics['loss'],
+                        'val_loss': val_metrics['loss'],
+                        'train_recon_loss': train_metrics['recon_loss'],
+                        'val_recon_loss': val_metrics['recon_loss'],
+                    }
+                    if model.sparse_net is not None:
+                        checkpoint['sparse_net_state_dict'] = model.sparse_net.state_dict()
+                elif args.per_channel_codebook:
                     checkpoint = {
                         'encoder_state_dict': model.encoder.state_dict(),
                         'decoder_state_dict': model.decoder.state_dict(),
-                        # model_state_dict 包含 vqs.0.*, vqs.1.*, ...
-                        # 可被 PatchVQVAETransformer.load_vqvae_weights() 直接加载
                         'model_state_dict': model.state_dict(),
                         'n_channels': dls.vars,
                         'config': config,

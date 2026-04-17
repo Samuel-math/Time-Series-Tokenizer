@@ -10,7 +10,7 @@ PerChannelCodebookModel — 每个通道拥有独立 VQ（nn.ModuleList self.vqs
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .vqvae import Encoder, Decoder, SparseNet
+from .vqvae import Encoder, Decoder, SparseNet, TrendExtractor
 from .patch_vqvae_transformer import (
     FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA, ResidualVQ,
 )
@@ -463,3 +463,339 @@ class PerChannelCodebookModel(nn.Module):
 
         x_recon = torch.stack(x_recon_list, dim=3)  # [B, num_patches, patch_size, C]
         return x_recon.reshape(B, -1, C)
+
+
+class TrendResidualCodebookModel(nn.Module):
+    """
+    基于低通滤波的趋势-残差分解双码本模型。
+
+    分解方式（确定性，不可学习）:
+        X_patch = X_trend + X_residual
+        X_trend   = LowPass(X_patch)       # 低通滤波（移动平均）
+        X_residual= X_patch - X_trend
+
+    两条独立支路，各自的 Encoder/Decoder 与 VQ 码本：
+        X_trend    ──→ Enc_T ──→ VQ_T ──→ Dec_T ──→ X_trend_hat
+        X_residual
+            ├── SparseNet → s            （L1 稀疏约束）
+            └── (X_residual − s) ─→ Enc_R ─→ VQ_R ─→ Dec_R ─→ r_clean_hat
+
+        X_hat = X_trend_hat + r_clean_hat + s
+
+    损失:
+        L_trend_rec = MSE(X_trend_hat, X_trend)
+        L_res_rec   = MSE(r_clean_hat + s, X_residual)
+        L_vq        = vq_loss_T + vq_loss_R
+        L_sparse    = λ · mean(|s|)
+
+    两个码本语义明确:
+        - Codebook_T : 低频趋势原子
+        - Codebook_R : 高频/振荡残差原子（稀疏异常已剥离）
+    """
+
+    def __init__(self, config, n_channels):
+        super().__init__()
+        self.patch_size = config['patch_size']
+        self.embedding_dim = config['embedding_dim']
+        self.compression_factor = config['compression_factor']
+        self.commitment_cost = config['commitment_cost']
+        self.compressed_len = self.patch_size // self.compression_factor
+        self.code_dim = self.embedding_dim * self.compressed_len
+        self.n_rq_layers = config.get('n_rq_layers', 1)
+        self.n_channels = n_channels
+
+        # 允许两个码本使用不同大小；缺省值回落到共享的 codebook_size
+        default_cb = config['codebook_size']
+        self.codebook_size_trend = int(config.get('codebook_size_trend') or default_cb)
+        self.codebook_size_res = int(config.get('codebook_size_res') or default_cb)
+
+        # 低通滤波器（learnable=False 固定 MA，无参数；learnable=True 可学习权重，
+        # 通过 softmax 归一化保持非负且和为 1 的低通性质）
+        self.trend_extractor = TrendExtractor(
+            kernel_size=int(config.get('trend_kernel_size', 5)),
+            learnable=bool(config.get('trend_learnable_filter', False)),
+        )
+
+        enc_kw = dict(
+            in_channels=1,
+            num_hiddens=config['num_hiddens'],
+            num_residual_layers=config['num_residual_layers'],
+            num_residual_hiddens=config['num_residual_hiddens'],
+            embedding_dim=self.embedding_dim,
+            compression_factor=self.compression_factor,
+        )
+        dec_kw = dict(
+            in_channels=self.embedding_dim,
+            num_hiddens=config['num_hiddens'],
+            num_residual_layers=config['num_residual_layers'],
+            num_residual_hiddens=config['num_residual_hiddens'],
+            compression_factor=self.compression_factor,
+            out_channels=1,
+        )
+
+        # 趋势支路
+        self.trend_encoder = Encoder(**enc_kw)
+        self.trend_decoder = Decoder(**dec_kw)
+        self.trend_vq = self._build_rvq(self.codebook_size_trend, config)
+
+        # 残差支路
+        self.res_encoder = Encoder(**enc_kw)
+        self.res_decoder = Decoder(**dec_kw)
+        self.res_vq = self._build_rvq(self.codebook_size_res, config)
+
+        # 稀疏噪声网络（作用于残差）
+        self.sparse_net: SparseNet | None = None
+        if config.get('sparse_weight', 0) > 0:
+            self.sparse_net = SparseNet(
+                patch_size=self.patch_size,
+                num_hiddens=config['num_hiddens'],
+                amplitude=config.get('sparse_amplitude', 0.5),
+            )
+
+    def _build_rvq(self, codebook_size, config):
+        init_method = config.get('vq_init_method', 'random')
+        cd = self.code_dim
+        cc = self.commitment_cost
+
+        def _make():
+            if config.get('codebook_ema', False):
+                return FlattenedVectorQuantizerEMA(
+                    codebook_size, cd, cc,
+                    decay=config.get('ema_decay', 0.99),
+                    eps=config.get('ema_eps', 1e-5),
+                    init_method=init_method,
+                )
+            return FlattenedVectorQuantizer(
+                codebook_size, cd, cc, init_method=init_method,
+            )
+        return ResidualVQ(self.n_rq_layers, _make)
+
+    # ------------------------------------------------------------------
+    # 内部单通道前向：返回该通道的所有中间量
+    # ------------------------------------------------------------------
+    def _forward_channel(self, x_c: torch.Tensor):
+        """
+        Args:
+            x_c: [N, 1, patch_size]
+        Returns:
+            dict: 该通道的所有输出与损失分量（标量 loss 为该通道平均）
+        """
+        N = x_c.size(0)
+
+        # 1. 趋势分解（低通滤波，无梯度）
+        x_trend = self.trend_extractor(x_c)          # [N, 1, P]
+        r = x_c - x_trend                            # [N, 1, P]
+
+        # 2. 趋势支路
+        z_t = self.trend_encoder(x_trend, self.compression_factor)
+        z_t_flat = z_t.reshape(N, self.code_dim)
+        t_vq_loss, z_qt, t_idx_layers = self.trend_vq(z_t_flat)
+        x_trend_hat = self.trend_decoder(
+            z_qt.reshape(N, self.embedding_dim, self.compressed_len),
+            self.compression_factor,
+        )                                            # [N, P]
+
+        # 3. 稀疏噪声（作用于残差）
+        if self.sparse_net is not None:
+            s = self.sparse_net(r)                   # [N, 1, P]
+            r_clean = r - s
+        else:
+            s = None
+            r_clean = r
+
+        # 4. 残差支路
+        z_r = self.res_encoder(r_clean, self.compression_factor)
+        z_r_flat = z_r.reshape(N, self.code_dim)
+        r_vq_loss, z_qr, r_idx_layers = self.res_vq(z_r_flat)
+        r_clean_hat = self.res_decoder(
+            z_qr.reshape(N, self.embedding_dim, self.compressed_len),
+            self.compression_factor,
+        )                                            # [N, P]
+
+        # 5. 损失分量
+        x_trend_2d = x_trend.squeeze(1)              # [N, P]
+        r_2d = r.squeeze(1)                          # [N, P]
+        trend_rec = F.mse_loss(x_trend_hat, x_trend_2d)
+        if s is not None:
+            s_2d = s.squeeze(1)                      # [N, P]
+            res_rec = F.mse_loss(r_clean_hat + s_2d, r_2d)
+            sparse_norm = s_2d.abs().mean()
+            x_hat = x_trend_hat + r_clean_hat + s_2d
+        else:
+            res_rec = F.mse_loss(r_clean_hat, r_2d)
+            sparse_norm = x_c.new_tensor(0.0)
+            x_hat = x_trend_hat + r_clean_hat
+
+        return {
+            'trend_rec': trend_rec,
+            'res_rec': res_rec,
+            'trend_vq': t_vq_loss,
+            'res_vq': r_vq_loss,
+            'sparse_norm': sparse_norm,
+            'x_hat': x_hat,                          # [N, P]
+            'z_qt': z_qt,                            # [N, code_dim]
+            'z_qr': z_qr,                            # [N, code_dim]
+            't_idx_layers': t_idx_layers,            # list of [N]
+            'r_idx_layers': r_idx_layers,            # list of [N]
+        }
+
+    # ------------------------------------------------------------------
+    # 统一前向接口（训练时使用）
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [B, T, C]
+        Returns:
+            dict:
+                trend_recon_loss, res_recon_loss  — 各通道平均
+                trend_vq_loss,    res_vq_loss
+                sparse_norm                         — 各通道平均 L1
+                trend_indices [B, P, C, n_rq]
+                res_indices   [B, P, C, n_rq]
+                z_q_trend     [B, P, C, code_dim]
+                z_q_res       [B, P, C, code_dim]
+                x_recon       [B, P*patch_size, C]
+        """
+        B, T, C = x.shape
+        P = T // self.patch_size
+        x = x[:, :P * self.patch_size, :]
+        x_patches = x.reshape(B, P, self.patch_size, C)
+
+        trend_rec = res_rec = trend_vq = res_vq = sparse_norm = x.new_tensor(0.0)
+        t_idx_all, r_idx_all = [], []
+        zqt_all, zqr_all = [], []
+        recon_channels = []
+
+        for c in range(C):
+            x_c = x_patches[:, :, :, c].reshape(B * P, self.patch_size).unsqueeze(1)
+            out = self._forward_channel(x_c)
+
+            trend_rec = trend_rec + out['trend_rec']
+            res_rec = res_rec + out['res_rec']
+            trend_vq = trend_vq + out['trend_vq']
+            res_vq = res_vq + out['res_vq']
+            sparse_norm = sparse_norm + out['sparse_norm']
+
+            recon_channels.append(out['x_hat'].reshape(B, P, self.patch_size))
+            t_idx_all.append(
+                torch.stack(out['t_idx_layers'], dim=1).reshape(B, P, self.n_rq_layers)
+            )
+            r_idx_all.append(
+                torch.stack(out['r_idx_layers'], dim=1).reshape(B, P, self.n_rq_layers)
+            )
+            zqt_all.append(out['z_qt'].reshape(B, P, self.code_dim))
+            zqr_all.append(out['z_qr'].reshape(B, P, self.code_dim))
+
+        x_recon = torch.stack(recon_channels, dim=3).reshape(B, -1, C)
+
+        return {
+            'trend_recon_loss': trend_rec / C,
+            'res_recon_loss': res_rec / C,
+            'trend_vq_loss': trend_vq / C,
+            'res_vq_loss': res_vq / C,
+            'sparse_norm': sparse_norm / C,
+            'trend_indices': torch.stack(t_idx_all, dim=2),
+            'res_indices': torch.stack(r_idx_all, dim=2),
+            'z_q_trend': torch.stack(zqt_all, dim=2),
+            'z_q_res': torch.stack(zqr_all, dim=2),
+            'x_recon': x_recon,
+        }
+
+    # ------------------------------------------------------------------
+    # 推理接口（返回两套码本索引与量化向量）
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def encode_to_indices(self, x: torch.Tensor):
+        """
+        Args:
+            x: [B, T, C]
+        Returns:
+            trend_indices [B, P, C, n_rq], res_indices [B, P, C, n_rq],
+            z_q_trend [B, P, C, code_dim], z_q_res [B, P, C, code_dim]
+        """
+        out = self.forward(x)
+        return (
+            out['trend_indices'], out['res_indices'],
+            out['z_q_trend'], out['z_q_res'],
+        )
+
+    def decode_from_codes(self, z_q_trend: torch.Tensor, z_q_res: torch.Tensor,
+                          s: torch.Tensor | None = None):
+        """
+        Args:
+            z_q_trend: [B, P, C, code_dim]
+            z_q_res:   [B, P, C, code_dim]
+            s:         [B, P*patch_size, C] 或 None（通常推理时不提供）
+        Returns:
+            x_recon: [B, P*patch_size, C]
+        """
+        B, P, C, _ = z_q_trend.shape
+        recon_channels = []
+        for c in range(C):
+            zqt = z_q_trend[:, :, c, :].reshape(B * P, self.embedding_dim, self.compressed_len)
+            zqr = z_q_res[:, :, c, :].reshape(B * P, self.embedding_dim, self.compressed_len)
+            x_trend_hat = self.trend_decoder(zqt, self.compression_factor)  # [B*P, P]
+            r_clean_hat = self.res_decoder(zqr, self.compression_factor)    # [B*P, P]
+            x_hat_c = x_trend_hat + r_clean_hat
+            recon_channels.append(x_hat_c.reshape(B, P, self.patch_size))
+
+        x_recon = torch.stack(recon_channels, dim=3).reshape(B, -1, C)
+        if s is not None:
+            recon_len = x_recon.shape[1]
+            x_recon = x_recon + s[:, :recon_len, :]
+        return x_recon
+
+    # ------------------------------------------------------------------
+    # 数据驱动码本初始化：两个码本分别收集
+    # ------------------------------------------------------------------
+    def init_codebook_from_data(self, dataloader, device, num_samples=10000,
+                                method='kmeans', revin=None):
+        """分别从趋势/残差 encoder 输出初始化两个码本。"""
+        self.eval()
+        z_trend_list, z_res_list = [], []
+        n_t = n_r = 0
+
+        print(f"\n收集 trend/res encoder 输出用于码本初始化（目标样本数: {num_samples}）...")
+        with torch.no_grad():
+            for batch_x, _ in dataloader:
+                if n_t >= num_samples and n_r >= num_samples:
+                    break
+                batch_x = batch_x.to(device)
+                if revin is not None:
+                    batch_x = revin(batch_x, 'norm')
+
+                B, T, C = batch_x.shape
+                P = T // self.patch_size
+                x = batch_x[:, :P * self.patch_size, :]
+                x_patches = x.reshape(B, P, self.patch_size, C)
+
+                for c in range(C):
+                    x_c = x_patches[:, :, :, c].reshape(B * P, self.patch_size).unsqueeze(1)
+                    x_trend = self.trend_extractor(x_c)
+                    r = x_c - x_trend
+                    if self.sparse_net is not None:
+                        r = r - self.sparse_net(r)
+
+                    if n_t < num_samples:
+                        zt = self.trend_encoder(x_trend, self.compression_factor)
+                        z_trend_list.append(zt.reshape(B * P, -1).cpu())
+                        n_t += zt.size(0)
+                    if n_r < num_samples:
+                        zr = self.res_encoder(r, self.compression_factor)
+                        z_res_list.append(zr.reshape(B * P, -1).cpu())
+                        n_r += zr.size(0)
+
+                    if n_t >= num_samples and n_r >= num_samples:
+                        break
+
+        if z_trend_list:
+            zt_all = torch.cat(z_trend_list, dim=0)[:num_samples].to(device)
+            print(f"  趋势码本初始化: {zt_all.size(0)} 个样本")
+            self.trend_vq.init_from_data(zt_all, method=method)
+        if z_res_list:
+            zr_all = torch.cat(z_res_list, dim=0)[:num_samples].to(device)
+            print(f"  残差码本初始化: {zr_all.size(0)} 个样本")
+            self.res_vq.init_from_data(zr_all, method=method)
+
+        self.train()
