@@ -16,24 +16,18 @@
 # =====================================================
 # 输入参数检验
 # =====================================================
-if [ $# -lt 3 ]; then
-    echo "错误: 需要3个参数"
-    echo "用法: bash $(basename $0) <dataset> <context_points> <progressive_step_size>"
-    echo "例如: bash $(basename $0) ettm1 1152 6"
-    exit 1
-fi
 
-DSET=$1
-PRETRAIN_CONTEXT_POINTS=$2
-PROGRESSIVE_STEP_SIZE=$3
-MODEL_ID=101
+DSET=ettm1
+PRETRAIN_CONTEXT_POINTS=1256
+PROGRESSIVE_STEP_SIZE=6
+MODEL_ID=1
 
 # =====================================================
 # Patch / VQVAE 参数（自动从 checkpoint 读取，这里作为备用）
 # =====================================================
 PATCH_SIZE=16
 COMPRESSION_FACTOR=8
-EMBEDDING_DIM=32
+EMBEDDING_DIM=64
 CODEBOOK_SIZE=256
 NUM_HIDDENS=64
 NUM_RESIDUAL_LAYERS=2
@@ -52,9 +46,7 @@ PER_CHANNEL_CODEBOOK=0
 # 2 = 2层残差 VQ（需与 vqvae-only 训练时保持一致）
 # =====================================================
 N_RQ_LAYERS=2
-# 各 RVQ 层 pred_loss 权重（空字符串 = 均等权重）
-# 例：第0层权重1.0，第1层权重0.5 → RQ_LAYER_WEIGHTS="1.0 0.5"
-RQ_LAYER_WEIGHTS=""
+RQ_LAYER_WEIGHTS="1.0 0.3"
 
 # =====================================================
 # NMPP 模式（Next Masked Patch Prediction with Raw Input）
@@ -99,7 +91,7 @@ TRANSFORMER_HIDDEN_DIM=""   # 留空表示使用 code_dim（不额外升维）
 # 预训练参数
 # =====================================================
 PRETRAIN_EPOCHS=100
-PRETRAIN_BATCH_SIZE=128
+PRETRAIN_BATCH_SIZE=64
 PRETRAIN_LR=3e-4
 VQ_WEIGHT=0.0       # 码本已冻结，设为 0
 RECON_WEIGHT=0.0    # 码本已冻结，设为 0
@@ -111,12 +103,12 @@ DISABLE_EMA_UPDATE=1
 FINETUNE_CONTEXT_POINTS=512
 FINETUNE_EPOCHS=50
 FINETUNE_BATCH_SIZE=64
-FINETUNE_LR=1e-4
+FINETUNE_LR=3e-4
 TARGET_POINTS_LIST=(96 192 336 720)
 
 # Gumbel-Softmax（微调阶段的码本查找）
 USE_GUMBEL_SOFTMAX=1
-GUMBEL_TEMPERATURE=1.4
+GUMBEL_TEMPERATURE=1.5
 GUMBEL_HARD=0
 
 # 自回归步长（留空 = 继承预训练 step_size；0 = 非自回归）

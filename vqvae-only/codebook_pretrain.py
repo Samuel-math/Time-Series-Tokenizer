@@ -92,6 +92,11 @@ def parse_args():
     parser.add_argument('--n_rq_layers', type=int, default=1,
                         help='残差向量量化层数（1=普通VQ，2=2层RVQ，以此类推）')
 
+    # 早停时的码本利用率门控
+    parser.add_argument('--codebook_usage_threshold', type=float, default=0.8,
+                        help='早停额外门控：只有当各码本层利用率均 >= 此阈值时才允许触发早停'
+                             '（默认 0.8 = 80%%；设为 0 关闭门控）')
+
     # Robust VQVAE: 稀疏分量
     parser.add_argument('--sparse_weight', type=float, default=0.0,
                         help='稀疏分量 L1 惩罚权重 λ（0=不启用 Robust 分解，建议初始值 0.01）')
@@ -167,6 +172,7 @@ def compute_codebook_usage_stats(indices, codebook_size):
         'top5_usage': top5_usage,
         'total_tokens': indices.numel(),
         'per_layer_usage': per_layer_usage,
+        'per_layer_usage_raw': all_usages,   # List[float]，供早停门控使用
     }
 
 
@@ -672,7 +678,6 @@ def main():
     train_recon_losses, valid_recon_losses = [], []  # 记录recon_loss历史
     no_improve_count = 0
     early_stop_patience = 10
-    model_saved = False
     
     print(f'\n开始码本预训练，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
     print('=' * 80)
@@ -751,54 +756,46 @@ def main():
                     top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
                     print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
-        # 基于val_loss保存最佳模型
-        if epoch >= 5:  # 前5个epoch不保存
+        # 保存 & 早停：val_loss 下降 + 各码本利用率均 ≥ threshold 才生效
+        if epoch >= 5:
+            thr = float(getattr(args, 'codebook_usage_threshold', 0.8))
             current_val_loss = val_metrics['loss']
-            
-            # 如果val_loss下降，保存模型
+            cb_stats = val_metrics.get('codebook_stats', {})
+            usages = (cb_stats.get('per_channel_usage', []) if args.per_channel_codebook
+                      else cb_stats.get('per_layer_usage_raw', [cb_stats.get('usage_rate', 0.0)]))
+            usage_str = ', '.join(f'{u*100:.1f}%' for u in usages)
+            gate_ok = thr <= 0 or (len(usages) > 0 and all(u >= thr for u in usages))
+
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
                 no_improve_count = 0
-                model_saved = True
-                
-                # 只保存encoder、decoder和vq的权重
-                if args.per_channel_codebook:
-                    checkpoint = {
+                if gate_ok:
+                    ckpt = {
+                        'config': config, 'args': vars(args), 'epoch': epoch,
+                        'train_loss': train_metrics['loss'], 'val_loss': current_val_loss,
+                        'train_recon_loss': train_metrics['recon_loss'],
+                        'val_recon_loss':   val_metrics['recon_loss'],
                         'encoder_state_dict': model.encoder.state_dict(),
                         'decoder_state_dict': model.decoder.state_dict(),
-                        # model_state_dict 包含 vqs.0.*, vqs.1.*, ...
-                        # 可被 PatchVQVAETransformer.load_vqvae_weights() 直接加载
-                        'model_state_dict': model.state_dict(),
-                        'n_channels': dls.vars,
-                        'config': config,
-                        'args': vars(args),
-                        'epoch': epoch,
-                        'train_loss': train_metrics['loss'],
-                        'val_loss': val_metrics['loss'],
-                        'train_recon_loss': train_metrics['recon_loss'],
-                        'val_recon_loss': val_metrics['recon_loss'],
+                        **(({'model_state_dict': model.state_dict(), 'n_channels': dls.vars})
+                           if args.per_channel_codebook else
+                           ({'vq_state_dict': model.vq.state_dict()})),
                     }
+                    torch.save(ckpt, save_dir / f'{model_name}.pth')
+                    print(f"  -> Best model saved (val_loss: {current_val_loss:.4f})")
                 else:
-                    checkpoint = {
-                        'encoder_state_dict': model.encoder.state_dict(),
-                        'decoder_state_dict': model.decoder.state_dict(),
-                        'vq_state_dict': model.vq.state_dict(),
-                        'config': config,
-                        'args': vars(args),
-                        'epoch': epoch,
-                        'train_loss': train_metrics['loss'],
-                        'val_loss': val_metrics['loss'],
-                        'train_recon_loss': train_metrics['recon_loss'],
-                        'val_recon_loss': val_metrics['recon_loss'],
-                    }
-                torch.save(checkpoint, save_dir / f'{model_name}.pth')
-                print(f"  -> Best model saved (val_loss: {val_metrics['loss']:.4f})")
+                    print(f"  [跳过保存] val_loss↓{current_val_loss:.4f}，"
+                          f"码本利用率 [{usage_str}] 未全部达到 {thr*100:.0f}%")
             else:
-                # val_loss不再下降，不再保存模型
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
-                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
-                    break
+                    if gate_ok:
+                        print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降"
+                              f"，各码本利用率均 ≥ {thr*100:.0f}% [{usage_str}]")
+                        break
+                    else:
+                        print(f"  [早停暂缓] val_loss 已连续 {no_improve_count} 个 epoch 未下降，"
+                              f"码本利用率 [{usage_str}] 未全部达到 {thr*100:.0f}%，继续训练")
     
     # 保存训练历史
     actual_epochs = len(train_losses)
