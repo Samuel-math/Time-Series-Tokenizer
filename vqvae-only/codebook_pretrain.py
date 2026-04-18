@@ -23,6 +23,9 @@ import random
 # 添加根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.models.codebook_model import CodebookModel, PerChannelCodebookModel
+from src.models.frequency_order import (
+    compute_per_layer_deltas, compute_frequency_order_loss,
+)
 from src.models.layers.revin import RevIN
 from src.basics import set_device
 from datautils import get_dls
@@ -94,6 +97,14 @@ def parse_args():
                         help='稀疏分量 L1 惩罚权重 λ（0=不启用 Robust 分解，建议初始值 0.01）')
     parser.add_argument('--sparse_amplitude', type=float, default=0.5,
                         help='SparseNet tanh 振幅上界（限制 s 的最大绝对值，建议 0.3~1.0）')
+
+    # 频率分工正则（soft 主频 + 平滑排序损失）
+    parser.add_argument('--lambda_ord', type=float, default=0.0,
+                        help='频率排序损失权重 λ_ord（0=关闭；多层 RVQ 时建议 0.01~0.1）')
+    parser.add_argument('--order_tau_f', type=float, default=1.0,
+                        help='soft peak pooling 的 softmax 温度 τ_f（越小越接近 hard peak）')
+    parser.add_argument('--order_eps', type=float, default=1e-6,
+                        help='能量归一化 eps，避免低能量层频率分数不稳定')
 
     return parser.parse_args()
 
@@ -207,6 +218,12 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     total_recon_loss = 0
     total_perplexity = 0
     total_sparse_norm = 0
+    total_order_loss = 0
+    # 频率分工正则：累计每层 g_l（按层分列），以 epoch 末打印
+    lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
+    use_order = lambda_ord > 0 and int(getattr(args, 'n_rq_layers', 1)) >= 2
+    per_layer_g_sum = None  # List[L] of float, lazily init
+    per_layer_gap_sum = None  # List[L-1] of float
     n_batches = 0
     
     # 用于累积码本使用统计
@@ -221,12 +238,32 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             batch_x = revin(batch_x, 'norm')
         
         # 编码和解码（只训练encoder、vq、decoder）
-        if use_sparse:
+        # 只在需要频率分工正则时额外返回 per_layer_z_q，开销可控
+        if use_sparse and use_order:
+            indices, vq_loss, z_q, s, per_layer_z_q = model.encode_to_indices(
+                batch_x, return_sparse=True, return_per_layer=True)
+        elif use_sparse:
             indices, vq_loss, z_q, s = model.encode_to_indices(batch_x, return_sparse=True)
+            per_layer_z_q = None
+        elif use_order:
+            indices, vq_loss, z_q, per_layer_z_q = model.encode_to_indices(
+                batch_x, return_per_layer=True)
+            s = None
         else:
             indices, vq_loss, z_q = model.encode_to_indices(batch_x)
-            s = None
-        x_recon = model.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
+            s, per_layer_z_q = None, None
+
+        # Decoder 前向：若启用频率分工正则，一次批处理同时产出 x_recon 和每层 Δr^(l)
+        # 否则走原始的单次重构解码，保持旧行为
+        if use_order and per_layer_z_q is not None:
+            delta_r_list, x_recon = compute_per_layer_deltas(
+                per_layer_z_q,
+                decode_fn=model.decode_from_codes,
+                return_recon=True,
+            )
+        else:
+            delta_r_list = None
+            x_recon = model.decode_from_codes(z_q)
         if s is not None:
             recon_len = x_recon.shape[1]
             x_recon = x_recon + s[:, :recon_len, :]  # add sparse component back
@@ -245,6 +282,25 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             sparse_norm = torch.tensor(0.0)
             # 总损失
             loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+
+        # 频率分工正则（soft 主频 + 平滑排序损失）
+        if use_order and delta_r_list is not None:
+            order_loss, g_list, gap_list = compute_frequency_order_loss(
+                delta_r_list,
+                tau_f=float(args.order_tau_f),
+                eps=float(args.order_eps),
+            )
+            loss = loss + lambda_ord * order_loss
+
+            # 累计 g_l / gap（用于 epoch 末平均打印）
+            if per_layer_g_sum is None:
+                per_layer_g_sum = [0.0] * len(g_list)
+                per_layer_gap_sum = [0.0] * len(gap_list)
+            for li, g in enumerate(g_list):
+                per_layer_g_sum[li] += float(g.detach())
+            for li, gap in enumerate(gap_list):
+                per_layer_gap_sum[li] += float(gap.detach())
+            total_order_loss += float(order_loss.detach())
         
         # 反向传播（只对可训练参数）
         optimizer.zero_grad()
@@ -289,12 +345,24 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     else:
         codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
     
+    per_layer_g = (
+        [v / n_batches for v in per_layer_g_sum]
+        if per_layer_g_sum is not None and n_batches > 0 else []
+    )
+    per_layer_gap = (
+        [v / n_batches for v in per_layer_gap_sum]
+        if per_layer_gap_sum is not None and n_batches > 0 else []
+    )
+
     return {
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
+        'order_loss': total_order_loss / n_batches if n_batches > 0 else 0.0,
+        'per_layer_g': per_layer_g,
+        'per_layer_gap': per_layer_gap,
         'codebook_stats': codebook_stats,
     }
 
@@ -307,6 +375,11 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_recon_loss = 0
     total_perplexity = 0
     total_sparse_norm = 0
+    total_order_loss = 0
+    lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
+    use_order = lambda_ord > 0 and int(getattr(args, 'n_rq_layers', 1)) >= 2
+    per_layer_g_sum = None
+    per_layer_gap_sum = None
     n_batches = 0
     
     # 用于累积码本使用统计
@@ -322,12 +395,30 @@ def validate_epoch(model, dataloader, revin, args, device):
                 batch_x = revin(batch_x, 'norm')
             
             # 编码和解码
-            if use_sparse:
+            if use_sparse and use_order:
+                indices, vq_loss, z_q, s, per_layer_z_q = model.encode_to_indices(
+                    batch_x, return_sparse=True, return_per_layer=True)
+            elif use_sparse:
                 indices, vq_loss, z_q, s = model.encode_to_indices(batch_x, return_sparse=True)
+                per_layer_z_q = None
+            elif use_order:
+                indices, vq_loss, z_q, per_layer_z_q = model.encode_to_indices(
+                    batch_x, return_per_layer=True)
+                s = None
             else:
                 indices, vq_loss, z_q = model.encode_to_indices(batch_x)
-                s = None
-            x_recon = model.decode_from_codes(z_q)  # [B, num_patches * patch_size, C]
+                s, per_layer_z_q = None, None
+
+            # Decoder 前向：共享一次批处理解码
+            if use_order and per_layer_z_q is not None:
+                delta_r_list, x_recon = compute_per_layer_deltas(
+                    per_layer_z_q,
+                    decode_fn=model.decode_from_codes,
+                    return_recon=True,
+                )
+            else:
+                delta_r_list = None
+                x_recon = model.decode_from_codes(z_q)
             if s is not None:
                 recon_len = x_recon.shape[1]
                 x_recon = x_recon + s[:, :recon_len, :]
@@ -345,6 +436,23 @@ def validate_epoch(model, dataloader, revin, args, device):
                 sparse_norm = torch.tensor(0.0)
                 # 总损失
                 loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
+
+            # 频率分工正则（验证期不反向传播，仅记录）
+            if use_order and delta_r_list is not None:
+                order_loss, g_list, gap_list = compute_frequency_order_loss(
+                    delta_r_list,
+                    tau_f=float(args.order_tau_f),
+                    eps=float(args.order_eps),
+                )
+                loss = loss + lambda_ord * order_loss
+                if per_layer_g_sum is None:
+                    per_layer_g_sum = [0.0] * len(g_list)
+                    per_layer_gap_sum = [0.0] * len(gap_list)
+                for li, g in enumerate(g_list):
+                    per_layer_g_sum[li] += float(g)
+                for li, gap in enumerate(gap_list):
+                    per_layer_gap_sum[li] += float(gap)
+                total_order_loss += float(order_loss)
             
             # 计算 perplexity
             if per_channel:
@@ -374,12 +482,24 @@ def validate_epoch(model, dataloader, revin, args, device):
     else:
         codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
     
+    per_layer_g = (
+        [v / n_batches for v in per_layer_g_sum]
+        if per_layer_g_sum is not None and n_batches > 0 else []
+    )
+    per_layer_gap = (
+        [v / n_batches for v in per_layer_gap_sum]
+        if per_layer_gap_sum is not None and n_batches > 0 else []
+    )
+
     return {
         'loss': total_loss / n_batches if n_batches > 0 else 0.0,
         'vq_loss': total_vq_loss / n_batches if n_batches > 0 else 0.0,
         'recon_loss': total_recon_loss / n_batches if n_batches > 0 else 0.0,
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
+        'order_loss': total_order_loss / n_batches if n_batches > 0 else 0.0,
+        'per_layer_g': per_layer_g,
+        'per_layer_gap': per_layer_gap,
         'codebook_stats': codebook_stats,
     }
 
@@ -589,6 +709,22 @@ def main():
         if getattr(args, 'sparse_weight', 0.0) > 0:
             print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
                   f"Valid {val_metrics['sparse_norm']:.5f}")
+
+        # 频率分工正则日志：每层 g_l、相邻层 gap、L_order
+        if float(getattr(args, 'lambda_ord', 0.0)) > 0 and train_metrics.get('per_layer_g'):
+            tg = train_metrics['per_layer_g']
+            vg = val_metrics.get('per_layer_g', [])
+            g_train = ', '.join([f"g{l+1}={v:.4f}" for l, v in enumerate(tg)])
+            g_valid = ', '.join([f"g{l+1}={v:.4f}" for l, v in enumerate(vg)])
+            print(f"  └─ FreqOrder: L_order Train {train_metrics['order_loss']:.5f} | "
+                  f"Valid {val_metrics['order_loss']:.5f}")
+            print(f"      Train: {g_train}")
+            if vg:
+                print(f"      Valid: {g_valid}")
+            gaps = train_metrics.get('per_layer_gap', [])
+            if gaps:
+                gap_str = ', '.join([f"Δg{l+1}->{l+2}={v:+.4f}" for l, v in enumerate(gaps)])
+                print(f"      Gap(Train): {gap_str}")
         
         # 定期报告码本利用率（每5个epoch或每10个epoch）
         report_interval = getattr(args, 'codebook_report_interval', 5)

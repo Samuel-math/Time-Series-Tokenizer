@@ -156,18 +156,22 @@ class CodebookModel(nn.Module):
         
         self.train()  # 恢复训练模式
     
-    def encode_to_indices(self, x, return_distances=False, return_sparse=False):
+    def encode_to_indices(self, x, return_distances=False, return_sparse=False,
+                          return_per_layer=False):
         """
         Args:
             x: [B, T, C]
             return_distances: 是否返回到码本第 0 层的距离（用于软索引计算）
             return_sparse: 是否返回稀疏分量 s [B, num_patches*patch_size, C]
+            return_per_layer: 是否返回 per_layer_z_q: List[L] of [B, num_patches, C, code_dim]
+                             （用于频率分工正则等需要 per-layer 量化向量的场景）
         Returns:
             indices: [B, num_patches, C, n_rq_layers]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
             distances (optional)
             s_tensor (optional): [B, num_patches*patch_size, C] or None
+            per_layer_z_q (optional): List[L] of [B, num_patches, C, code_dim]
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
@@ -188,6 +192,8 @@ class CodebookModel(nn.Module):
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
 
         indices_list, z_q_list, distances_list = [], [], []
+        # per_layer_per_channel[c] = List[L] of [B, num_patches, code_dim]
+        per_layer_per_channel = [] if return_per_layer else None
         vq_loss_sum = 0
 
         for c in range(C):
@@ -202,7 +208,15 @@ class CodebookModel(nn.Module):
                 )
                 distances_list.append(distances_c)
 
-            vq_loss_c, z_q_sum_c, all_idx_c = self.vq(z_c_flat)
+            if return_per_layer:
+                vq_loss_c, z_q_sum_c, all_idx_c, per_layer_c = self.vq(
+                    z_c_flat, return_per_layer=True
+                )
+                per_layer_per_channel.append([
+                    zl.reshape(B, num_patches, self.code_dim) for zl in per_layer_c
+                ])
+            else:
+                vq_loss_c, z_q_sum_c, all_idx_c = self.vq(z_c_flat)
             vq_loss_sum += vq_loss_c
 
             # [B*num_patches, n_rq_layers] → [B, num_patches, n_rq_layers]
@@ -216,6 +230,17 @@ class CodebookModel(nn.Module):
         z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C
 
+        # 组装 per-layer z_q: List[L] of [B, num_patches, C, code_dim]
+        if return_per_layer:
+            per_layer_z_q = []
+            for l in range(self.n_rq_layers):
+                # stack across channels → [B, num_patches, C, code_dim]
+                per_layer_z_q.append(torch.stack(
+                    [per_layer_per_channel[c][l] for c in range(C)], dim=2
+                ))
+        else:
+            per_layer_z_q = None
+
         # 组装稀疏分量张量
         if return_sparse:
             if s_list:
@@ -223,14 +248,24 @@ class CodebookModel(nn.Module):
                 s_tensor = s_tensor.reshape(B, -1, C)   # [B, num_patches*patch_size, C]
             else:
                 s_tensor = None
+            if return_distances and return_per_layer:
+                distances = torch.cat(distances_list, dim=0)
+                return indices, vq_loss, z_q, distances, s_tensor, per_layer_z_q
             if return_distances:
                 distances = torch.cat(distances_list, dim=0)
                 return indices, vq_loss, z_q, distances, s_tensor
+            if return_per_layer:
+                return indices, vq_loss, z_q, s_tensor, per_layer_z_q
             return indices, vq_loss, z_q, s_tensor
 
+        if return_distances and return_per_layer:
+            distances = torch.cat(distances_list, dim=0)
+            return indices, vq_loss, z_q, distances, per_layer_z_q
         if return_distances:
             distances = torch.cat(distances_list, dim=0)
             return indices, vq_loss, z_q, distances
+        if return_per_layer:
+            return indices, vq_loss, z_q, per_layer_z_q
 
         return indices, vq_loss, z_q
     
@@ -395,16 +430,18 @@ class PerChannelCodebookModel(nn.Module):
     # 前向接口（与 CodebookModel 完全相同，方便 train_epoch 复用）
     # ------------------------------------------------------------------
 
-    def encode_to_indices(self, x, return_sparse=False):
+    def encode_to_indices(self, x, return_sparse=False, return_per_layer=False):
         """
         Args:
             x: [B, T, C]
             return_sparse: 是否返回稀疏分量 s [B, num_patches*patch_size, C]
+            return_per_layer: 是否返回 per_layer_z_q: List[L] of [B, num_patches, C, code_dim]
         Returns:
             indices: [B, num_patches, C, n_rq_layers]
             vq_loss: scalar
             z_q: [B, num_patches, C, code_dim]
-            s_tensor (optional): [B, num_patches*patch_size, C] or None
+            s_tensor (optional)
+            per_layer_z_q (optional)
         """
         B, T, C = x.shape
         num_patches = T // self.patch_size
@@ -424,10 +461,19 @@ class PerChannelCodebookModel(nn.Module):
         z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
 
         indices_list, z_q_list = [], []
+        per_layer_per_channel = [] if return_per_layer else None
         vq_loss_sum = 0.0
         for c in range(C):
             z_c_flat = z_all[:, :, c, :].reshape(B * num_patches, self.code_dim)
-            vq_loss_c, z_q_sum_c, all_idx_c = self.vqs[c](z_c_flat)
+            if return_per_layer:
+                vq_loss_c, z_q_sum_c, all_idx_c, per_layer_c = self.vqs[c](
+                    z_c_flat, return_per_layer=True
+                )
+                per_layer_per_channel.append([
+                    zl.reshape(B, num_patches, self.code_dim) for zl in per_layer_c
+                ])
+            else:
+                vq_loss_c, z_q_sum_c, all_idx_c = self.vqs[c](z_c_flat)
             vq_loss_sum += vq_loss_c
             indices_c = torch.stack(all_idx_c, dim=1).reshape(B, num_patches, self.n_rq_layers)
             indices_list.append(indices_c)
@@ -437,14 +483,26 @@ class PerChannelCodebookModel(nn.Module):
         z_q = torch.stack(z_q_list, dim=2)          # [B, num_patches, C, code_dim]
         vq_loss = vq_loss_sum / C
 
+        if return_per_layer:
+            per_layer_z_q = [
+                torch.stack([per_layer_per_channel[c][l] for c in range(C)], dim=2)
+                for l in range(self.n_rq_layers)
+            ]
+        else:
+            per_layer_z_q = None
+
         if return_sparse:
             if s_list:
                 s_tensor = torch.stack(s_list, dim=3)  # [B, num_patches, patch_size, C]
                 s_tensor = s_tensor.reshape(B, -1, C)
             else:
                 s_tensor = None
+            if return_per_layer:
+                return indices, vq_loss, z_q, s_tensor, per_layer_z_q
             return indices, vq_loss, z_q, s_tensor
 
+        if return_per_layer:
+            return indices, vq_loss, z_q, per_layer_z_q
         return indices, vq_loss, z_q
 
     def decode_from_codes(self, z_q):

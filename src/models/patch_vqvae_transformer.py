@@ -251,19 +251,22 @@ class ResidualVQ(nn.Module):
     def embedding(self):
         return self.layers[0].embedding
 
-    def forward(self, z_flat):
+    def forward(self, z_flat, return_per_layer=False):
         """
         Args:
             z_flat: [N, code_dim]
+            return_per_layer: 若为 True，额外返回 per_layer_z_q: List[L] of [N, code_dim]
         Returns:
             total_loss: scalar
             z_q_sum: [N, code_dim]  各层量化之和
             all_indices: List[[N]]  每层的索引
+            per_layer_z_q (optional): List[L] of [N, code_dim]，每层单独输出的量化向量
         """
         residual = z_flat
         z_q_sum = torch.zeros_like(z_flat)
         total_loss = z_flat.new_tensor(0.0)
         all_indices = []
+        per_layer_z_q = [] if return_per_layer else None
 
         for vq in self.layers:
             loss, z_q, idx = vq(residual)
@@ -271,7 +274,11 @@ class ResidualVQ(nn.Module):
             z_q_sum = z_q_sum + z_q
             total_loss = total_loss + loss
             all_indices.append(idx)
+            if return_per_layer:
+                per_layer_z_q.append(z_q)
 
+        if return_per_layer:
+            return total_loss, z_q_sum, all_indices, per_layer_z_q
         return total_loss, z_q_sum, all_indices
 
     def get_embedding(self, indices_list):
