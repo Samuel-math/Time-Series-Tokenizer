@@ -24,7 +24,7 @@ import random
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.models.codebook_model import CodebookModel, PerChannelCodebookModel
 from src.models.frequency_order import (
-    compute_per_layer_deltas, compute_frequency_order_loss,
+    decode_per_layer, compute_frequency_order_loss,
 )
 from src.models.layers.revin import RevIN
 from src.basics import set_device
@@ -219,33 +219,35 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     total_perplexity = 0
     total_sparse_norm = 0
     total_order_loss = 0
-    # 频率分工正则：累计每层 g_l（按层分列），以 epoch 末打印
     lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
-    use_order = lambda_ord > 0 and int(getattr(args, 'n_rq_layers', 1)) >= 2
-    per_layer_g_sum = None  # List[L] of float, lazily init
+    # per-layer decode：只要 n_rq_layers >= 2 就启用；
+    # 重构 = X_1 + X_2 + ... + X_L（各层分别解码后叠加）
+    use_per_layer = int(getattr(args, 'n_rq_layers', 1)) >= 2
+    use_order = lambda_ord > 0 and use_per_layer
+    per_layer_g_sum = None   # lazily init: List[L] of float
     per_layer_gap_sum = None  # List[L-1] of float
     n_batches = 0
-    
-    # 用于累积码本使用统计
+
     all_indices_list = []
     per_channel = bool(args.per_channel_codebook)
     use_sparse = getattr(args, 'sparse_weight', 0.0) > 0
-    
+
     for batch_x, _ in dataloader:
         batch_x = batch_x.to(device)  # [B, T, C]
-        
+
         if revin:
             batch_x = revin(batch_x, 'norm')
-        
-        # 编码和解码（只训练encoder、vq、decoder）
-        # 只在需要频率分工正则时额外返回 per_layer_z_q，开销可控
-        if use_sparse and use_order:
+
+        # ── 编码 ──────────────────────────────────────────────────────────
+        # use_per_layer=True 时额外返回每层量化向量 per_layer_z_q，
+        # 用于后续分层解码；use_per_layer=False 时走标准路径。
+        if use_sparse and use_per_layer:
             indices, vq_loss, z_q, s, per_layer_z_q = model.encode_to_indices(
                 batch_x, return_sparse=True, return_per_layer=True)
         elif use_sparse:
             indices, vq_loss, z_q, s = model.encode_to_indices(batch_x, return_sparse=True)
             per_layer_z_q = None
-        elif use_order:
+        elif use_per_layer:
             indices, vq_loss, z_q, per_layer_z_q = model.encode_to_indices(
                 batch_x, return_per_layer=True)
             s = None
@@ -253,46 +255,47 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             indices, vq_loss, z_q = model.encode_to_indices(batch_x)
             s, per_layer_z_q = None, None
 
-        # Decoder 前向：若启用频率分工正则，一次批处理同时产出 x_recon 和每层 Δr^(l)
-        # 否则走原始的单次重构解码，保持旧行为
-        if use_order and per_layer_z_q is not None:
-            delta_r_list, x_recon = compute_per_layer_deltas(
-                per_layer_z_q,
-                decode_fn=model.decode_from_codes,
-                return_recon=True,
-            )
+        # ── 解码 ──────────────────────────────────────────────────────────
+        # 多层 RVQ：把 [z_q^(1), ..., z_q^(L)] 堆成大 batch，一次 Decoder 前向
+        #   x_components[l] = Decoder(z_q^(l))   每层单独的时间域分量
+        #   x_recon          = X_1 + X_2 + ...    叠加作为 VQ 重构结果
+        # 单层 VQ / 兜底：标准 decode_from_codes
+        if use_per_layer and per_layer_z_q is not None:
+            x_components, x_recon = decode_per_layer(
+                per_layer_z_q, model.decode_from_codes)
         else:
-            delta_r_list = None
+            x_components = None
             x_recon = model.decode_from_codes(z_q)
+
+        # 稀疏分量 s 加回来（Robust VQVAE）
         if s is not None:
             recon_len = x_recon.shape[1]
-            x_recon = x_recon + s[:, :recon_len, :]  # add sparse component back
-        
-        # 计算重构损失
+            x_recon = x_recon + s[:, :recon_len, :]
+
+        # ── 损失计算 ──────────────────────────────────────────────────────
         B, T, C = batch_x.shape
         num_patches = indices.shape[1]
         recon_len = num_patches * model.patch_size
         recon_loss = F.mse_loss(x_recon, batch_x[:, :recon_len, :])
 
-        # 稀疏 L1 惩罚
         if s is not None:
             sparse_norm = s.abs().mean()
-            loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss + args.sparse_weight * sparse_norm
+            loss = (args.recon_weight * recon_loss
+                    + args.vq_weight * vq_loss
+                    + args.sparse_weight * sparse_norm)
         else:
             sparse_norm = torch.tensor(0.0)
-            # 总损失
             loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
 
-        # 频率分工正则（soft 主频 + 平滑排序损失）
-        if use_order and delta_r_list is not None:
+        # 频率排序损失（仅在 lambda_ord > 0 且多层 RVQ 时）
+        if use_order and x_components is not None:
             order_loss, g_list, gap_list = compute_frequency_order_loss(
-                delta_r_list,
+                x_components,
                 tau_f=float(args.order_tau_f),
                 eps=float(args.order_eps),
             )
             loss = loss + lambda_ord * order_loss
 
-            # 累计 g_l / gap（用于 epoch 末平均打印）
             if per_layer_g_sum is None:
                 per_layer_g_sum = [0.0] * len(g_list)
                 per_layer_gap_sum = [0.0] * len(gap_list)
@@ -301,8 +304,8 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             for li, gap in enumerate(gap_list):
                 per_layer_gap_sum[li] += float(gap.detach())
             total_order_loss += float(order_loss.detach())
-        
-        # 反向传播（只对可训练参数）
+
+        # ── 反向传播 ──────────────────────────────────────────────────────
         optimizer.zero_grad()
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -316,8 +319,8 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
-        
-        # 计算 perplexity（per-channel 时取各通道平均；取第 0 层索引计算）
+
+        # perplexity（码本利用率代理指标，第 0 层索引）
         if per_channel:
             ch_usages = [
                 len(torch.unique(indices[:, :, c, 0])) / args.codebook_size
@@ -327,24 +330,21 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         else:
             unique_indices = torch.unique(indices[:, :, :, 0].reshape(-1))
             perplexity = len(unique_indices) / args.codebook_size
-        
-        # 累积索引用于统计
+
         all_indices_list.append(indices.detach().cpu())
-        
         total_loss += loss.item()
         total_vq_loss += vq_loss.item()
         total_recon_loss += recon_loss.item()
         total_perplexity += perplexity
         total_sparse_norm += sparse_norm.item()
         n_batches += 1
-    
-    # 计算整个epoch的码本利用率统计
-    all_indices_epoch = torch.cat(all_indices_list, dim=0)  # [total_B, num_patches, C]
+
+    all_indices_epoch = torch.cat(all_indices_list, dim=0)
     if per_channel:
         codebook_stats = compute_per_channel_usage_stats(all_indices_epoch, args.codebook_size)
     else:
         codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
-    
+
     per_layer_g = (
         [v / n_batches for v in per_layer_g_sum]
         if per_layer_g_sum is not None and n_batches > 0 else []
@@ -377,31 +377,31 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_sparse_norm = 0
     total_order_loss = 0
     lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
-    use_order = lambda_ord > 0 and int(getattr(args, 'n_rq_layers', 1)) >= 2
+    use_per_layer = int(getattr(args, 'n_rq_layers', 1)) >= 2
+    use_order = lambda_ord > 0 and use_per_layer
     per_layer_g_sum = None
     per_layer_gap_sum = None
     n_batches = 0
-    
-    # 用于累积码本使用统计
+
     all_indices_list = []
     per_channel = bool(args.per_channel_codebook)
     use_sparse = getattr(args, 'sparse_weight', 0.0) > 0
-    
+
     with torch.no_grad():
         for batch_x, _ in dataloader:
             batch_x = batch_x.to(device)  # [B, T, C]
-            
+
             if revin:
                 batch_x = revin(batch_x, 'norm')
-            
-            # 编码和解码
-            if use_sparse and use_order:
+
+            # 编码
+            if use_sparse and use_per_layer:
                 indices, vq_loss, z_q, s, per_layer_z_q = model.encode_to_indices(
                     batch_x, return_sparse=True, return_per_layer=True)
             elif use_sparse:
                 indices, vq_loss, z_q, s = model.encode_to_indices(batch_x, return_sparse=True)
                 per_layer_z_q = None
-            elif use_order:
+            elif use_per_layer:
                 indices, vq_loss, z_q, per_layer_z_q = model.encode_to_indices(
                     batch_x, return_per_layer=True)
                 s = None
@@ -409,21 +409,19 @@ def validate_epoch(model, dataloader, revin, args, device):
                 indices, vq_loss, z_q = model.encode_to_indices(batch_x)
                 s, per_layer_z_q = None, None
 
-            # Decoder 前向：共享一次批处理解码
-            if use_order and per_layer_z_q is not None:
-                delta_r_list, x_recon = compute_per_layer_deltas(
-                    per_layer_z_q,
-                    decode_fn=model.decode_from_codes,
-                    return_recon=True,
-                )
+            # 解码
+            if use_per_layer and per_layer_z_q is not None:
+                x_components, x_recon = decode_per_layer(
+                    per_layer_z_q, model.decode_from_codes)
             else:
-                delta_r_list = None
+                x_components = None
                 x_recon = model.decode_from_codes(z_q)
+
             if s is not None:
                 recon_len = x_recon.shape[1]
                 x_recon = x_recon + s[:, :recon_len, :]
-            
-            # 计算重构损失
+
+            # 损失
             B, T, C = batch_x.shape
             num_patches = indices.shape[1]
             recon_len = num_patches * model.patch_size
@@ -431,16 +429,17 @@ def validate_epoch(model, dataloader, revin, args, device):
 
             if s is not None:
                 sparse_norm = s.abs().mean()
-                loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss + args.sparse_weight * sparse_norm
+                loss = (args.recon_weight * recon_loss
+                        + args.vq_weight * vq_loss
+                        + args.sparse_weight * sparse_norm)
             else:
                 sparse_norm = torch.tensor(0.0)
-                # 总损失
                 loss = args.recon_weight * recon_loss + args.vq_weight * vq_loss
 
-            # 频率分工正则（验证期不反向传播，仅记录）
-            if use_order and delta_r_list is not None:
+            # 频率排序损失（验证期仅统计，不反向传播）
+            if use_order and x_components is not None:
                 order_loss, g_list, gap_list = compute_frequency_order_loss(
-                    delta_r_list,
+                    x_components,
                     tau_f=float(args.order_tau_f),
                     eps=float(args.order_eps),
                 )
@@ -453,8 +452,7 @@ def validate_epoch(model, dataloader, revin, args, device):
                 for li, gap in enumerate(gap_list):
                     per_layer_gap_sum[li] += float(gap)
                 total_order_loss += float(order_loss)
-            
-            # 计算 perplexity
+
             if per_channel:
                 ch_usages = [
                     len(torch.unique(indices[:, :, c, 0])) / args.codebook_size
@@ -464,24 +462,21 @@ def validate_epoch(model, dataloader, revin, args, device):
             else:
                 unique_indices = torch.unique(indices[:, :, :, 0].reshape(-1))
                 perplexity = len(unique_indices) / args.codebook_size
-            
-            # 累积索引用于统计
+
             all_indices_list.append(indices.cpu())
-            
             total_loss += loss.item()
             total_vq_loss += vq_loss.item()
             total_recon_loss += recon_loss.item()
             total_perplexity += perplexity
             total_sparse_norm += sparse_norm.item()
             n_batches += 1
-    
-    # 计算整个epoch的码本利用率统计
-    all_indices_epoch = torch.cat(all_indices_list, dim=0)  # [total_B, num_patches, C]
+
+    all_indices_epoch = torch.cat(all_indices_list, dim=0)
     if per_channel:
         codebook_stats = compute_per_channel_usage_stats(all_indices_epoch, args.codebook_size)
     else:
         codebook_stats = compute_codebook_usage_stats(all_indices_epoch, args.codebook_size)
-    
+
     per_layer_g = (
         [v / n_batches for v in per_layer_g_sum]
         if per_layer_g_sum is not None and n_batches > 0 else []
