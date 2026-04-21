@@ -111,6 +111,15 @@ def parse_args():
     parser.add_argument('--order_eps', type=float, default=1e-6,
                         help='能量归一化 eps，避免低能量层频率分数不稳定')
 
+    # 噪声-VQ重构正交损失（Patch 空间版）
+    parser.add_argument('--orth_weight', type=float, default=0.0,
+                        help='噪声正交损失最终权重（0=关闭；需启用 sparse_weight>0）。'
+                             '鼓励 s ⊥ x_vq_recon，梯度仅流向 SparseNet。建议 0.005~0.02')
+    parser.add_argument('--orth_start_epoch', type=int, default=20,
+                        help='从第几个 epoch 开始引入 L_orth（码本稳定后再加，默认 20）')
+    parser.add_argument('--orth_warmup_epochs', type=int, default=10,
+                        help='L_orth 权重从 0 线性 warmup 到 orth_weight 所需 epoch 数（默认 10）')
+
     return parser.parse_args()
 
 
@@ -216,7 +225,68 @@ def compute_per_channel_usage_stats(indices, codebook_size):
     }
 
 
-def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
+def compute_noise_orth_loss(model, s: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """噪声-码本正交损失（Shadow Encoder 版：只训练 SparseNet，不污染 Encoder）。
+
+    设计思路：
+        使用"shadow encoder"——将主 Encoder 当前权重全部 detach 成常数，
+        用 functional_call 做前向。梯度可以穿过这个常数网络流回 s_input，
+        进而训练 SparseNet；但 Encoder 自身的 Parameter 不会累积来自 L_orth 的梯度。
+
+        等价于：两个参数相同的 Encoder，一个可训练（用于 x_clean），
+               一个是常数网络（用于 s），两者共享权重快照但梯度路径完全分离。
+
+    梯度路径：
+        L_orth → z_noise → s_input → s → SparseNet   ✓
+        Encoder.parameters()：无梯度                  ✓
+        码本：detach，无梯度                           ✓
+
+    公式：
+        z_noise = ShadowEncoder(s)   （encoder 权重为常数）
+        L_orth  = mean_k |cos(z_noise, e_k)|
+
+    Args:
+        model: CodebookModel / PerChannelCodebookModel
+        s:     [B, num_patches*patch_size, C]  稀疏噪声
+        eps:   L2 归一化防零项
+    Returns:
+        标量 loss
+    """
+    import torch.func as _func
+
+    B, L, C = s.shape
+    patch_size = model.patch_size
+    num_patches = L // patch_size
+
+    # [B*num_patches*C, 1, patch_size]
+    s_patches = s[:, :num_patches * patch_size, :].reshape(B, num_patches, patch_size, C)
+    s_input = s_patches.permute(0, 1, 3, 2).reshape(B * num_patches * C, patch_size).unsqueeze(1)
+
+    # Shadow Encoder：参数全部 detach（常数），但梯度可穿过网络流回 s_input
+    frozen_params = {name: param.detach()
+                     for name, param in model.encoder.named_parameters()}
+    frozen_buffers = dict(model.encoder.named_buffers())
+    z_noise = _func.functional_call(
+        model.encoder,
+        {**frozen_params, **frozen_buffers},
+        (s_input, model.compression_factor),
+    )                                                                # [N, emb_dim, comp_len]
+    z_noise_flat = z_noise.reshape(z_noise.shape[0], -1)            # [N, code_dim]
+    z_noise_norm = F.normalize(z_noise_flat, p=2, dim=-1, eps=eps)  # [N, code_dim]
+
+    # 码本矩阵（detach，不向码本施加梯度）
+    vq_module = model.vqs[0] if hasattr(model, 'vqs') else model.vq
+    E = torch.cat(
+        [layer.embedding.weight.detach() for layer in vq_module.layers], dim=0
+    )                                                                # [K_total, code_dim]
+    E_norm = F.normalize(E, p=2, dim=-1, eps=eps)                   # [K_total, code_dim]
+
+    # [N, K_total] 余弦相似度取绝对值后均值
+    sim = z_noise_norm @ E_norm.T
+    return sim.abs().mean()
+
+
+def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, epoch: int = 0):
     """训练一个epoch"""
     model.train()
     total_loss = 0
@@ -225,7 +295,21 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
     total_perplexity = 0
     total_sparse_norm = 0
     total_order_loss = 0
-    lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
+    total_orth_loss = 0
+    lambda_ord  = float(getattr(args, 'lambda_ord',  0.0))
+    orth_weight = float(getattr(args, 'orth_weight', 0.0))
+    orth_start  = int(getattr(args, 'orth_start_epoch', 20))
+    orth_warmup = int(getattr(args, 'orth_warmup_epochs', 10))
+    # 线性 warmup：epoch < orth_start → 0；warmup 结束后 → orth_weight
+    if orth_weight > 0:
+        if epoch < orth_start:
+            effective_orth_weight = 0.0
+        elif orth_warmup > 0 and epoch < orth_start + orth_warmup:
+            effective_orth_weight = orth_weight * (epoch - orth_start) / orth_warmup
+        else:
+            effective_orth_weight = orth_weight
+    else:
+        effective_orth_weight = 0.0
     # per-layer decode：只要 n_rq_layers >= 2 就启用；
     # 重构 = X_1 + X_2 + ... + X_L（各层分别解码后叠加）
     use_per_layer = int(getattr(args, 'n_rq_layers', 1)) >= 2
@@ -311,6 +395,12 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
                 per_layer_gap_sum[li] += float(gap.detach())
             total_order_loss += float(order_loss.detach())
 
+        # 噪声-码本正交损失（Encoder 空间，warmup 控制有效权重）
+        if effective_orth_weight > 0 and s is not None:
+            orth_loss = compute_noise_orth_loss(model, s)
+            loss = loss + effective_orth_weight * orth_loss
+            total_orth_loss += float(orth_loss.detach())
+
         # ── 反向传播 ──────────────────────────────────────────────────────
         optimizer.zero_grad()
         if scaler.is_enabled():
@@ -367,6 +457,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler):
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
         'order_loss': total_order_loss / n_batches if n_batches > 0 else 0.0,
+        'orth_loss': total_orth_loss / n_batches if n_batches > 0 else 0.0,
         'per_layer_g': per_layer_g,
         'per_layer_gap': per_layer_gap,
         'codebook_stats': codebook_stats,
@@ -684,7 +775,7 @@ def main():
     
     for epoch in range(args.n_epochs):
         # 训练
-        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler)
+        train_metrics = train_epoch(model, dls.train, optimizer, revin, args, device, scaler, epoch=epoch)
         scheduler.step()
         
         # 验证
@@ -709,6 +800,20 @@ def main():
         if getattr(args, 'sparse_weight', 0.0) > 0:
             print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
                   f"Valid {val_metrics['sparse_norm']:.5f}")
+
+        # 噪声-VQ重构正交损失日志（只在有效权重 > 0 时才打印）
+        if float(getattr(args, 'orth_weight', 0.0)) > 0:
+            orth_start  = int(getattr(args, 'orth_start_epoch', 20))
+            orth_warmup = int(getattr(args, 'orth_warmup_epochs', 10))
+            if epoch < orth_start:
+                eff_w_str = f"0.000 (delayed, starts ep{orth_start})"
+            elif orth_warmup > 0 and epoch < orth_start + orth_warmup:
+                cur_w = args.orth_weight * (epoch - orth_start) / orth_warmup
+                eff_w_str = f"{cur_w:.5f} (warmup {epoch-orth_start+1}/{orth_warmup})"
+            else:
+                eff_w_str = f"{args.orth_weight:.5f}"
+            print(f"  └─ OrthLoss (s⊥vq): Train {train_metrics.get('orth_loss', 0.0):.5f}"
+                  f"  (eff_weight={eff_w_str})")
 
         # 频率分工正则日志：每层 g_l、相邻层 gap、L_order
         if float(getattr(args, 'lambda_ord', 0.0)) > 0 and train_metrics.get('per_layer_g'):
@@ -756,46 +861,30 @@ def main():
                     top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
                     print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
-        # 保存 & 早停：val_loss 下降 + 各码本利用率均 ≥ threshold 才生效
+        # 保存 & 早停：epoch >= 5 后开始，仅依据 val_loss
         if epoch >= 5:
-            thr = float(getattr(args, 'codebook_usage_threshold', 0.8))
             current_val_loss = val_metrics['loss']
-            cb_stats = val_metrics.get('codebook_stats', {})
-            usages = (cb_stats.get('per_channel_usage', []) if args.per_channel_codebook
-                      else cb_stats.get('per_layer_usage_raw', [cb_stats.get('usage_rate', 0.0)]))
-            usage_str = ', '.join(f'{u*100:.1f}%' for u in usages)
-            gate_ok = thr <= 0 or (len(usages) > 0 and all(u >= thr for u in usages))
-
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
                 no_improve_count = 0
-                if gate_ok:
-                    ckpt = {
-                        'config': config, 'args': vars(args), 'epoch': epoch,
-                        'train_loss': train_metrics['loss'], 'val_loss': current_val_loss,
-                        'train_recon_loss': train_metrics['recon_loss'],
-                        'val_recon_loss':   val_metrics['recon_loss'],
-                        'encoder_state_dict': model.encoder.state_dict(),
-                        'decoder_state_dict': model.decoder.state_dict(),
-                        **(({'model_state_dict': model.state_dict(), 'n_channels': dls.vars})
-                           if args.per_channel_codebook else
-                           ({'vq_state_dict': model.vq.state_dict()})),
-                    }
-                    torch.save(ckpt, save_dir / f'{model_name}.pth')
-                    print(f"  -> Best model saved (val_loss: {current_val_loss:.4f})")
-                else:
-                    print(f"  [跳过保存] val_loss↓{current_val_loss:.4f}，"
-                          f"码本利用率 [{usage_str}] 未全部达到 {thr*100:.0f}%")
+                ckpt = {
+                    'config': config, 'args': vars(args), 'epoch': epoch,
+                    'train_loss': train_metrics['loss'], 'val_loss': current_val_loss,
+                    'train_recon_loss': train_metrics['recon_loss'],
+                    'val_recon_loss':   val_metrics['recon_loss'],
+                    'encoder_state_dict': model.encoder.state_dict(),
+                    'decoder_state_dict': model.decoder.state_dict(),
+                    **(({'model_state_dict': model.state_dict(), 'n_channels': dls.vars})
+                       if args.per_channel_codebook else
+                       ({'vq_state_dict': model.vq.state_dict()})),
+                }
+                torch.save(ckpt, save_dir / f'{model_name}.pth')
+                print(f"  -> Best model saved (val_loss: {current_val_loss:.4f})")
             else:
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
-                    if gate_ok:
-                        print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降"
-                              f"，各码本利用率均 ≥ {thr*100:.0f}% [{usage_str}]")
-                        break
-                    else:
-                        print(f"  [早停暂缓] val_loss 已连续 {no_improve_count} 个 epoch 未下降，"
-                              f"码本利用率 [{usage_str}] 未全部达到 {thr*100:.0f}%，继续训练")
+                    print(f"\n>>> 早停: val_loss 连续 {early_stop_patience} 个 epoch 未下降")
+                    break
     
     # 保存训练历史
     actual_epochs = len(train_losses)

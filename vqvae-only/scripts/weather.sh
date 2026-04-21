@@ -4,7 +4,7 @@
 # 用于在decoder-only预训练之前先训练好encoder、codebook和decoder
 
 # 数据集参数
-DSET="ettm1"
+DSET="weather"
 CONTEXT_POINTS=512
 BATCH_SIZE=64
 NUM_WORKERS=0
@@ -13,7 +13,7 @@ FEATURES="M"
 
 # 模型参数（与PatchVQVAETransformer一致）
 PATCH_SIZE=16
-EMBEDDING_DIM=64
+EMBEDDING_DIM=32
 CODEBOOK_SIZE=256
 COMPRESSION_FACTOR=8
 NUM_HIDDENS=64
@@ -21,7 +21,7 @@ NUM_RESIDUAL_LAYERS=2
 NUM_RESIDUAL_HIDDENS=64
 COMMITMENT_COST=0.25
 CODEBOOK_EMA=1  # 使用EMA
-EMA_DECAY=0.99
+EMA_DECAY=0.95
 EMA_EPS=1e-5
 
 # 码本初始化参数
@@ -29,8 +29,8 @@ CODEBOOK_REPORT_INTERVAL=5  # 码本利用率报告间隔（每N个epoch报告�
 SEED=42  # 随机数种子（用于训练可复现性，但不影响码本初始化）
 
 # 训练参数
-N_EPOCHS=100
-LR=1e-4
+N_EPOCHS=50
+LR=3e-4
 WEIGHT_DECAY=1e-4
 REVIN=1
 AMP=1
@@ -56,27 +56,27 @@ N_RQ_LAYERS=2
 # Robust VQVAE: 稀疏分量
 # SPARSE_WEIGHT=0 表示不启用 Robust 分解（标准 VQVAE 行为）
 # 建议初始值: 0.01；调大可让码本更专注干净主体结构，调小则减弱稀疏约束
-SPARSE_WEIGHT=0.01
+SPARSE_WEIGHT=0.4
 # SparseNet 输出 tanh 振幅上界（防止异常分量学走主体结构）
 # 建议范围: 0.2 ~ 1.0（相对归一化后的 patch 值域）
-SPARSE_AMPLITUDE=0.3
+SPARSE_AMPLITUDE=0.1
 
 # 频率分工正则（soft 主频 + 平滑排序损失）
 # 仅在 N_RQ_LAYERS >= 2 时生效，单层 VQ 自动跳过，开销为 0
 # LAMBDA_ORD=0 表示不启用；建议多层 RVQ 初始值 0.01~0.1
-LAMBDA_ORD=0.03
+LAMBDA_ORD=0.01
 # softmax 温度 τ_f：越小越接近 hard peak；常用 0.3 ~ 1.0
-ORDER_TAU_F=1.0
+ORDER_TAU_F=0.7
 # 能量归一化 eps，避免低能量层频率分数不稳定
 ORDER_EPS=1e-6
 
 # 噪声-VQ重构正交损失（s ⊥ x_vq_recon，Patch 空间版）
 # ORTH_WEIGHT=0 表示不启用；建议 0.005~0.02（远小于旧方案）
-ORTH_WEIGHT=0.0
+ORTH_WEIGHT=0.01
 # 延迟启动：前 N 个 epoch 不加 L_orth，让码本先稳定
-ORTH_START_EPOCH=20
+ORTH_START_EPOCH=0
 # 线性 warmup epoch 数：从 orth_start_epoch 起线性增大到 orth_weight
-ORTH_WARMUP_EPOCHS=10
+ORTH_WARMUP_EPOCHS=5
 
 python codebook_pretrain.py \
     --dset $DSET \
