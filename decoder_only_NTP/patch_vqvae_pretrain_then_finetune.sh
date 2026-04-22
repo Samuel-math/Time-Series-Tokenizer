@@ -19,8 +19,17 @@
 
 DSET=ettm1
 PRETRAIN_CONTEXT_POINTS=1256
-PROGRESSIVE_STEP_SIZE=6
+PROGRESSIVE_STEP_SIZE=6    # M: 相邻 stage 的推进步长（也作为默认的 AR 步长）
 MODEL_ID=1
+
+# =====================================================
+# Overlapping Chunk Prediction（M < N 时生效）
+#   PRED_LEN : N，每个 stage / 每次 forward 预测的 patch 数
+#              空值 / 等于 PROGRESSIVE_STEP_SIZE → 退化为原始非重叠逻辑
+# 用法提示：令 PRED_LEN=12, STEP=6 即形成 50% 重叠的 overlapping chunks；
+#          Finetune 若未显式设置 PRED_LEN，会自动继承预训练 checkpoint 里的值。
+# =====================================================
+PRED_LEN=""                # 留空 = 等于 PROGRESSIVE_STEP_SIZE（不启用重叠）
 
 # =====================================================
 # Patch / VQVAE 参数（自动从 checkpoint 读取，这里作为备用）
@@ -96,6 +105,12 @@ PRETRAIN_LR=3e-4
 VQ_WEIGHT=0.0       # 码本已冻结，设为 0
 RECON_WEIGHT=0.0    # 码本已冻结，设为 0
 DISABLE_EMA_UPDATE=1
+
+# 早停（patience 轮未显著改善则停止；warmup 期仍会保存 best model 但不触发早停）
+EARLY_STOP_PATIENCE=5
+EARLY_STOP_WARMUP=5
+EARLY_STOP_MIN_DELTA=1e-4
+EARLY_STOP_SMOOTH_K=1    # 用最近 K 个 epoch 的 val_loss 均值判据；1 表示不平滑
 
 # =====================================================
 # 微调参数
@@ -184,7 +199,8 @@ echo "================================================="
 echo "数据集         : ${DSET}"
 echo "码本模型       : ${CODEBOOK_CHECKPOINT}"
 echo "模型名称       : ${MODEL_NAME}"
-echo "渐进步长       : ${PROGRESSIVE_STEP_SIZE} patches"
+echo "渐进步长 M     : ${PROGRESSIVE_STEP_SIZE} patches"
+echo "预测长度 N     : ${PRED_LEN:-<= M (无重叠)}"
 echo "Transformer 维度(code_dim): ${CODE_DIM}"
 echo "Per-channel VQ : ${PER_CHANNEL_CODEBOOK}"
 echo "NMPP 模式      : ${USE_RAW_INPUT}"
@@ -237,6 +253,15 @@ PRETRAIN_ARGS=(
 # nargs='+' 参数需展开为多个独立值
 [ -n "${RQ_LAYER_WEIGHTS}" ] && PRETRAIN_ARGS+=(--rq_layer_weights ${RQ_LAYER_WEIGHTS})
 
+# Overlapping chunk 参数（PRED_LEN 为空时不传，python 端默认等于 step_size）
+[ -n "${PRED_LEN}" ] && PRETRAIN_ARGS+=(--pred_len "${PRED_LEN}")
+
+# 早停参数
+PRETRAIN_ARGS+=(--early_stop_patience  "${EARLY_STOP_PATIENCE}")
+PRETRAIN_ARGS+=(--early_stop_warmup    "${EARLY_STOP_WARMUP}")
+PRETRAIN_ARGS+=(--early_stop_min_delta "${EARLY_STOP_MIN_DELTA}")
+PRETRAIN_ARGS+=(--early_stop_smooth_k  "${EARLY_STOP_SMOOTH_K}")
+
 python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
 
 if [ $? -ne 0 ]; then
@@ -286,6 +311,7 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
         --gumbel_temperature "${GUMBEL_TEMPERATURE}" \
         --gumbel_hard "${GUMBEL_HARD}" \
         ${AR_STEP_SIZE:+--ar_step_size "${AR_STEP_SIZE}"} \
+        ${PRED_LEN:+--pred_len "${PRED_LEN}"} \
         --model_id "${MODEL_ID}"
 done
 

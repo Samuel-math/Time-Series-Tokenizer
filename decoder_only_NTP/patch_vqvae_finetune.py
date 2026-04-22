@@ -57,6 +57,9 @@ def parse_args():
     
     # 自回归预测参数
     parser.add_argument('--ar_step_size', type=int, default=None, help='自回归步长（每步预测的patch数）。None表示非自回归（一次预测所有）')
+    parser.add_argument('--pred_len', type=int, default=None,
+                        help='每次 Transformer forward 预测的 patch 数 N（默认 None = 等于 ar_step_size）。'
+                             'N > M 时产生 overlapping chunk，同一未来位置的多个 logit 在概率层面融合后再 argmax。')
     
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
@@ -144,8 +147,11 @@ def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
         batch_x = revin(batch_x, 'norm')
     
     with amp.autocast(enabled=scaler.is_enabled()):
-        # 前向传播: 预测码本索引 -> 解码（支持自回归步长）
-        pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
+        # 前向传播: 预测码本索引 -> 解码（支持自回归步长 + overlapping chunk 融合）
+        pred, _ = model.forward_finetune(
+            batch_x, args.target_points,
+            step_size=args.ar_step_size, pred_len=args.pred_len,
+        )
         
         # RevIN反归一化
         if revin:
@@ -182,7 +188,10 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
                 batch_x = revin(batch_x, 'norm')
             
             with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
+                pred, _ = model.forward_finetune(
+                    batch_x, args.target_points,
+                    step_size=args.ar_step_size, pred_len=args.pred_len,
+                )
             
             if revin:
                 pred = revin(pred, 'denorm')
@@ -211,7 +220,10 @@ def test_model(model, dataloader, revin, args, device, use_amp):
                 batch_x = revin(batch_x, 'norm')
             
             with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(batch_x, args.target_points, step_size=args.ar_step_size)
+                pred, _ = model.forward_finetune(
+                    batch_x, args.target_points,
+                    step_size=args.ar_step_size, pred_len=args.pred_len,
+                )
             
             # 验证预测长度与目标长度一致
             assert pred.shape[1] == batch_y.shape[1] == args.target_points, \
@@ -236,17 +248,8 @@ def main():
     args = parse_args()
     print('Args:', args)
     
-    # PyTorch 2.7+ 兼容性修复：禁用 flash attention 和 memory-efficient attention
-    # 当使用 mask 时，这些优化可能导致 CUDA 错误
-    if torch.cuda.is_available():
-        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
-            torch.backends.cuda.enable_math_sdp(True)
-        print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容性修复）')
-    
+    # CausalTransformer 现已走 is_causal=True 的 fused SDP 路径，无需禁用 flash/mem-efficient attention
+
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -280,6 +283,11 @@ def main():
     if args.ar_step_size is None and 'progressive_step_size' in pretrain_args:
         args.ar_step_size = pretrain_args['progressive_step_size']
         print(f'✓ 自动继承预训练step_size: {args.ar_step_size}')
+
+    # 自动继承预训练的 pred_len（如果 finetune 时未指定，且预训练启用了 overlapping chunk）
+    if args.pred_len is None and 'pred_len' in pretrain_args and pretrain_args['pred_len'] is not None:
+        args.pred_len = pretrain_args['pred_len']
+        print(f'✓ 自动继承预训练 pred_len: {args.pred_len}')
     
     # 冻结 encoder、VQ 层（将patch映射成码本前的所有参数）
     freeze_encoder_vq(model)

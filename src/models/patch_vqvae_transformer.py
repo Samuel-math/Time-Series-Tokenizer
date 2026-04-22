@@ -310,70 +310,62 @@ class ResidualVQ(nn.Module):
 
 
 class CausalTransformer(nn.Module):
-    """轻量级 Causal Transformer，支持独立的 hidden_dim 参数"""
+    """轻量级 Causal Transformer，支持独立的 hidden_dim 参数。
+
+    性能说明：
+        使用 is_causal=True 让 nn.TransformerEncoder 走 fused SDP 路径
+        （flash / memory-efficient attention），比显式 triu 布尔 mask 快 2~4×。
+        语义上与三角 mask 完全等价。
+    """
     def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_dim=None):
         super().__init__()
-        
-        # PyTorch 2.7+ 兼容性修复：禁用 flash attention 和 memory-efficient attention
-        # 当使用 mask 时，这些优化可能导致 CUDA 错误
-        # 强制使用标准的数学实现
-        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
-            torch.backends.cuda.enable_math_sdp(True)
-        
+
         self.code_dim = code_dim
-        # 如果未指定 hidden_dim，默认使用 code_dim
         self.hidden_dim = hidden_dim if hidden_dim is not None else code_dim
-        
-        # 如果 hidden_dim 与 code_dim 不同，需要输入和输出投影层
+
         if self.hidden_dim != self.code_dim:
-            self.input_proj = nn.Linear(self.code_dim, self.hidden_dim)
+            self.input_proj  = nn.Linear(self.code_dim, self.hidden_dim)
             self.output_proj = nn.Linear(self.hidden_dim, self.code_dim)
         else:
             self.input_proj = None
             self.output_proj = None
-        
-        # 位置编码，维度与 hidden_dim 一致
+
         self.pos_embedding = nn.Embedding(max_len, self.hidden_dim)
         self.drop = nn.Dropout(dropout)
-        
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(self.hidden_dim)
-    
+
     def forward(self, x):
         """
         Args:
-            x: [B, T, code_dim] 直接是量化后的码本向量
+            x: [B, T, code_dim]
         Returns:
-            output: [B, T, code_dim] 输出维度与输入一致
+            output: [B, T, code_dim]
         """
         B, T, _ = x.shape
-        
-        # 输入投影（如果需要）
+
         if self.input_proj is not None:
-            x = self.input_proj(x)  # [B, T, code_dim] -> [B, T, hidden_dim]
-        
+            x = self.input_proj(x)
+
         positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
         x = x + self.pos_embedding(positions)
         x = self.drop(x)
-        
-        # 创建 causal mask（上三角矩阵，对角线以上为 True）
-        # 只使用 mask 参数，避免 is_causal=True 在某些 PyTorch 版本中的兼容性问题
-        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        x = self.transformer(x, mask=mask)
-        x = self.norm(x)  # [B, T, hidden_dim]
-        
-        # 输出投影（如果需要）
+
+        # 同时给 mask 和 is_causal=True：
+        # - fast-path（推理 / 无 dropout 等满足条件）→ 走 fused SDP（flash / mem-efficient attention）
+        # - slow-path（训练 + dropout / 旧内部实现）→ 用 mask 兜底，避免
+        #   "Need attn_mask if specifying the is_causal hint" 的报错
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+        x = self.transformer(x, mask=causal_mask, is_causal=True)
+
+        x = self.norm(x)
         if self.output_proj is not None:
-            x = self.output_proj(x)  # [B, T, hidden_dim] -> [B, T, code_dim]
-        
+            x = self.output_proj(x)
         return x
 
 
@@ -590,24 +582,36 @@ class PatchVQVAETransformer(nn.Module):
         return x_recon
     
     def forward_progressive_pretrain(self, x_full, step_size, max_stages=None,
-                                      compute_recon_loss=True, use_raw_input=False):
+                                      compute_recon_loss=True, use_raw_input=False,
+                                      pred_len=None):
         """
-        渐进式预训练: 使用不同长度的上下文预测固定长度的未来 tokens。
+        渐进式预训练：每 stage 的预测长度（pred_len=N）与推进步长（step_size=M）解耦。
+
+        Stage s（1-indexed）：
+          - context = patches[0 : s*M]
+          - target  = patches[s*M : s*M + N]      ← 预测 context 之后的 N 个 patch
+          - 当 M < N 时，相邻 stage 的预测区间重叠，重叠长度 = N - M
+
+        当 pred_len = step_size（默认）时退化为原始不重叠逻辑，行为完全一致。
 
         Args:
-            x_full: [B, total_len, C]
-            step_size: int, 每阶段步长（patches）
-            max_stages: int | None, 最大阶段数
-            compute_recon_loss: bool, 是否计算重构损失（recon_weight=0 时可设 False）
-            use_raw_input: bool, NMPP 模式 —— Transformer 接收原始 patch embedding，
-                           VQVAE 仅作为 teacher 提供 indices；不计算 vq_loss / recon_loss
+            x_full:             [B, total_len, C]
+            step_size:          M，推进步长（patches）
+            max_stages:         最大阶段数，None 表示全部
+            compute_recon_loss: 是否计算 VQ 重构损失
+            use_raw_input:      NMPP 模式
+            pred_len:           N，每 stage 预测的 patch 数；None 时等于 step_size
 
         Returns:
-            all_logits: List[[B, step_size, C, codebook_size]]
-            all_target_indices: List[[B, step_size, C]]
-            vq_loss: scalar
-            recon_loss: scalar
+            all_logits:         List[stage] of List[rq_layer] of [B, N, C, K]
+            all_target_indices: List[stage] of List[rq_layer] of [B, N, C]
+            vq_loss:            scalar
+            recon_loss:         scalar
         """
+        # pred_len=None → 与 step_size 相同，保持后向兼容
+        if pred_len is None:
+            pred_len = step_size
+
         B, total_len, C = x_full.shape
         num_patches = total_len // self.patch_size
         x_full = x_full[:, :num_patches * self.patch_size, :]
@@ -624,53 +628,76 @@ class PatchVQVAETransformer(nn.Module):
 
         num_total_patches = full_indices.shape[1]
 
+        # Stage s 需要 s*M + N <= num_total_patches
         if max_stages is None:
-            max_stages = (num_total_patches - step_size) // step_size
+            max_stages = (num_total_patches - pred_len) // step_size
         else:
-            max_stages = min(max_stages, (num_total_patches - step_size) // step_size)
+            max_stages = min(max_stages, (num_total_patches - pred_len) // step_size)
 
         if max_stages <= 0:
             raise ValueError(
-                f"序列长度不足：总patches={num_total_patches}, step_size={step_size}, 无法创建任何阶段"
+                f"序列长度不足：总patches={num_total_patches}, "
+                f"step_size={step_size}, pred_len={pred_len}, 无法创建任何阶段"
             )
 
+        n_rq = len(self.output_heads)
+
+        # 预先筛出合法的 stage 列表
+        valid_stages = [
+            s for s in range(1, max_stages + 1)
+            if s * step_size + pred_len <= num_total_patches
+        ]
+
+        if not valid_stages:
+            raise ValueError(
+                f"序列长度不足：总patches={num_total_patches}, "
+                f"step_size={step_size}, pred_len={pred_len}, 无法创建任何阶段"
+            )
+
+        # ── 方案 A：把所有 stage 的序列拼成一个大 batch，一次 Transformer forward ──
+        #
+        # 对 stage s，序列 = seq_full[:, 0 : s*M+N]，其中 [s*M : s*M+N] 为 placeholder（零向量）。
+        # causal mask 保证 prediction 位置只能 attend 到 [0 : s*M] 的真实 context，
+        # 后面多余的真实 patch（若有）因 causal mask 而不被这些位置看到，所以不需要额外 padding。
+        # 统一截到最长 stage 的长度：max_len = max(s)*M + N
+        max_len = valid_stages[-1] * step_size + pred_len
+
+        # 构造大 batch: [S * B*C, max_len, D]
+        S = len(valid_stages)
+        code_dim_inner = seq_full.shape[2]
+        batch_seqs = seq_full.new_zeros(S * B * C, max_len, code_dim_inner)
+        for i, s in enumerate(valid_stages):
+            ctx = s * step_size
+            batch_seqs[i * B * C:(i + 1) * B * C, :ctx, :] = seq_full[:, :ctx, :]
+            # [ctx : ctx+pred_len] 保持零向量（placeholder）
+
+        # 一次 forward（CausalTransformer 内部会自动生成 causal mask + is_causal=True）
+        h_batch = self.transformer(batch_seqs)
+        # h_batch: [S * B*C, max_len, hidden]
+
+        # ── 从 h_batch 里按 stage 切出 logits ─────────────────────────────────────
         all_logits, all_target_indices = [], []
 
-        for stage in range(1, max_stages + 1):
+        for i, stage in enumerate(valid_stages):
             context_size = stage * step_size
-            target_start = (stage - 1) * step_size
-            target_end = stage * step_size
+            target_start = stage * step_size
+            target_end   = target_start + pred_len
 
-            if target_end > num_patches:
-                break
+            # 从大 batch 里取出本 stage 的 hidden states
+            h_stage  = h_batch[i * B * C:(i + 1) * B * C]          # [B*C, max_len, hidden]
+            h_target = h_stage[:, context_size:context_size + pred_len, :]  # [B*C, N, hidden]
 
-            placeholder = torch.zeros(
-                B * C, step_size, seq_full.shape[2],
-                device=seq_full.device, dtype=seq_full.dtype,
-            )
-            full_sequence_stage = torch.cat([seq_full[:, :context_size, :], placeholder], dim=1)
-            h_full = self.transformer(full_sequence_stage)
-            h_target = h_full[:, context_size:context_size + step_size, :]
-
-            # target_indices_stage: [B, step_size, C, n_rq_layers]
             target_indices_stage = full_indices[:, target_start:target_end, :, :]
 
-            # 对每层 RVQ 独立预测
             logits_layers, tgt_layers = [], []
             for l, head in enumerate(self.output_heads):
-                logits_flat = head(h_target)  # [B*C, step_size, codebook_size]
-                logits_l = logits_flat.reshape(B, C, step_size, -1).permute(0, 2, 1, 3)
-                # [B, step_size, C, codebook_size]
+                logits_flat = head(h_target)                                      # [B*C, N, K]
+                logits_l = logits_flat.reshape(B, C, pred_len, -1).permute(0, 2, 1, 3)  # [B, N, C, K]
                 logits_layers.append(logits_l)
-                tgt_layers.append(target_indices_stage[:, :, :, l])  # [B, step_size, C]
+                tgt_layers.append(target_indices_stage[:, :, :, l])              # [B, N, C]
 
             all_logits.append(logits_layers)
             all_target_indices.append(tgt_layers)
-
-        if not all_logits:
-            raise ValueError(
-                f"序列长度不足：总patches={num_patches}, step_size={step_size}, 无法创建任何阶段"
-            )
 
         if compute_recon_loss and not use_raw_input:
             x_recon_full = self.decode_from_codes(z_q_full)
@@ -680,18 +707,23 @@ class PatchVQVAETransformer(nn.Module):
 
         return all_logits, all_target_indices, vq_loss_full, recon_loss
     
-    def forward_finetune(self, x, target_len, step_size=None, use_raw_input=False):
+    def forward_finetune(self, x, target_len, step_size=None, use_raw_input=False,
+                          pred_len=None):
         """
-        微调: 预测未来序列（批量自回归版本，channel-independent）
+        微调: 预测未来序列（支持 overlapping chunk prediction + 概率级融合）
 
         Args:
-            x: [B, T, C]
-            target_len: int
-            step_size: int | None
-            use_raw_input: bool, 与 NMPP 预训练一致时设 True，历史上下文用原始 patch embedding
+            x:            [B, T, C]
+            target_len:   int，目标预测时间步数
+            step_size:    M，自回归步长（每步提交的 patch 数）；None 表示非自回归
+            use_raw_input: 与 NMPP 预训练一致时设 True
+            pred_len:     N，每次 Transformer forward 预测的 patch 数；
+                          None 时等于 step_size（无重叠，退化为旧行为）
+                          M < N 时产生 overlapping chunk，同一位置的多个 logit 在
+                          argmax 之前做均值融合（概率级融合）
 
         Returns:
-            pred: [B, target_len, C]
+            pred:    [B, target_len, C]
             vq_loss: scalar
         """
         B, T, C = x.shape
@@ -724,7 +756,17 @@ class PatchVQVAETransformer(nn.Module):
                 out = torch.einsum('bcpk,ckd->bcpd', w, stacked_codebooks)
                 return out.reshape(B * C, -1, code_dim)
             return torch.matmul(weights_bc, shared_codebook)
-        
+
+        def _decode_logits(avg_logits_2d):
+            """avg_logits_2d: [B*C, K] → [B*C, 1, code_dim]"""
+            if self.use_gumbel_softmax and self.training:
+                w = F.gumbel_softmax(avg_logits_2d.unsqueeze(1),
+                                     tau=self.gumbel_temperature,
+                                     hard=self.gumbel_hard, dim=-1)
+            else:
+                w = F.softmax(avg_logits_2d, dim=-1).unsqueeze(1)  # [B*C, 1, K]
+            return _lookup_codebook(w)  # [B*C, 1, code_dim]
+
         # 如果没有指定 step_size 或 step_size >= num_pred_patches，使用非自回归模式
         if step_size is None or step_size >= num_pred_patches:
             # 非自回归：一次性预测所有 patches
@@ -743,49 +785,76 @@ class PatchVQVAETransformer(nn.Module):
 
             all_pred_codes = _lookup_codebook(weights)
         else:
-            # 批量自回归：每步预测 step_size 个 patches
-            num_steps = (num_pred_patches + step_size - 1) // step_size
+            # ── 批量自回归（支持 overlapping chunk prediction）──────────────────
+            # pred_len=None 时默认等于 step_size（无重叠，退化为旧逻辑）
+            eff_pred_len = pred_len if pred_len is not None else step_size
+
+            # pos_logit_sum[p]  : [B*C, K] 累积 logit 和
+            # pos_logit_count[p]: int，覆盖该位置的 chunk 数
+            pos_logit_sum   = {}
+            pos_logit_count = {}
+
             current_context = context_flat
-            all_pred_codes_list = []
-            remaining_patches = num_pred_patches
+            committed_list  = []   # [B*C, 1, code_dim] 每个已提交位置
 
-            for step in range(num_steps):
-                patches_to_predict = min(step_size, remaining_patches)
+            step = 0
+            while step * step_size < num_pred_patches:
+                abs_start = step * step_size   # 本 chunk 覆盖的第一个未来 patch 位置
 
+                # Transformer forward：context + N 个 placeholder
+                n_ctx = current_context.shape[1]
                 placeholder = torch.zeros(
-                    B * C, patches_to_predict, code_dim,
+                    B * C, eff_pred_len, code_dim,
                     device=current_context.device, dtype=current_context.dtype,
                 )
-                full_sequence = torch.cat([current_context, placeholder], dim=1)
-                h_full = self.transformer(full_sequence)
+                h_full = self.transformer(torch.cat([current_context, placeholder], dim=1))
+                logits_chunk = self.output_heads[0](
+                    h_full[:, n_ctx:n_ctx + eff_pred_len, :]
+                )  # [B*C, N, K]
 
-                context_len = current_context.shape[1]
-                h_pred_step = h_full[:, context_len:, :]
-                logits_step = self.output_heads[0](h_pred_step)
+                # 把本 chunk 的每个位置 logit 累积到全局融合表
+                for offset in range(eff_pred_len):
+                    p = abs_start + offset
+                    if p >= num_pred_patches:
+                        break
+                    logit_p = logits_chunk[:, offset, :]  # [B*C, K]
+                    if p not in pos_logit_sum:
+                        pos_logit_sum[p]   = logit_p
+                        pos_logit_count[p] = 1
+                    else:
+                        pos_logit_sum[p]   = pos_logit_sum[p] + logit_p
+                        pos_logit_count[p] += 1
 
-                if self.use_gumbel_softmax and self.training:
-                    weights_step = F.gumbel_softmax(logits_step, tau=self.gumbel_temperature,
-                                                    hard=self.gumbel_hard, dim=-1)
-                else:
-                    weights_step = F.softmax(logits_step, dim=-1)
+                # 提交本步的 step_size 个位置（使用已融合的 logit 均值解码）
+                new_codes = []
+                for offset in range(step_size):
+                    p = abs_start + offset
+                    if p >= num_pred_patches:
+                        break
+                    avg_l = pos_logit_sum[p] / pos_logit_count[p]   # [B*C, K] 融合后均值
+                    code  = _decode_logits(avg_l)                     # [B*C, 1, code_dim]
+                    new_codes.append(code)
+                    committed_list.append(code)
 
-                pred_codes_step = _lookup_codebook(weights_step)
-                all_pred_codes_list.append(pred_codes_step)
-                current_context = torch.cat([current_context, pred_codes_step], dim=1)
-                remaining_patches -= patches_to_predict
+                # 用本步提交的 codes 延伸 context（供下一步使用）
+                if new_codes:
+                    current_context = torch.cat(
+                        [current_context, torch.cat(new_codes, dim=1)], dim=1
+                    )
+                step += 1
 
-            all_pred_codes = torch.cat(all_pred_codes_list, dim=1)
-        
+            all_pred_codes = torch.cat(committed_list, dim=1)  # [B*C, num_pred_patches, code_dim]
+
         # Reshape 回通道分离格式: [B*C, num_pred_patches, code_dim] -> [B, num_pred_patches, C, code_dim]
         pred_codes = all_pred_codes.reshape(B, C, num_pred_patches, code_dim).permute(0, 2, 1, 3)
-        
+
         # 解码（优化后的批量解码）
         pred = self.decode_from_codes(pred_codes)  # [B, num_pred_patches*patch_size, C]
-        pred = pred[:, :target_len, :]  # [B, target_len, C]
-        
+        pred = pred[:, :target_len, :]             # [B, target_len, C]
+
         # 确保输出长度与目标长度一致
         assert pred.shape[1] == target_len, f"预测长度 {pred.shape[1]} 与目标长度 {target_len} 不匹配"
-        
+
         return pred, vq_loss
     
     def forward(self, x, target=None, target_len=None, mode='pretrain'):

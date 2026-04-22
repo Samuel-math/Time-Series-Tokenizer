@@ -87,6 +87,11 @@ def build_arg_parser():
     p.add_argument('--use_raw_input', type=int, default=0,
                    help='1: NMPP 模式，Transformer 接收原始 patch，VQVAE 仅作为 teacher')
 
+    # Overlapping chunk prediction（pred_len > step_size 时启用）
+    p.add_argument('--pred_len', type=int, default=None,
+                   help='每个 stage 预测的 patch 数 N（默认 None = 等于 progressive_step_size）。'
+                        'N > M 时产生 overlapping chunk，同一位置的多个预测在 logit 层面融合。')
+
     # 训练超参
     p.add_argument('--n_epochs', type=int, default=100)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -94,6 +99,16 @@ def build_arg_parser():
     p.add_argument('--revin', type=int, default=1)
     p.add_argument('--vq_weight', type=float, default=1.0)
     p.add_argument('--recon_weight', type=float, default=0.1)
+
+    # 早停
+    p.add_argument('--early_stop_patience', type=int, default=5,
+                   help='val_loss 连续未显著下降多少 epoch 就早停（默认 5）')
+    p.add_argument('--early_stop_warmup', type=int, default=5,
+                   help='前多少 epoch 不触发早停（但仍会保存 best model，默认 5）')
+    p.add_argument('--early_stop_min_delta', type=float, default=1e-4,
+                   help='视为"有效改善"的最小 val_loss 降幅（默认 1e-4）')
+    p.add_argument('--early_stop_smooth_k', type=int, default=1,
+                   help='用最近 K 个 epoch 的 val_loss 均值做早停判据（K=1 表示不平滑，默认 1）')
 
     # 保存
     p.add_argument('--save_path', type=str, default='saved_models/patch_vqvae/')
@@ -148,6 +163,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     vq_w    = 0. if use_raw else args.vq_weight
     recon_w = 0. if use_raw else args.recon_weight
     rq_weights = getattr(args, 'rq_layer_weights', None)
+    pred_len    = getattr(args, 'pred_len', None)            # N；None → 等于 step_size
+    step_size   = args.progressive_step_size
 
     for batch_x, batch_y in dataloader:
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -158,12 +175,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         batch_full = torch.cat([batch_x, batch_y], dim=1)
         all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
             batch_full,
-            step_size=args.progressive_step_size,
+            step_size=step_size,
             max_stages=args.progressive_max_stages,
             compute_recon_loss=compute_recon,
             use_raw_input=use_raw,
+            pred_len=pred_len,
         )
         pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
+
         loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
         optimizer.zero_grad()
@@ -190,7 +209,9 @@ def validate_epoch(model, dataloader, revin, args, device):
     compute_recon = args.recon_weight > 0 and not use_raw
     vq_w    = 0. if use_raw else args.vq_weight
     recon_w = 0. if use_raw else args.recon_weight
-    rq_weights = getattr(args, 'rq_layer_weights', None)
+    rq_weights  = getattr(args, 'rq_layer_weights', None)
+    pred_len    = getattr(args, 'pred_len', None)
+    step_size   = args.progressive_step_size
 
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
@@ -202,10 +223,11 @@ def validate_epoch(model, dataloader, revin, args, device):
             batch_full = torch.cat([batch_x, batch_y], dim=1)
             all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
                 batch_full,
-                step_size=args.progressive_step_size,
+                step_size=step_size,
                 max_stages=args.progressive_max_stages,
                 compute_recon_loss=compute_recon,
                 use_raw_input=use_raw,
+                pred_len=pred_len,
             )
             pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
             loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
@@ -222,17 +244,6 @@ def validate_epoch(model, dataloader, revin, args, device):
 # ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
-
-def _disable_flash_sdp():
-    if not torch.cuda.is_available():
-        return
-    for fn in ('enable_flash_sdp', 'enable_mem_efficient_sdp'):
-        if hasattr(torch.backends.cuda, fn):
-            getattr(torch.backends.cuda, fn)(False)
-    if hasattr(torch.backends.cuda, 'enable_math_sdp'):
-        torch.backends.cuda.enable_math_sdp(True)
-    print('✓ 已禁用 flash/memory-efficient attention（PyTorch 2.7+ 兼容）')
-
 
 def _disable_ema(model):
     """冻结所有 VQ 模块的 EMA 更新（兼容 shared / per-channel + 单层/RVQ 模式）"""
@@ -264,7 +275,6 @@ def run_pretrain():
             raise ValueError('NMPP (--use_raw_input=1) 需要指定 --vqvae_checkpoint')
         args.freeze_vqvae = 1
 
-    _disable_flash_sdp()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
@@ -344,11 +354,21 @@ def run_pretrain():
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
 
-    best_val  = float('inf')
-    train_losses, valid_losses = [], []
-    no_improve, patience, saved = 0, 10, False
+    # 早停配置（全部可通过 CLI 覆盖）
+    patience  = int(getattr(args, 'early_stop_patience',    5))
+    warmup    = int(getattr(args, 'early_stop_warmup',      5))
+    min_delta = float(getattr(args, 'early_stop_min_delta', 1e-4))
+    smooth_k  = max(1, int(getattr(args, 'early_stop_smooth_k', 1)))
 
-    print(f'\n开始预训练，共 {args.n_epochs} epoch（早停 patience={patience}）')
+    best_val   = float('inf')
+    no_improve = 0
+    train_losses, valid_losses = [], []
+
+    print(
+        f'\n开始预训练，共 {args.n_epochs} epoch '
+        f'(early stop: patience={patience}, warmup={warmup}, '
+        f'min_delta={min_delta}, smooth_k={smooth_k})'
+    )
     print('=' * 80)
 
     for epoch in range(args.n_epochs):
@@ -359,37 +379,42 @@ def run_pretrain():
         train_losses.append(tr['loss'])
         valid_losses.append(va['loss'])
 
+        if smooth_k > 1 and len(valid_losses) >= smooth_k:
+            va_signal = sum(valid_losses[-smooth_k:]) / smooth_k
+        else:
+            va_signal = va['loss']
+
         print(
             f"Epoch {epoch+1:3d}/{args.n_epochs} | "
             f"Train {tr['loss']:.4f} (Pred {tr['pred_loss']:.4f}  "
-            f"VQ {tr['vq_loss']:.4f}  Recon {tr['recon_loss']:.4f}) | "
-            f"Val {va['loss']:.4f} (Pred {va['pred_loss']:.4f})"
+            f"VQ {tr['vq_loss']:.4f}  Recon {tr['recon_loss']:.4f})"
+            f" | Val {va['loss']:.4f} (Pred {va['pred_loss']:.4f})"
         )
 
-        if epoch >= 3:
-            if va['loss'] < best_val:
-                best_val   = va['loss']
-                no_improve = 0
-                saved      = True
-                torch.save(
-                    {
-                        'model_state_dict': model.state_dict(),
-                        'config': config,
-                        'args':   vars(args),
-                        'epoch':  epoch,
-                        'train_loss': tr['loss'],
-                        'val_loss':   va['loss'],
-                    },
-                    save_dir / f'{model_name}.pth',
-                )
-                print(f"  -> Best model saved (val_loss: {va['loss']:.4f})")
-            elif saved:
-                no_improve += 1
-                if no_improve >= patience:
-                    print(f'\n>>> 早停: val_loss 连续 {patience} epoch 未下降')
-                    break
+        if va_signal < best_val - min_delta:
+            best_val   = va_signal
+            no_improve = 0
+            torch.save(
+                {
+                    'model_state_dict': model.state_dict(),
+                    'config': config,
+                    'args':   vars(args),
+                    'epoch':  epoch,
+                    'train_loss': tr['loss'],
+                    'val_loss':   va['loss'],
+                },
+                save_dir / f'{model_name}.pth',
+            )
+            print(f"  -> Best model saved (val_signal: {va_signal:.4f})")
+        else:
+            no_improve += 1
 
-        # 定期打印码本利用率
+        if epoch + 1 > warmup and no_improve >= patience:
+            print(f'\n>>> 早停: val_loss 连续 {patience} epoch 未显著下降'
+                  f'（min_delta={min_delta}, smooth_k={smooth_k}）')
+            break
+
+        # 定期打印码本利用率及（可选）overlap coverage 统计
         if (epoch + 1) % 10 == 0:
             with torch.no_grad():
                 sample = next(iter(dls.train))[0].to(device)
@@ -397,6 +422,17 @@ def run_pretrain():
                     sample = revin(sample, 'norm')
                 usage, _ = model.get_codebook_usage(sample)
                 print(f'  -> Codebook usage: {usage * 100:.1f}%')
+
+            # 打印 overlap coverage（有重叠时）
+            eff_pred_len = getattr(args, 'pred_len', None) or args.progressive_step_size
+            if eff_pred_len != args.progressive_step_size:
+                M, N = args.progressive_step_size, eff_pred_len
+                # 理论覆盖：位置 p 被 min(floor(p/M)+1, ceil(N/M)) 个 chunk 覆盖
+                import math
+                max_cover = math.ceil(N / M)
+                print(f'  -> Overlap config: step_size={M}, pred_len={N} '
+                      f'| max_coverage_per_pos={max_cover} '
+                      f'| overlap_len={N - M} patches/stage')
 
     pd.DataFrame({
         'epoch':       range(1, len(train_losses) + 1),
