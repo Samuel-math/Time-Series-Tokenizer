@@ -637,9 +637,12 @@ class PatchVQVAETransformer(nn.Module):
         all_logits, all_target_indices = [], []
 
         for stage in range(1, max_stages + 1):
+            # NTP 对齐：context 给前 stage*M 个真实 patch，placeholder 放在
+            # [stage*M, (stage+1)*M)，监督信号就是 placeholder 那 M 个位置自身
+            # 的真实 idx —— 模型在零输入位置、仅凭 causal 上下文预测未来 M 个 token。
             context_size = stage * step_size
-            target_start = (stage - 1) * step_size
-            target_end = stage * step_size
+            target_start = stage * step_size
+            target_end   = (stage + 1) * step_size
 
             if target_end > num_patches:
                 break
@@ -653,6 +656,7 @@ class PatchVQVAETransformer(nn.Module):
             h_target = h_full[:, context_size:context_size + step_size, :]
 
             # target_indices_stage: [B, step_size, C, n_rq_layers]
+            # 位置 [stage*M, (stage+1)*M) —— 与 h_target 位置严格对齐
             target_indices_stage = full_indices[:, target_start:target_end, :, :]
 
             # 对每层 RVQ 独立预测
