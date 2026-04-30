@@ -149,13 +149,35 @@ def _progressive_loss(all_logits, all_target_indices, rq_layer_weights=None):
     return total_loss / (total_weight * len(all_logits) / n_layers)
 
 
+def _progressive_accuracy(all_logits, all_target_indices):
+    """统计 NMPP token 预测准确率（按 RVQ 层分别统计，并给出整体均值）。"""
+    n_layers = len(all_logits[0])
+    correct = [0] * n_layers
+    total = [0] * n_layers
+
+    with torch.no_grad():
+        for logits_layers, tgt_layers in zip(all_logits, all_target_indices):
+            for l, (logits_l, tgt_l) in enumerate(zip(logits_layers, tgt_layers)):
+                pred_l = logits_l.argmax(dim=-1)
+                correct[l] += (pred_l == tgt_l).sum().item()
+                total[l] += tgt_l.numel()
+
+    layer_acc = [
+        (correct[l] / total[l]) if total[l] > 0 else 0.0
+        for l in range(n_layers)
+    ]
+    avg_acc = sum(correct) / sum(total) if sum(total) > 0 else 0.0
+    return avg_acc, layer_acc
+
+
 # ---------------------------------------------------------------------------
 # Train / validate epochs
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, trainable_params):
     model.train()
-    totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0.)
+    totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0., token_acc=0.)
+    layer_acc_sum = None
     n = 0
 
     use_raw = bool(args.use_raw_input)
@@ -169,8 +191,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     for batch_x, batch_y in dataloader:
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
         if revin:
-            batch_x = revin(batch_x, 'norm')
-            batch_y = revin(batch_y, 'norm')
+            # 用 batch_x 的 stats 同时归一化 batch_x 和 batch_y，使拼接后的序列
+            # 和推理/finetune 行为一致（只用 context 的 stats）。
+            # 注意：直接调用两次 revin(_, 'norm') 会用各自的 stats 覆盖存储，导致
+            # 两段在不同归一化空间下拼接，产生边界不连续，pretrain/inference 分布失配。
+            batch_x = revin(batch_x, 'norm')         # 存 stats(batch_x)
+            batch_y = revin._normalize(batch_y)      # 复用 batch_x 的 stats
 
         batch_full = torch.cat([batch_x, batch_y], dim=1)
         all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
@@ -182,6 +208,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
             pred_len=pred_len,
         )
         pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
+        token_acc, layer_acc = _progressive_accuracy(all_logits, all_tgt)
 
         loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
@@ -194,15 +221,23 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         totals['pred_loss']  += pred_loss.item()
         totals['vq_loss']    += vq_loss.item()
         totals['recon_loss'] += recon_loss.item()
+        totals['token_acc']  += token_acc
+        if layer_acc_sum is None:
+            layer_acc_sum = [0.0] * len(layer_acc)
+        for i, acc in enumerate(layer_acc):
+            layer_acc_sum[i] += acc
         n += 1
 
     scheduler.step()
-    return {k: v / n for k, v in totals.items()}
+    out = {k: v / n for k, v in totals.items()}
+    out['layer_acc'] = [v / n for v in layer_acc_sum] if layer_acc_sum is not None else []
+    return out
 
 
 def validate_epoch(model, dataloader, revin, args, device):
     model.eval()
-    totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0.)
+    totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0., token_acc=0.)
+    layer_acc_sum = None
     n = 0
 
     use_raw = bool(args.use_raw_input)
@@ -217,8 +252,8 @@ def validate_epoch(model, dataloader, revin, args, device):
         for batch_x, batch_y in dataloader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             if revin:
-                batch_x = revin(batch_x, 'norm')
-                batch_y = revin(batch_y, 'norm')
+                batch_x = revin(batch_x, 'norm')     # 存 stats(batch_x)
+                batch_y = revin._normalize(batch_y)  # 复用 batch_x 的 stats
 
             batch_full = torch.cat([batch_x, batch_y], dim=1)
             all_logits, all_tgt, vq_loss, recon_loss = model.forward_progressive_pretrain(
@@ -230,15 +265,23 @@ def validate_epoch(model, dataloader, revin, args, device):
                 pred_len=pred_len,
             )
             pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
+            token_acc, layer_acc = _progressive_accuracy(all_logits, all_tgt)
             loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
             totals['loss']       += loss.item()
             totals['pred_loss']  += pred_loss.item()
             totals['vq_loss']    += vq_loss.item()
             totals['recon_loss'] += recon_loss.item()
+            totals['token_acc']  += token_acc
+            if layer_acc_sum is None:
+                layer_acc_sum = [0.0] * len(layer_acc)
+            for i, acc in enumerate(layer_acc):
+                layer_acc_sum[i] += acc
             n += 1
 
-    return {k: v / n for k, v in totals.items()}
+    out = {k: v / n for k, v in totals.items()}
+    out['layer_acc'] = [v / n for v in layer_acc_sum] if layer_acc_sum is not None else []
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +406,7 @@ def run_pretrain():
     best_val   = float('inf')
     no_improve = 0
     train_losses, valid_losses = [], []
+    train_token_accs, valid_token_accs = [], []
 
     print(
         f'\n开始预训练，共 {args.n_epochs} epoch '
@@ -378,6 +422,8 @@ def run_pretrain():
 
         train_losses.append(tr['loss'])
         valid_losses.append(va['loss'])
+        train_token_accs.append(tr['token_acc'])
+        valid_token_accs.append(va['token_acc'])
 
         if smooth_k > 1 and len(valid_losses) >= smooth_k:
             va_signal = sum(valid_losses[-smooth_k:]) / smooth_k
@@ -390,6 +436,15 @@ def run_pretrain():
             f"VQ {tr['vq_loss']:.4f}  Recon {tr['recon_loss']:.4f})"
             f" | Val {va['loss']:.4f} (Pred {va['pred_loss']:.4f})"
         )
+        tr_layers = ', '.join(f'L{i}:{a * 100:.1f}%' for i, a in enumerate(tr.get('layer_acc', [])))
+        va_layers = ', '.join(f'L{i}:{a * 100:.1f}%' for i, a in enumerate(va.get('layer_acc', [])))
+        print(
+            f"  └─ NTP Acc: Train {tr['token_acc'] * 100:.2f}%"
+            f" | Val {va['token_acc'] * 100:.2f}%"
+        )
+        if tr_layers and va_layers:
+            print(f"      Train Layers: {tr_layers}")
+            print(f"      Val Layers  : {va_layers}")
 
         if va_signal < best_val - min_delta:
             best_val   = va_signal
@@ -438,6 +493,8 @@ def run_pretrain():
         'epoch':       range(1, len(train_losses) + 1),
         'train_loss':  train_losses,
         'valid_loss':  valid_losses,
+        'train_token_acc': train_token_accs,
+        'valid_token_acc': valid_token_accs,
     }).to_csv(save_dir / f'{model_name}_history.csv', index=False)
 
     with open(save_dir / f'{model_name}_config.json', 'w') as f:

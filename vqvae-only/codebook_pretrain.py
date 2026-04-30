@@ -760,6 +760,13 @@ def main():
     train_recon_losses, valid_recon_losses = [], []  # 记录recon_loss历史
     no_improve_count = 0
     early_stop_patience = 10
+
+    # 保存/早停起始 epoch 参数需要在主循环外定义，避免 orth_weight=0 时日志分支不执行而未赋值。
+    orth_weight = float(getattr(args, 'orth_weight', 0.0))
+    orth_start = int(getattr(args, 'orth_start_epoch', 20))
+    orth_warmup = int(getattr(args, 'orth_warmup_epochs', 10))
+    # 若启用 L_orth，则等 warmup 完成后再保存/早停；否则保留原来的 epoch>=5 行为。
+    save_start_epoch = orth_start + orth_warmup if orth_weight > 0 else 5
     
     print(f'\n开始码本预训练，共 {args.n_epochs} 个 epoch (早停: {early_stop_patience} epochs)')
     print('=' * 80)
@@ -852,8 +859,8 @@ def main():
                     top5_str = ', '.join([f"#{idx}({cnt})" for idx, cnt in train_stats['top5_usage'][:5]])
                     print(f"  └─ 最常用码本元素 (Train): {top5_str}")
         
-        # 保存 & 早停：epoch >= 5 后开始，仅依据 val_loss
-        if epoch >= 5:
+        # 保存 & 早停：若启用 L_orth，则等 warmup 结束；否则 epoch >= 5 后开始
+        if epoch >= save_start_epoch:
             current_val_loss = val_metrics['loss']
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss

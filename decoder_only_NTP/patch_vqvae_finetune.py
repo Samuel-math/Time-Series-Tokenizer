@@ -12,7 +12,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 from torch.cuda import amp
 import argparse
 from pathlib import Path
@@ -49,6 +49,22 @@ def parse_args():
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     parser.add_argument('--run_id', type=int, default=None, help='运行ID（用于多次运行同一参数组合）')
+
+    # 训练 loss 类型（验证/测试始终用 MSE 报告，保持与 benchmark 可比）
+    parser.add_argument('--train_loss', type=str, default='mse',
+                        choices=['mse', 'huber', 'smooth_l1'],
+                        help='训练反向传播使用的 loss 类型：mse | huber | smooth_l1')
+    parser.add_argument('--huber_delta', type=float, default=1.0,
+                        help='Huber / Smooth-L1 的 delta（beta）阈值。RevIN 空间建议 0.3~1.0')
+
+    # Decoder 解冻（finetune 阶段做任务精调；不会改动预训练 checkpoint 文件）
+    parser.add_argument('--unfreeze_decoder', type=int, default=0,
+                        help='1 = 解冻 VQVAE decoder 参与 finetune（用更小 lr + 更大 weight decay 保护）'
+                             '；0 = 保持冻结（默认，向后兼容）')
+    parser.add_argument('--decoder_lr_ratio', type=float, default=0.1,
+                        help='解冻 decoder 时使用的 lr 相对比例：decoder_lr = main_lr * ratio（默认 0.1）')
+    parser.add_argument('--decoder_wd_ratio', type=float, default=5.0,
+                        help='解冻 decoder 时使用的 weight_decay 放大倍数（默认 5.0，加强过拟合抑制）')
     
     # Gumbel-Softmax参数（微调阶段的码本查找）
     parser.add_argument('--use_gumbel_softmax', type=int, default=1, help='是否使用Gumbel-Softmax（1启用，0使用普通Softmax）')
@@ -60,7 +76,7 @@ def parse_args():
     parser.add_argument('--pred_len', type=int, default=None,
                         help='每次 Transformer forward 预测的 patch 数 N（默认 None = 等于 ar_step_size）。'
                              'N > M 时产生 overlapping chunk，同一未来位置的多个 logit 在概率层面融合后再 argmax。')
-    
+
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/patch_vqvae_finetune/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
@@ -131,10 +147,39 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     return model, config, pretrain_args
 
 
-def freeze_encoder_vq(model, freeze_patch_attention=True):
-    """冻结encoder、decoder、VQ层（将patch映射成码本前的所有参数）"""
-    # 使用模型的方法冻结VQVAE组件
-    model.freeze_vqvae(components=['Encoder', 'Decoder', 'VQ'])
+def freeze_encoder_vq(model, unfreeze_decoder=False):
+    """冻结 VQVAE 相关组件（Encoder + VQ 始终冻结；Decoder 可选是否解冻）
+
+    注意：这里仅修改 requires_grad / EMA 标志，不会触碰模型权重本身。
+    因此加载的 VQVAE 预训练 checkpoint 文件始终保持原样，未被任何读写操作修改。
+
+    Args:
+        model: PatchVQVAETransformer
+        unfreeze_decoder: True 时解冻 decoder，让它在 finetune 中参与梯度更新
+    """
+    components = ['Encoder', 'VQ']
+    if not unfreeze_decoder:
+        components.append('Decoder')
+    model.freeze_vqvae(components=components)
+
+
+def _compute_train_loss(pred, target, args):
+    """根据 args.train_loss 计算训练反向 loss（始终 fp32）。
+
+    - mse:       F.mse_loss
+    - huber:     F.huber_loss(delta=args.huber_delta)
+    - smooth_l1: F.smooth_l1_loss(beta=args.huber_delta)
+
+    |e| < delta 时近似 L2，|e| > delta 时近似 L1，对 outlier 鲁棒。
+    """
+    pred_f = pred.float()
+    loss_type = getattr(args, 'train_loss', 'mse')
+    delta = float(getattr(args, 'huber_delta', 1.0))
+    if loss_type == 'huber':
+        return F.huber_loss(pred_f, target, reduction='mean', delta=delta)
+    if loss_type == 'smooth_l1':
+        return F.smooth_l1_loss(pred_f, target, reduction='mean', beta=delta)
+    return F.mse_loss(pred_f, target, reduction='mean')
 
 
 def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler):
@@ -152,14 +197,15 @@ def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
             batch_x, args.target_points,
             step_size=args.ar_step_size, pred_len=args.pred_len,
         )
-        
-        # RevIN反归一化
-        if revin:
-            pred = revin(pred, 'denorm')
-        
-        # 用于反向传播和报告的loss（使用mean）
-        loss = F.mse_loss(pred, batch_y, reduction='mean')
-    
+
+    # RevIN 反归一化 + loss 放到 autocast 外（fp32），与 val/test 一致，
+    # 避免在 fp16 下对较大的 stdev 做乘法带来精度损失。
+    if revin:
+        pred = revin(pred, 'denorm')
+
+    # 用于反向传播的训练 loss（可选 mse/huber/smooth_l1；val/test 始终用 MSE 报告）
+    loss = _compute_train_loss(pred, batch_y, args)
+
     # 反向传播（只对可训练参数）
     optimizer.zero_grad()
     scaler.scale(loss).backward()
@@ -169,79 +215,123 @@ def train_batch(model, batch_x, batch_y, optimizer, revin, args, device, scaler)
     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
     scaler.step(optimizer)
     scaler.update()
-    
+
     return loss.item()
 
 
 def validate_epoch(model, dataloader, revin, args, device, use_amp):
-    """验证一个epoch"""
+    """验证一个epoch
+
+    注意：验证始终在 FP32 下进行，避免 FP16 的 softmax/码本查表/RevIN denorm
+    的精度损失导致 best epoch 选择不稳。参数 use_amp 仅为了兼容调用方签名。
+    """
     model.eval()
     total_loss = 0
+    total_token_acc = 0.0
+    layer_acc_sum = None
+    metric_batches = 0
     n_batches = 0
-    
+
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-            
+
             if revin:
                 batch_x = revin(batch_x, 'norm')
-            
-            with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(
-                    batch_x, args.target_points,
-                    step_size=args.ar_step_size, pred_len=args.pred_len,
-                )
-            
+                batch_y_for_token = revin._normalize(batch_y)
+            else:
+                batch_y_for_token = batch_y
+
+            # 验证强制 FP32（忽略 use_amp）
+            pred, _, token_metrics = model.forward_finetune(
+                batch_x, args.target_points,
+                step_size=args.ar_step_size, pred_len=args.pred_len,
+                target=batch_y_for_token, return_token_metrics=True,
+            )
+
             if revin:
                 pred = revin(pred, 'denorm')
-            
-            # 使用mean
-            mse_loss = F.mse_loss(pred, batch_y, reduction='mean')
+
+            mse_loss = F.mse_loss(pred.float(), batch_y, reduction='mean')
             total_loss += mse_loss.item()
+            if token_metrics.get('token_acc') is not None:
+                total_token_acc += token_metrics['token_acc']
+                if layer_acc_sum is None:
+                    layer_acc_sum = [0.0] * len(token_metrics.get('layer_acc', []))
+                for i, acc in enumerate(token_metrics.get('layer_acc', [])):
+                    layer_acc_sum[i] += acc
+                metric_batches += 1
             n_batches += 1
-    
-    # 按batch数平均
-    return total_loss / n_batches if n_batches > 0 else 0.0
+
+    avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+    return {
+        'loss': avg_loss,
+        'token_acc': total_token_acc / metric_batches if metric_batches > 0 else None,
+        'layer_acc': [v / metric_batches for v in layer_acc_sum] if metric_batches > 0 else [],
+    }
 
 
 def test_model(model, dataloader, revin, args, device, use_amp):
-    """测试模型"""
+    """测试模型
+
+    注意：测试始终在 FP32 下进行。FP16 推理在 softmax/码本查表/RevIN denorm
+    等算子上有 micro 精度损失，对 SOTA 级别的 MSE 比较敏感。参数 use_amp
+    仅为了兼容调用方签名，实际被忽略。
+    """
     model.eval()
     all_preds = []
     all_targets = []
-    
+    total_token_acc = 0.0
+    layer_acc_sum = None
+    metric_batches = 0
+
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-            
+
             if revin:
                 batch_x = revin(batch_x, 'norm')
-            
-            with amp.autocast(enabled=use_amp):
-                pred, _ = model.forward_finetune(
-                    batch_x, args.target_points,
-                    step_size=args.ar_step_size, pred_len=args.pred_len,
-                )
-            
-            # 验证预测长度与目标长度一致
+                batch_y_for_token = revin._normalize(batch_y)
+            else:
+                batch_y_for_token = batch_y
+
+            # 测试强制 FP32（忽略 use_amp）
+            pred, _, token_metrics = model.forward_finetune(
+                batch_x, args.target_points,
+                step_size=args.ar_step_size, pred_len=args.pred_len,
+                target=batch_y_for_token, return_token_metrics=True,
+            )
+
             assert pred.shape[1] == batch_y.shape[1] == args.target_points, \
                 f"预测长度 {pred.shape[1]} 与目标长度 {batch_y.shape[1]} 或 args.target_points {args.target_points} 不匹配"
-            
+
             if revin:
                 pred = revin(pred, 'denorm')
-            
-            all_preds.append(pred.cpu())
+
+            if token_metrics.get('token_acc') is not None:
+                total_token_acc += token_metrics['token_acc']
+                if layer_acc_sum is None:
+                    layer_acc_sum = [0.0] * len(token_metrics.get('layer_acc', []))
+                for i, acc in enumerate(token_metrics.get('layer_acc', [])):
+                    layer_acc_sum[i] += acc
+                metric_batches += 1
+
+            all_preds.append(pred.float().cpu())
             all_targets.append(batch_y.cpu())
-    
+
     preds = torch.cat(all_preds, dim=0).numpy()
     targets = torch.cat(all_targets, dim=0).numpy()
-    
+
     mse = np.mean((preds - targets) ** 2)
     mae = np.mean(np.abs(preds - targets))
-    
-    return mse, mae, preds, targets
+    token_metrics = {
+        'token_acc': total_token_acc / metric_batches if metric_batches > 0 else None,
+        'layer_acc': [v / metric_batches for v in layer_acc_sum] if metric_batches > 0 else [],
+    }
+
+    return mse, mae, preds, targets, token_metrics
 
 
 def main():
@@ -288,9 +378,15 @@ def main():
     if args.pred_len is None and 'pred_len' in pretrain_args and pretrain_args['pred_len'] is not None:
         args.pred_len = pretrain_args['pred_len']
         print(f'✓ 自动继承预训练 pred_len: {args.pred_len}')
-    
-    # 冻结 encoder、VQ 层（将patch映射成码本前的所有参数）
-    freeze_encoder_vq(model)
+
+    # 冻结 Encoder + VQ；根据 --unfreeze_decoder 决定 Decoder 是否参与 finetune
+    unfreeze_dec = bool(getattr(args, 'unfreeze_decoder', 0))
+    freeze_encoder_vq(model, unfreeze_decoder=unfreeze_dec)
+    if unfreeze_dec:
+        print(f'✓ Decoder 已解冻（decoder_lr = main_lr × {args.decoder_lr_ratio}, '
+              f'decoder_wd = main_wd × {args.decoder_wd_ratio}）')
+    else:
+        print('✓ Decoder 保持冻结（向后兼容行为）')
     
     # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -306,6 +402,11 @@ def main():
     use_amp = bool(args.amp) and device.type == 'cuda'
     scaler = amp.GradScaler(enabled=use_amp)
     print(f'AMP enabled: {use_amp}')
+    if args.train_loss == 'mse':
+        print('训练 loss: MSE（验证/测试也用 MSE）')
+    else:
+        print(f'训练 loss: {args.train_loss.upper()} (delta/beta={args.huber_delta})'
+              f'  | 验证/测试仍用 MSE')
     
     # RevIN
     revin = RevIN(dls.vars, eps=1e-5, affine=False).to(device) if args.revin else None
@@ -327,13 +428,33 @@ def main():
         model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
     
     # 优化器和调度器
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
-                      lr=args.lr, weight_decay=args.weight_decay)
+    # 解冻 decoder 时分组：decoder 用更小 lr + 更大 weight_decay，
+    # 保护 VQ-VAE 在 pretrain 中学到的几何结构，避免过拟合 ETTh1 这种小数据集。
+    if unfreeze_dec:
+        decoder_params = [p for n, p in model.named_parameters()
+                          if n.startswith('decoder.') and p.requires_grad]
+        other_params   = [p for n, p in model.named_parameters()
+                          if (not n.startswith('decoder.')) and p.requires_grad]
+        dec_lr = args.lr * float(args.decoder_lr_ratio)
+        dec_wd = args.weight_decay * float(args.decoder_wd_ratio)
+        optimizer = AdamW(
+            [
+                {'params': other_params,   'lr': args.lr, 'weight_decay': args.weight_decay},
+                {'params': decoder_params, 'lr': dec_lr,  'weight_decay': dec_wd},
+            ],
+        )
+        n_dec = sum(p.numel() for p in decoder_params)
+        n_oth = sum(p.numel() for p in other_params)
+        print(f'  Optimizer groups: main={n_oth:,} params (lr={args.lr}, wd={args.weight_decay})'
+              f' | decoder={n_dec:,} params (lr={dec_lr}, wd={dec_wd})')
+    else:
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                          lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
     # 训练
     best_val_loss = float('inf')
-    train_losses, valid_losses = [], []
+    train_losses, valid_losses, valid_token_accs = [], [], []
     no_improve_epochs = 0  # 连续无改善的epoch数
     early_stop_patience = 5  # 连续5个epoch无下降就停止
     best_epoch = -1  # 最佳模型所在的epoch
@@ -360,10 +481,12 @@ def main():
         avg_train_loss = np.mean(epoch_train_losses)
         
         # 验证评估
-        val_loss = validate_epoch(model, dls.valid, revin, args, device, use_amp)
+        val_metrics = validate_epoch(model, dls.valid, revin, args, device, use_amp)
+        val_loss = val_metrics['loss']
         
         train_losses.append(avg_train_loss)
         valid_losses.append(val_loss)
+        valid_token_accs.append(val_metrics.get('token_acc'))
         
         total_time = time.time() - start_time
         
@@ -399,6 +522,12 @@ def main():
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
               f"Train Loss: {avg_train_loss:.6f} | Valid Loss: {val_loss:.6f} | "
               f"Time: {total_time/60:.1f}min {status}")
+        if val_metrics.get('token_acc') is not None:
+            layer_text = ', '.join(
+                f'L{i}:{acc * 100:.1f}%' for i, acc in enumerate(val_metrics.get('layer_acc', []))
+            )
+            print(f"  └─ Forecast Token Acc: Val {val_metrics['token_acc'] * 100:.2f}%"
+                  + (f" ({layer_text})" if layer_text else ""))
         
         if not is_best:
             print(f"  -> 无改善 (当前最佳: epoch {best_epoch+1}, val_loss: {best_val_loss:.6f}, "
@@ -455,7 +584,8 @@ def main():
     
     # 使用checkpoint中的config重新创建模型（确保架构完全一致）
     model = PatchVQVAETransformer(checkpoint_config).to(device)
-    freeze_encoder_vq(model)
+    # 测试阶段只跑 no_grad，冻/不冻不影响结果；这里保持与训练阶段一致以防混淆
+    freeze_encoder_vq(model, unfreeze_decoder=bool(getattr(args, 'unfreeze_decoder', 0)))
     print("✓ 已使用checkpoint config重新创建模型")
     
     # 加载权重
@@ -470,13 +600,27 @@ def main():
         if unexpected_keys:
             print(f"警告: 以下权重未使用: {unexpected_keys[:10]}..." if len(unexpected_keys) > 10 else f"警告: 以下权重未使用: {unexpected_keys}")
     
-    mse, mae, preds, targets = test_model(model, dls.test, revin, args, device, use_amp)
+    mse, mae, preds, targets, test_token_metrics = test_model(model, dls.test, revin, args, device, use_amp)
     print(f'测试结果: MSE = {mse:.6f}, MAE = {mae:.6f}')
+    if test_token_metrics.get('token_acc') is not None:
+        layer_text = ', '.join(
+            f'L{i}:{acc * 100:.1f}%' for i, acc in enumerate(test_token_metrics.get('layer_acc', []))
+        )
+        print(f"测试 Token Acc: {test_token_metrics['token_acc'] * 100:.2f}%"
+              + (f" ({layer_text})" if layer_text else ""))
     
     # 保存结果
+    result_metrics = ['MSE', 'MAE']
+    result_values = [mse, mae]
+    if test_token_metrics.get('token_acc') is not None:
+        result_metrics.append('TokenAcc')
+        result_values.append(test_token_metrics['token_acc'])
+        for i, acc in enumerate(test_token_metrics.get('layer_acc', [])):
+            result_metrics.append(f'TokenAcc_L{i}')
+            result_values.append(acc)
     results_df = pd.DataFrame({
-        'metric': ['MSE', 'MAE'],
-        'value': [mse, mae]
+        'metric': result_metrics,
+        'value': result_values,
     })
     results_df.to_csv(save_dir / f'{model_name}_results.csv', index=False)
     
@@ -485,6 +629,7 @@ def main():
         'epoch': range(1, len(train_losses) + 1),
         'train_loss': train_losses,
         'valid_loss': valid_losses,
+        'valid_token_acc': valid_token_accs,
     })
     history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
     
