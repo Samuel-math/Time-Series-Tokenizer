@@ -8,30 +8,19 @@
 # 再针对多个预测长度进行微调。
 #
 # 使用方法:
-#   bash patch_vqvae_pretrain_then_finetune.sh <dataset> <context_points> <progressive_step_size>
+#   bash scripts/decoder_only_NTP/patch_vqvae_pretrain_then_finetune.sh <dataset> <context_points> <progressive_step_size>
 # 例如:
-#   bash patch_vqvae_pretrain_then_finetune.sh ettm1 1152 6
+#   bash scripts/decoder_only_NTP/patch_vqvae_pretrain_then_finetune.sh ettm1 1152 6
 # =====================================================
 
 # =====================================================
 # 输入参数检验
 # =====================================================
 
-DSET=ettm1
-PRETRAIN_CONTEXT_POINTS=512
+DSET=weather
+PRETRAIN_CONTEXT_POINTS=1024
 PROGRESSIVE_STEP_SIZE=3
 MODEL_ID=1
-
-# =====================================================
-# Overlapping Chunk Prediction（M < N 时生效）
-#   PRED_LEN            : N，每个 stage / 每次 forward 预测的 patch 数
-#                          空值 / 等于 PROGRESSIVE_STEP_SIZE → 退化为原始非重叠逻辑
-#   CONSISTENCY_WEIGHT  : 预训练阶段 overlap 一致性损失权重
-#                          （仅 N > M 时实际生效；N == M 时不产生损失）
-# 用法提示：令 PRED_LEN=12, STEP=6 即形成 50% 重叠的 overlapping chunks；
-#          Finetune 若未显式设置 PRED_LEN，会自动继承预训练 checkpoint 里的值。
-# =====================================================
-PRED_LEN=6                # 留空 = 等于 PROGRESSIVE_STEP_SIZE（不启用重叠）
 
 # =====================================================
 # Patch / VQVAE 参数（自动从 checkpoint 读取，这里作为备用）
@@ -91,7 +80,7 @@ fi
 # =====================================================
 N_LAYERS=3
 N_HEADS=8
-D_FF=128
+D_FF=256
 DROPOUT=0.2
 CODEBOOK_EMA=1
 EMA_DECAY=0.99
@@ -108,29 +97,51 @@ VQ_WEIGHT=0.0       # 码本已冻结，设为 0
 RECON_WEIGHT=0.0    # 码本已冻结，设为 0
 DISABLE_EMA_UPDATE=1
 
-# 早停（patience 轮未显著改善则停止；warmup 期仍会保存 best model 但不触发早停）
-EARLY_STOP_PATIENCE=5
-EARLY_STOP_WARMUP=5
-EARLY_STOP_MIN_DELTA=1e-4
-EARLY_STOP_SMOOTH_K=1    # 用最近 K 个 epoch 的 val_loss 均值判据；1 表示不平滑
-
 # =====================================================
 # 微调参数
 # =====================================================
-FINETUNE_CONTEXT_POINTS=336
+FINETUNE_CONTEXT_POINTS=512
 FINETUNE_EPOCHS=50
 FINETUNE_BATCH_SIZE=64
 FINETUNE_LR=1e-4
-# TARGET_POINTS_LIST=(336)
 TARGET_POINTS_LIST=(96 192 336 720)
+# TARGET_POINTS_LIST=(96 192 336 720)
 
 # Gumbel-Softmax（微调阶段的码本查找）
 USE_GUMBEL_SOFTMAX=1
-GUMBEL_TEMPERATURE=0.8
+GUMBEL_TEMPERATURE=0.6
 GUMBEL_HARD=0
+EVAL_TOP_K=4
 
-# 自回归步长（留空 = 继承预训练 step_size；0 = 非自回归）
-AR_STEP_SIZE=6
+# 训练 loss（验证/测试始终用 MSE 报告，保持 benchmark 可比）
+#   mse       : 默认，与评估一致
+#   huber     : 对 outlier 鲁棒；delta 控制 L2→L1 切换阈值
+#   smooth_l1 : 同上，PyTorch 早期定义
+# RevIN 归一空间下 HUBER_DELTA 建议 0.3~1.0
+TRAIN_LOSS=mse
+HUBER_DELTA=3.5
+
+# =====================================================
+# Overlapping chunk prediction（pretrain / forecast 解耦）
+# =====================================================
+# Pretrain: M_p = PROGRESSIVE_STEP_SIZE，N_p = PRETRAIN_PRED_LEN
+#   PRETRAIN_PRED_LEN 留空 = 等于 PROGRESSIVE_STEP_SIZE（不启用预训练重叠）
+# Forecast: M_f = FORECAST_STEP_SIZE，N_f = FORECAST_PRED_LEN
+#   FORECAST_STEP_SIZE 留空 = 继承 checkpoint 的 progressive_step_size
+#   FORECAST_PRED_LEN  留空 = 继承 checkpoint 的 pred_len；若 checkpoint 未记录则等于 M_f
+#   长序列稳定性建议：N_f = 2~3 * M_f，让重叠 chunk 在概率级融合后再提交 token
+# 示例：PROGRESSIVE_STEP_SIZE=6, PRETRAIN_PRED_LEN=6, FORECAST_STEP_SIZE=6, FORECAST_PRED_LEN=12
+PRETRAIN_PRED_LEN=9
+FORECAST_STEP_SIZE=3
+FORECAST_PRED_LEN=9
+
+# =====================================================
+# 预训练早停参数
+# =====================================================
+EARLY_STOP_PATIENCE=5
+EARLY_STOP_WARMUP=5
+EARLY_STOP_MIN_DELTA=1e-4
+EARLY_STOP_SMOOTH_K=1      # 用最近 K 个 epoch 的 val_loss 均值判据；1 = 不平滑
 
 # =====================================================
 # 跳过预训练（直接用已有模型做微调）
@@ -152,16 +163,19 @@ FREEZE_VQVAE=1
 # 自动查找码本模型（如果指定路径不存在）
 # =====================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DECODER_DIR="${REPO_ROOT}/decoder_only_NTP"
+VQVAE_DIR="${REPO_ROOT}/vqvae-only"
 
 # 转换为绝对路径
 if [[ ! "${CODEBOOK_CHECKPOINT}" = /* ]]; then
-    CODEBOOK_CHECKPOINT="${SCRIPT_DIR}/${CODEBOOK_CHECKPOINT}"
+    CODEBOOK_CHECKPOINT="${DECODER_DIR}/${CODEBOOK_CHECKPOINT}"
 fi
 CODEBOOK_CHECKPOINT=$(readlink -f "${CODEBOOK_CHECKPOINT}" 2>/dev/null || realpath "${CODEBOOK_CHECKPOINT}" 2>/dev/null || echo "${CODEBOOK_CHECKPOINT}")
 
 if [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
     echo "指定路径不存在，正在自动查找码本模型..."
-    VQ_ONLY_DIR="${SCRIPT_DIR}/../vqvae-only/saved_models/vqvae_only"
+    VQ_ONLY_DIR="${VQVAE_DIR}/saved_models/vqvae_only"
 
     # per-channel 模式优先查找 _perch 后缀的模型
     if [ "${PER_CHANNEL_CODEBOOK}" -eq 1 ]; then
@@ -174,12 +188,13 @@ if [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
 
     if [ -z "${CODEBOOK_CHECKPOINT}" ] || [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
         echo "错误: 未找到码本模型！"
-        echo "请先运行 vqvae-only/codebook_pretrain.sh 训练码本，或手动设置 CODEBOOK_CHECKPOINT"
+        echo "请先运行 scripts/vqvae-only/codebook_pretrain.sh 训练码本，或手动设置 CODEBOOK_CHECKPOINT"
         exit 1
     fi
 fi
 
 echo "找到码本模型: ${CODEBOOK_CHECKPOINT}"
+cd "${DECODER_DIR}"
 
 # =====================================================
 # 计算 code_dim 与模型名称
@@ -202,9 +217,10 @@ echo "================================================="
 echo "数据集         : ${DSET}"
 echo "码本模型       : ${CODEBOOK_CHECKPOINT}"
 echo "模型名称       : ${MODEL_NAME}"
-echo "渐进步长 M     : ${PROGRESSIVE_STEP_SIZE} patches"
-echo "预测长度 N     : ${PRED_LEN:-<= M (无重叠)}"
-echo "一致性权重     : ${CONSISTENCY_WEIGHT}"
+echo "Pretrain M_p   : ${PROGRESSIVE_STEP_SIZE} patches"
+echo "Pretrain N_p   : ${PRETRAIN_PRED_LEN:-<等于 M_p (无重叠)>}"
+echo "Forecast M_f   : ${FORECAST_STEP_SIZE:-<继承 checkpoint M_p>} patches"
+echo "Forecast N_f   : ${FORECAST_PRED_LEN:-<继承 checkpoint N_p / 默认等于 M_f>}"
 echo "Transformer 维度(code_dim): ${CODE_DIM}"
 echo "Per-channel VQ : ${PER_CHANNEL_CODEBOOK}"
 echo "NMPP 模式      : ${USE_RAW_INPUT}"
@@ -257,22 +273,21 @@ PRETRAIN_ARGS=(
 # nargs='+' 参数需展开为多个独立值
 [ -n "${RQ_LAYER_WEIGHTS}" ] && PRETRAIN_ARGS+=(--rq_layer_weights ${RQ_LAYER_WEIGHTS})
 
+# Pretrain overlapping chunk 参数（留空时不传，Python 端默认等于 step_size）
+[ -n "${PRETRAIN_PRED_LEN}" ] && PRETRAIN_ARGS+=(--pred_len "${PRETRAIN_PRED_LEN}")
+
 # 早停参数
 PRETRAIN_ARGS+=(--early_stop_patience  "${EARLY_STOP_PATIENCE}")
 PRETRAIN_ARGS+=(--early_stop_warmup    "${EARLY_STOP_WARMUP}")
 PRETRAIN_ARGS+=(--early_stop_min_delta "${EARLY_STOP_MIN_DELTA}")
 PRETRAIN_ARGS+=(--early_stop_smooth_k  "${EARLY_STOP_SMOOTH_K}")
 
-# Overlapping chunk 参数（PRED_LEN 为空时不传，python 端默认等于 step_size）
-[ -n "${PRED_LEN}" ] && PRETRAIN_ARGS+=(--pred_len "${PRED_LEN}")
-[ -n "${CONSISTENCY_WEIGHT}" ] && PRETRAIN_ARGS+=(--consistency_weight "${CONSISTENCY_WEIGHT}")
-
 python patch_vqvae_pretrain.py "${PRETRAIN_ARGS[@]}"
 
 # =====================================================
 # 阶段 2: 微调（多预测长度）
 # =====================================================
-PRETRAINED_MODEL="${SCRIPT_DIR}/saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
+PRETRAINED_MODEL="${DECODER_DIR}/saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
 PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${PRETRAINED_MODEL}" 2>/dev/null || echo "${PRETRAINED_MODEL}")
 
 if [ ! -f "${PRETRAINED_MODEL}" ]; then
@@ -295,6 +310,7 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
     echo ""
     echo "-------------------------------------------------"
     echo "微调: Target Points = ${TARGET_POINTS}"
+    echo "Forecast M_f: ${FORECAST_STEP_SIZE:-<继承 checkpoint M_p>} | N_f: ${FORECAST_PRED_LEN:-<继承 checkpoint N_p / 默认等于 M_f>}"
     echo "-------------------------------------------------"
 
     python patch_vqvae_finetune.py \
@@ -310,8 +326,11 @@ for TARGET_POINTS in "${TARGET_POINTS_LIST[@]}"; do
         --use_gumbel_softmax "${USE_GUMBEL_SOFTMAX}" \
         --gumbel_temperature "${GUMBEL_TEMPERATURE}" \
         --gumbel_hard "${GUMBEL_HARD}" \
-        ${AR_STEP_SIZE:+--ar_step_size "${AR_STEP_SIZE}"} \
-        ${PRED_LEN:+--pred_len "${PRED_LEN}"} \
+        --eval_top_k "${EVAL_TOP_K}" \
+        --train_loss "${TRAIN_LOSS}" \
+        --huber_delta "${HUBER_DELTA}" \
+        ${FORECAST_STEP_SIZE:+--ar_step_size "${FORECAST_STEP_SIZE}"} \
+        ${FORECAST_PRED_LEN:+--pred_len "${FORECAST_PRED_LEN}"} \
         --model_id "${MODEL_ID}"
 done
 

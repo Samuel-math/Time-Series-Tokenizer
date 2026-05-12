@@ -17,6 +17,59 @@ DSETS = ['ettm1', 'ettm2', 'etth1', 'etth2', 'electricity',
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATASETS_ROOT = os.path.join(_SCRIPT_DIR, 'datasets')
 
+
+class ChannelSliceDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that keeps a channel range or arbitrary channel indices."""
+
+    def __init__(self, dataset, channel_start=None, channel_end=None, channel_indices=None):
+        self.dataset = dataset
+        self.full_vars = dataset[0][0].shape[1]
+        self.channel_indices = None
+
+        if channel_indices is not None:
+            if isinstance(channel_indices, str):
+                channel_indices = [int(x) for x in channel_indices.split(',') if x.strip()]
+            channel_indices = [int(x) for x in channel_indices]
+            if not channel_indices:
+                raise ValueError("channel_indices is empty")
+            if min(channel_indices) < 0 or max(channel_indices) >= self.full_vars:
+                raise ValueError(
+                    f"Invalid channel_indices {channel_indices} for dataset with {self.full_vars} channels"
+                )
+            self.channel_indices = torch.tensor(channel_indices, dtype=torch.long)
+            self.channel_start = min(channel_indices)
+            self.channel_end = max(channel_indices) + 1
+        else:
+            start = 0 if channel_start is None else int(channel_start)
+            end = self.full_vars if channel_end is None else int(channel_end)
+            if not (0 <= start < end <= self.full_vars):
+                raise ValueError(
+                    f"Invalid channel range [{start}, {end}) for dataset with {self.full_vars} channels"
+                )
+            self.channel_start = start
+            self.channel_end = end
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        values = list(item)
+        # Time-series tensors are returned as [T, C]. Time feature tensors, if
+        # present, are kept unchanged because they are timestamp features.
+        if self.channel_indices is not None:
+            idx = self.channel_indices
+            values[0] = values[0].index_select(1, idx) if torch.is_tensor(values[0]) else values[0][:, idx.numpy()]
+            values[1] = values[1].index_select(1, idx) if torch.is_tensor(values[1]) else values[1][:, idx.numpy()]
+        else:
+            values[0] = values[0][:, self.channel_start:self.channel_end]
+            values[1] = values[1][:, self.channel_start:self.channel_end]
+        return tuple(values)
+
+
 def get_dls(params):
     
     assert params.dset in DSETS, f"Unrecognized dset (`{params.dset}`). Options include: {DSETS}"
@@ -53,7 +106,27 @@ def get_dls(params):
     }
     
     datasetCls, data_path = dataset_config[params.dset]
-    
+
+    channel_start = getattr(params, 'channel_start', None)
+    channel_end = getattr(params, 'channel_end', None)
+    channel_indices = getattr(params, 'channel_indices', None)
+
+    # argparse may pass -1/None-like values when users want the full channel set.
+    if channel_start is not None and int(channel_start) < 0:
+        channel_start = None
+    if channel_end is not None and int(channel_end) < 0:
+        channel_end = None
+    if channel_start is not None:
+        channel_start = int(channel_start)
+    if channel_end is not None:
+        channel_end = int(channel_end)
+
+    use_channel_slice = channel_indices is not None or channel_start is not None or channel_end is not None
+    baseDatasetCls = datasetCls
+    if use_channel_slice:
+        def datasetCls(**kwargs):
+            return ChannelSliceDataset(baseDatasetCls(**kwargs), channel_start, channel_end, channel_indices)
+
     dls = DataLoaders(
         datasetCls=datasetCls,
         dataset_kwargs={
@@ -67,6 +140,20 @@ def get_dls(params):
         batch_size=params.batch_size,
         workers=params.num_workers,
     )
+    if use_channel_slice:
+        dls.channel_start = dls.train.dataset.channel_start
+        dls.channel_end = dls.train.dataset.channel_end
+        dls.channel_indices = (
+            dls.train.dataset.channel_indices.tolist()
+            if dls.train.dataset.channel_indices is not None else None
+        )
+        dls.full_vars = dls.train.dataset.full_vars
+    else:
+        dls.channel_start = None
+        dls.channel_end = None
+        dls.channel_indices = None
+        dls.full_vars = dls.train.dataset[0][0].shape[1]
+
     # dataset is assume to have dimension len x nvars
     dls.vars, dls.len = dls.train.dataset[0][0].shape[1], params.context_points
     dls.c = dls.train.dataset[0][1].shape[0]

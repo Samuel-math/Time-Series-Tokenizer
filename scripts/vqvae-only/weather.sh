@@ -78,6 +78,11 @@ ORTH_START_EPOCH=0
 # 线性 warmup epoch 数：从 orth_start_epoch 起线性增大到 orth_weight
 ORTH_WARMUP_EPOCHS=5
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+VQVAE_DIR="${REPO_ROOT}/vqvae-only"
+cd "${VQVAE_DIR}"
+
 python codebook_pretrain.py \
     --dset $DSET \
     --context_points $CONTEXT_POINTS \

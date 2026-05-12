@@ -8,9 +8,9 @@
 # 再针对多个预测长度进行微调。
 #
 # 使用方法:
-#   bash patch_vqvae_pretrain_then_finetune.sh <dataset> <context_points> <progressive_step_size>
+#   bash scripts/decoder_only_NTP/patch_vqvae_pretrain_then_finetune.sh <dataset> <context_points> <progressive_step_size>
 # 例如:
-#   bash patch_vqvae_pretrain_then_finetune.sh ettm1 1152 6
+#   bash scripts/decoder_only_NTP/patch_vqvae_pretrain_then_finetune.sh ettm1 1152 6
 # =====================================================
 
 # =====================================================
@@ -162,16 +162,19 @@ FREEZE_VQVAE=1
 # 自动查找码本模型（如果指定路径不存在）
 # =====================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DECODER_DIR="${REPO_ROOT}/decoder_only_NTP"
+VQVAE_DIR="${REPO_ROOT}/vqvae-only"
 
 # 转换为绝对路径
 if [[ ! "${CODEBOOK_CHECKPOINT}" = /* ]]; then
-    CODEBOOK_CHECKPOINT="${SCRIPT_DIR}/${CODEBOOK_CHECKPOINT}"
+    CODEBOOK_CHECKPOINT="${DECODER_DIR}/${CODEBOOK_CHECKPOINT}"
 fi
 CODEBOOK_CHECKPOINT=$(readlink -f "${CODEBOOK_CHECKPOINT}" 2>/dev/null || realpath "${CODEBOOK_CHECKPOINT}" 2>/dev/null || echo "${CODEBOOK_CHECKPOINT}")
 
 if [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
     echo "指定路径不存在，正在自动查找码本模型..."
-    VQ_ONLY_DIR="${SCRIPT_DIR}/../vqvae-only/saved_models/vqvae_only"
+    VQ_ONLY_DIR="${VQVAE_DIR}/saved_models/vqvae_only"
 
     # per-channel 模式优先查找 _perch 后缀的模型
     if [ "${PER_CHANNEL_CODEBOOK}" -eq 1 ]; then
@@ -184,12 +187,13 @@ if [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
 
     if [ -z "${CODEBOOK_CHECKPOINT}" ] || [ ! -f "${CODEBOOK_CHECKPOINT}" ]; then
         echo "错误: 未找到码本模型！"
-        echo "请先运行 vqvae-only/codebook_pretrain.sh 训练码本，或手动设置 CODEBOOK_CHECKPOINT"
+        echo "请先运行 scripts/vqvae-only/codebook_pretrain.sh 训练码本，或手动设置 CODEBOOK_CHECKPOINT"
         exit 1
     fi
 fi
 
 echo "找到码本模型: ${CODEBOOK_CHECKPOINT}"
+cd "${DECODER_DIR}"
 
 # =====================================================
 # 计算 code_dim 与模型名称
@@ -282,7 +286,7 @@ PRETRAIN_ARGS+=(--early_stop_smooth_k  "${EARLY_STOP_SMOOTH_K}")
 # =====================================================
 # 阶段 2: 微调（多预测长度）
 # =====================================================
-PRETRAINED_MODEL="${SCRIPT_DIR}/saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
+PRETRAINED_MODEL="${DECODER_DIR}/saved_models/patch_vqvae/${DSET}/${MODEL_NAME}.pth"
 PRETRAINED_MODEL=$(readlink -f "${PRETRAINED_MODEL}" 2>/dev/null || realpath "${PRETRAINED_MODEL}" 2>/dev/null || echo "${PRETRAINED_MODEL}")
 
 if [ ! -f "${PRETRAINED_MODEL}" ]; then

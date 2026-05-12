@@ -42,15 +42,27 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
     parser.add_argument('--scaler', type=str, default='standard', help='数据缩放方式')
     parser.add_argument('--features', type=str, default='M', help='特征类型')
+    parser.add_argument('--channel_start', type=int, default=None,
+                        help='只使用变量维度中的起始 channel（包含）；None 表示从 0 开始')
+    parser.add_argument('--channel_end', type=int, default=None,
+                        help='只使用变量维度中的结束 channel（不包含）；None 表示到最后')
+    parser.add_argument('--channel_indices', type=str, default=None,
+                        help='逗号分隔的任意 channel 索引列表；设置后优先于 channel_start/end')
     
     # 模型参数（与PatchVQVAETransformer一致）
     parser.add_argument('--patch_size', type=int, default=16, help='Patch大小')
     parser.add_argument('--embedding_dim', type=int, default=32, help='Embedding维度')
     parser.add_argument('--codebook_size', type=int, default=256, help='码本大小')
-    parser.add_argument('--compression_factor', type=int, default=4, choices=[4, 8, 12, 16], help='压缩因子')
+    parser.add_argument('--compression_factor', type=int, default=4, help='压缩因子')
     parser.add_argument('--num_hiddens', type=int, default=64, help='隐藏层维度')
     parser.add_argument('--num_residual_layers', type=int, default=2, help='残差层数')
     parser.add_argument('--num_residual_hiddens', type=int, default=32, help='残差隐藏层维度')
+    parser.add_argument('--vqvae_backbone', type=str, default='mlp',
+                        help='VQVAE Encoder/Decoder backbone: mlp=旧结构, linear=单层线性结构, conv_linear=一层卷积+线性投影, tcn=Conv1d/TCN结构, chunk_mlp=分块Linear结构')
+    parser.add_argument('--vqvae_tcn_kernel_size', type=int, default=5,
+                        help='TCN backbone 的 Conv1d kernel size（需为奇数；仅 vqvae_backbone=tcn 时使用）')
+    parser.add_argument('--vqvae_chunk_size', type=int, default=2,
+                        help='chunk_mlp backbone 的 patch 分块大小（需整除 patch_size）')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
     parser.add_argument('--codebook_ema', type=int, default=0, help='是否使用EMA更新码本')
     parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减率')
@@ -83,6 +95,8 @@ def parse_args():
     # 保存参数
     parser.add_argument('--save_path', type=str, default='saved_models/vqvae_only/', help='模型保存路径')
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
+    parser.add_argument('--channel_group_id', type=int, default=None,
+                        help='任意 channel_indices 分组时用于 checkpoint 后缀的 group id')
     
     # Per-channel 码本
     parser.add_argument('--per_channel_codebook', type=int, default=0,
@@ -123,6 +137,19 @@ def parse_args():
     return parser.parse_args()
 
 
+def channel_suffix(args):
+    """Checkpoint suffix for channel-group training."""
+    indices = getattr(args, 'channel_indices', None)
+    if indices:
+        gid = getattr(args, 'channel_group_id', None)
+        return f'_grp{gid if gid is not None else "custom"}'
+    start = getattr(args, 'channel_start', None)
+    end = getattr(args, 'channel_end', None)
+    if start is None and end is None:
+        return ''
+    return f'_ch{0 if start is None else start}-{end if end is not None else "end"}'
+
+
 def get_model_config(args):
     """构建模型配置"""
     config = {
@@ -138,10 +165,16 @@ def get_model_config(args):
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
+        'vqvae_backbone': getattr(args, 'vqvae_backbone', 'mlp'),
+        'vqvae_tcn_kernel_size': int(getattr(args, 'vqvae_tcn_kernel_size', 5)),
+        'vqvae_chunk_size': int(getattr(args, 'vqvae_chunk_size', 2)),
         'use_patch_attention': False,
         'n_rq_layers': int(getattr(args, 'n_rq_layers', 1)),
         'sparse_weight': float(getattr(args, 'sparse_weight', 0.0)),
         'sparse_amplitude': float(getattr(args, 'sparse_amplitude', 0.5)),
+        'channel_start': getattr(args, 'channel_start', None),
+        'channel_end': getattr(args, 'channel_end', None),
+        'channel_indices': getattr(args, 'channel_indices', None),
     }
     return config
 
@@ -313,7 +346,10 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, epoch
     # per-layer decode：只要 n_rq_layers >= 2 就启用；
     # 重构 = X_1 + X_2 + ... + X_L（各层分别解码后叠加）
     use_per_layer = int(getattr(args, 'n_rq_layers', 1)) >= 2
-    use_order = lambda_ord > 0 and use_per_layer
+    use_order = (
+        lambda_ord > 0 and use_per_layer
+        and not getattr(model, 'uses_frequency_codebooks', False)
+    )
     per_layer_g_sum = None   # lazily init: List[L] of float
     per_layer_gap_sum = None  # List[L-1] of float
     n_batches = 0
@@ -475,7 +511,10 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_order_loss = 0
     lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
     use_per_layer = int(getattr(args, 'n_rq_layers', 1)) >= 2
-    use_order = lambda_ord > 0 and use_per_layer
+    use_order = (
+        lambda_ord > 0 and use_per_layer
+        and not getattr(model, 'uses_frequency_codebooks', False)
+    )
     per_layer_g_sum = None
     per_layer_gap_sum = None
     n_batches = 0
@@ -650,12 +689,26 @@ def main():
     code_dim = args.embedding_dim * (args.patch_size // args.compression_factor)
     per_ch_suffix = '_perch' if args.per_channel_codebook else ''
     rvq_suffix = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
-    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}_model{args.model_id}'
+    backbone = str(getattr(args, 'vqvae_backbone', 'mlp')).lower()
+    if backbone == 'mlp':
+        backbone_suffix = ''
+    elif backbone == 'linear':
+        backbone_suffix = '_linear'
+    elif backbone == 'conv_linear':
+        backbone_suffix = f'_convlineark{int(getattr(args, "vqvae_tcn_kernel_size", 5))}'
+    elif backbone == 'tcn':
+        backbone_suffix = f'_tcnk{int(getattr(args, "vqvae_tcn_kernel_size", 5))}'
+    else:
+        backbone_suffix = f'_{backbone}c{int(getattr(args, "vqvae_chunk_size", 2))}'
+    ch_suffix = channel_suffix(args)
+    model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}{backbone_suffix}_model{args.model_id}{ch_suffix}'
     
     # 获取数据
     args.dset_pretrain = args.dset
     dls = get_dls(args)
     print(f'Number of channels: {dls.vars}')
+    if getattr(dls, 'channel_start', None) is not None:
+        print(f'Channel group: [{dls.channel_start}, {dls.channel_end}) / full channels = {dls.full_vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}')
     
     # 对训练集和验证集进行采样（如果指定了采样比例）
@@ -829,8 +882,9 @@ def main():
                 gap_str = ', '.join([f"Δg{l+1}->{l+2}={v:+.4f}" for l, v in enumerate(gaps)])
                 print(f"      Gap(Train): {gap_str}")
         
-        # 定期报告码本利用率（每5个epoch或每10个epoch）
         report_interval = getattr(args, 'codebook_report_interval', 5)
+
+        # 定期报告码本利用率（每5个epoch或每10个epoch）
         if (epoch + 1) % report_interval == 0 or epoch == 0:
             train_usage = train_stats.get('usage_rate', 0.0) * 100
             val_usage = val_stats.get('usage_rate', 0.0) * 100

@@ -10,8 +10,10 @@ Patch VQVAE + Transformer 渐进式预训练公共逻辑
 
 import argparse
 import json
+import random
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -43,6 +45,14 @@ def build_arg_parser():
     p.add_argument('--num_workers', type=int, default=0)
     p.add_argument('--scaler', type=str, default='standard')
     p.add_argument('--features', type=str, default='M')
+    p.add_argument('--channel_start', type=int, default=None,
+                   help='只使用变量维度中的起始 channel（包含）；None 表示从 0 开始')
+    p.add_argument('--channel_end', type=int, default=None,
+                   help='只使用变量维度中的结束 channel（不包含）；None 表示到最后')
+    p.add_argument('--channel_indices', type=str, default=None,
+                   help='逗号分隔的任意 channel 索引列表；设置后优先于 channel_start/end')
+    p.add_argument('--channel_group_id', type=int, default=None,
+                   help='任意 channel_indices 分组时用于 checkpoint 后缀的 group id')
 
     # 模型结构
     p.add_argument('--patch_size', type=int, default=16)
@@ -63,6 +73,12 @@ def build_arg_parser():
     p.add_argument('--num_hiddens', type=int, default=64)
     p.add_argument('--num_residual_layers', type=int, default=2)
     p.add_argument('--num_residual_hiddens', type=int, default=32)
+    p.add_argument('--vqvae_backbone', type=str, default='mlp',
+                   help='VQVAE Encoder/Decoder backbone: mlp=旧结构, linear=单层线性结构, conv_linear=一层卷积+线性投影, tcn=Conv1d/TCN结构, chunk_mlp=分块Linear结构')
+    p.add_argument('--vqvae_tcn_kernel_size', type=int, default=5,
+                   help='TCN backbone 的 Conv1d kernel size（需为奇数；仅 vqvae_backbone=tcn 时使用）')
+    p.add_argument('--vqvae_chunk_size', type=int, default=2,
+                   help='chunk_mlp backbone 的 patch 分块大小（需整除 patch_size）')
 
     # VQVAE checkpoint
     p.add_argument('--vqvae_checkpoint', type=str, default=None,
@@ -96,6 +112,7 @@ def build_arg_parser():
     p.add_argument('--n_epochs', type=int, default=100)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--seed', type=int, default=42)
     p.add_argument('--revin', type=int, default=1)
     p.add_argument('--vq_weight', type=float, default=1.0)
     p.add_argument('--recon_weight', type=float, default=0.1)
@@ -116,6 +133,29 @@ def build_arg_parser():
     p.add_argument('--run_id', type=int, default=None)
 
     return p
+
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _channel_suffix(args):
+    indices = getattr(args, 'channel_indices', None)
+    if indices:
+        gid = getattr(args, 'channel_group_id', None)
+        return f'_grp{gid if gid is not None else "custom"}'
+    start = getattr(args, 'channel_start', None)
+    end = getattr(args, 'channel_end', None)
+    if start is None and end is None:
+        return ''
+    return f'_ch{0 if start is None else start}-{end if end is not None else "end"}'
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +351,8 @@ def _disable_ema(model):
 def run_pretrain():
     args = build_arg_parser().parse_args()
     print('Args:', args)
+    set_global_seed(int(args.seed))
+    print(f'Seed set to: {int(args.seed)}')
 
     # NMPP 校验
     if args.use_raw_input:
@@ -330,17 +372,47 @@ def run_pretrain():
     nmpp_sfx  = '_nmpp'  if args.use_raw_input        else ''
     perch_sfx = '_perch' if args.per_channel_codebook else ''
     rvq_sfx   = f'_rvq{args.n_rq_layers}' if getattr(args, 'n_rq_layers', 1) > 1 else ''
+    backbone = str(getattr(args, 'vqvae_backbone', 'mlp')).lower()
+    if backbone == 'mlp':
+        backbone_sfx = ''
+    elif backbone == 'linear':
+        backbone_sfx = '_linear'
+    elif backbone == 'conv_linear':
+        backbone_sfx = f'_convlineark{int(getattr(args, "vqvae_tcn_kernel_size", 5))}'
+    elif backbone == 'tcn':
+        backbone_sfx = f'_tcnk{int(getattr(args, "vqvae_tcn_kernel_size", 5))}'
+    else:
+        backbone_sfx = f'_{backbone}c{int(getattr(args, "vqvae_chunk_size", 2))}'
     rid_sfx   = f'_run{args.run_id}' if args.run_id is not None else ''
+    ch_sfx    = _channel_suffix(args)
     model_name = (
         f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}'
         f'_l{args.n_layers}_in{args.context_points}_step{step_size}'
-        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{nmpp_sfx}'
+        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{backbone_sfx}{nmpp_sfx}{ch_sfx}'
     )
+    # 同名 pretrain 文件存在时，先清理旧文件再写入新结果（保持文件名稳定）。
+    existing_ckpt = save_dir / f'{model_name}.pth'
+    if existing_ckpt.exists():
+        old_artifacts = [
+            existing_ckpt,
+            save_dir / f'{model_name}_history.csv',
+            save_dir / f'{model_name}_results.csv',
+            save_dir / f'{model_name}_config.json',
+        ]
+        removed = []
+        for path in old_artifacts:
+            if path.exists():
+                path.unlink()
+                removed.append(path.name)
+        if removed:
+            print(f'检测到同名历史pretrain结果，已先删除: {", ".join(removed)}')
 
     # 数据
     args.dset_pretrain = args.dset
     dls = get_dls(args)
     print(f'Channels: {dls.vars} | Train batches: {len(dls.train)} | Val batches: {len(dls.valid)}')
+    if getattr(dls, 'channel_start', None) is not None:
+        print(f'Channel group: [{dls.channel_start}, {dls.channel_end}) / full channels = {dls.full_vars}')
 
     # 如果提供了 VQVAE checkpoint，先从其 config 覆盖 VQVAE 结构参数，
     # 防止 num_residual_hiddens 等参数与命令行默认值不一致导致 size mismatch
@@ -352,6 +424,7 @@ def run_pretrain():
                 'patch_size', 'embedding_dim', 'compression_factor',
                 'codebook_size', 'num_hiddens', 'num_residual_layers',
                 'num_residual_hiddens', 'commitment_cost',
+                'vqvae_backbone', 'vqvae_tcn_kernel_size', 'vqvae_chunk_size',
                 'codebook_ema', 'ema_decay', 'ema_eps',
             ]
             overridden = []
@@ -372,6 +445,10 @@ def run_pretrain():
     # 模型
     config = get_model_config(args)
     config['n_channels'] = dls.vars
+    config['channel_start'] = getattr(args, 'channel_start', None)
+    config['channel_end'] = getattr(args, 'channel_end', None)
+    config['channel_indices'] = getattr(args, 'channel_indices', None)
+    config['channel_group_id'] = getattr(args, 'channel_group_id', None)
     model = PatchVQVAETransformer(config).to(device)
 
     # 加载预训练 VQVAE

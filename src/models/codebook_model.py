@@ -10,7 +10,7 @@ PerChannelCodebookModel — 每个通道拥有独立 VQ（nn.ModuleList self.vqs
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .vqvae import Encoder, Decoder, SparseNet
+from .vqvae import SparseNet, build_encoder, build_decoder
 from .patch_vqvae_transformer import (
     FlattenedVectorQuantizer, FlattenedVectorQuantizerEMA, ResidualVQ,
 )
@@ -34,22 +34,8 @@ class CodebookModel(nn.Module):
         self.code_dim = self.embedding_dim * self.compressed_len
         
         # Encoder和Decoder（单通道，channel-independent）
-        self.encoder = Encoder(
-            in_channels=1,
-            num_hiddens=config['num_hiddens'],
-            num_residual_layers=config['num_residual_layers'],
-            num_residual_hiddens=config['num_residual_hiddens'],
-            embedding_dim=self.embedding_dim,
-            compression_factor=self.compression_factor
-        )
-        self.decoder = Decoder(
-            in_channels=self.embedding_dim,
-            num_hiddens=config['num_hiddens'],
-            num_residual_layers=config['num_residual_layers'],
-            num_residual_hiddens=config['num_residual_hiddens'],
-            compression_factor=self.compression_factor,
-            out_channels=1
-        )
+        self.encoder = build_encoder(config, in_channels=1)
+        self.decoder = build_decoder(config, in_channels=self.embedding_dim, out_channels=1)
         
         # VQ（包裹在 ResidualVQ 中；n_rq_layers=1 时等价于原来的单层 VQ）
         self.n_rq_layers = config.get('n_rq_layers', 1)
@@ -325,22 +311,8 @@ class PerChannelCodebookModel(nn.Module):
         self.code_dim = self.embedding_dim * self.compressed_len
 
         # 共享 Encoder / Decoder（channel-independent：单通道输入/输出）
-        self.encoder = Encoder(
-            in_channels=1,
-            num_hiddens=config['num_hiddens'],
-            num_residual_layers=config['num_residual_layers'],
-            num_residual_hiddens=config['num_residual_hiddens'],
-            embedding_dim=self.embedding_dim,
-            compression_factor=self.compression_factor,
-        )
-        self.decoder = Decoder(
-            in_channels=self.embedding_dim,
-            num_hiddens=config['num_hiddens'],
-            num_residual_layers=config['num_residual_layers'],
-            num_residual_hiddens=config['num_residual_hiddens'],
-            compression_factor=self.compression_factor,
-            out_channels=1,
-        )
+        self.encoder = build_encoder(config, in_channels=1)
+        self.decoder = build_decoder(config, in_channels=self.embedding_dim, out_channels=1)
 
         # 每个通道独立的 RVQ（键名 vqs.{c}.* 与 PatchVQVAETransformer 保持一致）
         self.n_rq_layers = config.get('n_rq_layers', 1)

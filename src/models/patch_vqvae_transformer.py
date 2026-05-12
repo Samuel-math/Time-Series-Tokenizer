@@ -15,7 +15,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from .vqvae import Encoder, Decoder
+try:
+    from .vqvae import build_encoder, build_decoder
+except ImportError:
+    from src.models.vqvae import build_encoder, build_decoder
 
 
 class FlattenedVectorQuantizer(nn.Module):
@@ -281,6 +284,43 @@ class ResidualVQ(nn.Module):
             return total_loss, z_q_sum, all_indices, per_layer_z_q
         return total_loss, z_q_sum, all_indices
 
+    def quantize_separate(self, z_parts, return_per_layer=False):
+        """
+        显式分量量化：z_parts[i] 直接交给第 i 层码本。
+        用于 low/high 频率拆分；n_layers=1 或未传够分量时仍可退化到残差量化。
+        """
+        if len(z_parts) == 0:
+            raise ValueError("z_parts must contain at least one tensor")
+
+        z_ref = torch.stack(z_parts, dim=0).sum(dim=0)
+        z_q_sum = torch.zeros_like(z_ref)
+        total_loss = z_ref.new_tensor(0.0)
+        all_indices = []
+        per_layer_z_q = [] if return_per_layer else None
+
+        n_direct = min(len(z_parts), self.n_layers)
+        for i in range(n_direct):
+            loss, z_q, idx = self.layers[i](z_parts[i])
+            z_q_sum = z_q_sum + z_q
+            total_loss = total_loss + loss
+            all_indices.append(idx)
+            if return_per_layer:
+                per_layer_z_q.append(z_q)
+
+        residual = z_ref - z_q_sum.detach()
+        for i in range(n_direct, self.n_layers):
+            loss, z_q, idx = self.layers[i](residual)
+            residual = residual - z_q.detach()
+            z_q_sum = z_q_sum + z_q
+            total_loss = total_loss + loss
+            all_indices.append(idx)
+            if return_per_layer:
+                per_layer_z_q.append(z_q)
+
+        if return_per_layer:
+            return total_loss, z_q_sum, all_indices, per_layer_z_q
+        return total_loss, z_q_sum, all_indices
+
     def get_embedding(self, indices_list):
         """
         indices_list: List[[N]] (length = n_rq_layers)
@@ -308,12 +348,46 @@ class ResidualVQ(nn.Module):
                 z_q = layer.embedding(idx)
                 residual = residual - z_q
 
+    def init_from_data_separate(self, z_samples_parts, method='kmeans'):
+        """按分量初始化码本；额外层继续初始化总表示残差。"""
+        if len(z_samples_parts) == 0:
+            raise ValueError("z_samples_parts must contain at least one tensor")
+
+        z_ref = torch.stack([z.detach() for z in z_samples_parts], dim=0).sum(dim=0)
+        z_q_sum = torch.zeros_like(z_ref)
+        n_direct = min(len(z_samples_parts), self.n_layers)
+
+        for i in range(n_direct):
+            layer = self.layers[i]
+            layer.init_from_data(z_samples_parts[i], method)
+            with torch.no_grad():
+                distances = (
+                    torch.sum(z_samples_parts[i] ** 2, dim=1, keepdim=True)
+                    + torch.sum(layer.embedding.weight ** 2, dim=1)
+                    - 2 * torch.matmul(z_samples_parts[i], layer.embedding.weight.t())
+                )
+                idx = torch.argmin(distances, dim=1)
+                z_q_sum = z_q_sum + layer.embedding(idx)
+
+        residual = z_ref - z_q_sum
+        for i in range(n_direct, self.n_layers):
+            layer = self.layers[i]
+            layer.init_from_data(residual, method)
+            with torch.no_grad():
+                distances = (
+                    torch.sum(residual ** 2, dim=1, keepdim=True)
+                    + torch.sum(layer.embedding.weight ** 2, dim=1)
+                    - 2 * torch.matmul(residual, layer.embedding.weight.t())
+                )
+                idx = torch.argmin(distances, dim=1)
+                residual = residual - layer.embedding(idx)
+
 
 class CausalTransformer(nn.Module):
-    """轻量级 Causal Transformer，支持独立的 hidden_dim 参数。
+    """轻量级 Causal Transformer，支持独立的 hidden_dim 参数
 
     性能说明：
-        使用 is_causal=True 让 nn.TransformerEncoder 走 fused SDP 路径
+        使用 is_causal=True 让 attention 走 fused SDP 路径
         （flash / memory-efficient attention），比显式 triu 布尔 mask 快 2~4×。
         语义上与三角 mask 完全等价。
     """
@@ -334,11 +408,13 @@ class CausalTransformer(nn.Module):
         self.drop = nn.Dropout(dropout)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden_dim, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, activation='gelu', batch_first=True
+            d_model=self.hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(self.hidden_dim)
 
     def forward(self, x):
         """
@@ -363,7 +439,6 @@ class CausalTransformer(nn.Module):
         causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
         x = self.transformer(x, mask=causal_mask, is_causal=True)
 
-        x = self.norm(x)
         if self.output_proj is not None:
             x = self.output_proj(x)
         return x
@@ -396,10 +471,12 @@ class PatchVQVAETransformer(nn.Module):
         self.num_residual_layers = config.get('num_residual_layers', 2)
         self.num_residual_hiddens = config.get('num_residual_hiddens', 32)
         
-        # 微调阶段的Gumbel-Softmax配置
-        self.use_gumbel_softmax = config.get('use_gumbel_softmax', True)  # 默认启用Gumbel-Softmax
-        self.gumbel_temperature = config.get('gumbel_temperature', 1.0)   # Gumbel-Softmax温度
-        self.gumbel_hard = config.get('gumbel_hard', False)               # 是否使用Straight-Through
+        # 微调阶段的码本分布配置。
+        # 历史参数名保留为 use_gumbel_softmax/gumbel_temperature，但这里不再采样 Gumbel 噪声；
+        # use_gumbel_softmax=True 表示使用 temperature softmax 做确定性 sharpen。
+        self.use_gumbel_softmax = config.get('use_gumbel_softmax', True)
+        self.gumbel_temperature = config.get('gumbel_temperature', 1.0)
+        self.gumbel_hard = config.get('gumbel_hard', False)
         
         # code_dim = embedding_dim * compressed_len
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
@@ -463,28 +540,39 @@ class PatchVQVAETransformer(nn.Module):
         self.chunk_gate_logits = nn.Parameter(torch.zeros(self.chunk_gate_max_rank))
 
         # Channel-independent: 每个通道独立处理，使用单通道Encoder/Decoder
-        self.encoder = Encoder(
-            in_channels=1,  # 单通道输入
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            embedding_dim=self.embedding_dim,
-            compression_factor=self.compression_factor
-        )
-        self.decoder = Decoder(
-            in_channels=self.embedding_dim,
-            num_hiddens=self.num_hiddens,
-            num_residual_layers=self.num_residual_layers,
-            num_residual_hiddens=self.num_residual_hiddens,
-            compression_factor=self.compression_factor,
-            out_channels=1  # 单通道输出
-        )
+        self.encoder = build_encoder(config, in_channels=1)
+        self.decoder = build_decoder(config, in_channels=self.embedding_dim, out_channels=1)
         
         # Channel Attention 已移除
     
     def _get_vq(self, c: int):
         """返回通道 c 对应的 VQ 模块（per_channel_codebook=True 时每通道独立，否则共享）"""
         return self.vqs[c] if self.per_channel_codebook else self.vq
+
+    @property
+    def uses_frequency_codebooks(self):
+        return self.n_rq_layers == 2
+
+    def _split_low_high(self, x_c):
+        """固定 moving-average 低通 + 残差高频，不引入额外参数。"""
+        kernel = min(5, self.patch_size)
+        if kernel % 2 == 0:
+            kernel -= 1
+        if kernel <= 1:
+            low = x_c
+        else:
+            low = F.avg_pool1d(
+                x_c, kernel_size=kernel, stride=1,
+                padding=kernel // 2, count_include_pad=False,
+            )
+        return low, x_c - low
+
+    def _encode_frequency_parts(self, x_c):
+        low, high = self._split_low_high(x_c)
+        return [
+            self.encoder(low, self.compression_factor).reshape(x_c.shape[0], self.code_dim),
+            self.encoder(high, self.compression_factor).reshape(x_c.shape[0], self.code_dim),
+        ]
 
     def _raw_patch_embedding_bc(self, x, B, num_patches, C):
         """原始 patch 线性投影，输出 [B*C, num_patches, code_dim]（NMPP 模式使用）"""
@@ -513,36 +601,25 @@ class PatchVQVAETransformer(nn.Module):
         x = x[:, :num_patches * self.patch_size, :]
         x_patches = x.reshape(B, num_patches, self.patch_size, C)
         
-        # Channel-independent: 对每个通道独立编码
-        z_list = []
-        
-        for c in range(C):
-            # 提取第c个通道的patches: [B, num_patches, patch_size]
-            x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
-            x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
-            x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
-            
-            # VQVAE Encoder (单通道输入)
-            z = self.encoder(x_c_flat, self.compression_factor)  # [B*num_patches, embedding_dim, compressed_len]
-            z_flat = z.reshape(B * num_patches, -1)  # [B*num_patches, code_dim]
-            z_c = z_flat.reshape(B, num_patches, self.code_dim)  # [B, num_patches, code_dim]
-            
-            z_list.append(z_c)
-        
-        # 合并所有通道: [B, num_patches, C, code_dim]
-        z_all = torch.stack(z_list, dim=2)  # [B, num_patches, C, code_dim]
-        
-        # VQ量化（对每个通道独立进行）
+        # Channel-independent: 对每个通道独立编码 + 量化
         indices_list = []
         z_q_list = []
         vq_loss_sum = 0
 
         for c in range(C):
-            z_c = z_all[:, :, c, :]  # [B, num_patches, code_dim]
-            z_c_flat = z_c.reshape(B * num_patches, self.code_dim)
+            # 提取第c个通道的patches: [B, num_patches, patch_size]
+            x_c = x_patches[:, :, :, c]  # [B, num_patches, patch_size]
+            x_c_flat = x_c.reshape(B * num_patches, self.patch_size)  # [B*num_patches, patch_size]
+            x_c_flat = x_c_flat.unsqueeze(1)  # [B*num_patches, 1, patch_size] (单通道输入)
 
             # RVQ（每通道独立码本或共享码本）
-            vq_loss_c, z_q_sum_c, all_idx_c = self._get_vq(c)(z_c_flat)
+            if self.uses_frequency_codebooks:
+                z_parts = self._encode_frequency_parts(x_c_flat)
+                vq_loss_c, z_q_sum_c, all_idx_c = self._get_vq(c).quantize_separate(z_parts)
+            else:
+                z = self.encoder(x_c_flat, self.compression_factor)
+                z_c_flat = z.reshape(B * num_patches, self.code_dim)
+                vq_loss_c, z_q_sum_c, all_idx_c = self._get_vq(c)(z_c_flat)
             vq_loss_sum += vq_loss_c
 
             # all_idx_c: List[n_rq_layers] of [B*num_patches]
@@ -770,16 +847,22 @@ class PatchVQVAETransformer(nn.Module):
                 return out.reshape(B * C, -1, code_dim)
             return torch.matmul(weights_bc, shared_codebooks_layers[l])
 
+        def _lookup_hard_codebook_at_layer(indices_bc, l):
+            """indices_bc: [B*C] → [B*C, 1, code_dim]，按 argmax id 查第 l 层 RVQ 码本"""
+            if self.per_channel_codebook:
+                idx = indices_bc.reshape(B, C)
+                emb = stacked_codebooks_layers[l].unsqueeze(0).expand(B, -1, -1, -1)
+                gather_idx = idx[:, :, None, None].expand(-1, -1, 1, code_dim)
+                return emb.gather(dim=2, index=gather_idx).reshape(B * C, 1, code_dim)
+            return shared_codebooks_layers[l][indices_bc].unsqueeze(1)
+
         def _softmax_or_gumbel(logits, keep_extra_dim=False):
-            """对 logits 做 (gumbel-)softmax。
+            """对 logits 做确定性的 temperature softmax。
             logits 形状：[B*C, P, K] 或 [B*C, K]
             若最后一维前没有 P 维，使用 keep_extra_dim=True 会先 unsqueeze(1)。"""
             x = logits.unsqueeze(1) if keep_extra_dim else logits
-            if self.use_gumbel_softmax and self.training:
-                return F.gumbel_softmax(
-                    x, tau=self.gumbel_temperature, hard=self.gumbel_hard, dim=-1
-                )
             tau = self.gumbel_temperature if self.use_gumbel_softmax else 1.0
+            tau = max(float(tau), 1e-6)
             return F.softmax(x / tau, dim=-1)
 
         def _decode_h_pred_all_layers(h_pred):
@@ -798,6 +881,15 @@ class PatchVQVAETransformer(nn.Module):
             for l, avg_l in enumerate(avg_logits_list):
                 w_l = _softmax_or_gumbel(avg_l, keep_extra_dim=True)  # [B*C, 1, K]
                 z_q_l = _lookup_codebook_at_layer(w_l, l)             # [B*C, 1, code_dim]
+                z_q_total = z_q_l if z_q_total is None else z_q_total + z_q_l
+            return z_q_total
+
+        def _decode_hard_logits_per_layer(logits_list):
+            """list[L] of [B*C, K] → [B*C, 1, code_dim]，用于自回归 context 的 hard first-hit 回填"""
+            z_q_total = None
+            for l, logits_l in enumerate(logits_list):
+                idx_l = logits_l.argmax(dim=-1)
+                z_q_l = _lookup_hard_codebook_at_layer(idx_l, l)
                 z_q_total = z_q_l if z_q_total is None else z_q_total + z_q_l
             return z_q_total
 
@@ -840,11 +932,13 @@ class PatchVQVAETransformer(nn.Module):
                 gate_logits = self.chunk_gate_logits[:max_rank_needed]
             gate = torch.sigmoid(gate_logits)  # [max_rank_needed]
 
-            # 对每层 RVQ 独立做重叠累积；gate 权重和所有层共享（不依赖层号）
-            # pos_logit_sum_layers[p] : list[L] of [B*C, K]
-            # pos_weight_sum[p]       : scalar tensor
-            pos_logit_sum_layers = {}
+            # 每个 chunk 先 logits -> sharpen softmax -> soft codebook vector，
+            # 再对同一未来位置的 soft code 向量做加权平均。
+            # pos_code_sum[p]   : [B*C, 1, code_dim]
+            # pos_weight_sum[p] : scalar tensor
+            pos_code_sum = {}
             pos_weight_sum       = {}
+            pos_first_hard_code = {}
 
             current_context = context_flat
             committed_list  = []   # 每项 [B*C, 1, code_dim]
@@ -865,29 +959,30 @@ class PatchVQVAETransformer(nn.Module):
                 # list[L] of [B*C, N, K]
                 logits_chunk_layers = [head(h_chunk) for head in self.output_heads]
 
-                # 把本 chunk 的每个位置 logit 加权累积到全局融合表（每层独立累积）。
+                # 把本 chunk 的每个位置先查成 soft code，再加权累积到全局融合表。
                 # 关键：本 chunk 在 offset o 是位置 p=abs_start+o 的第 floor(o/M) 个 coverer。
-                # gate 按 rank 分组，不依赖层号 → 所有层共享同一 weight_sum。
+                # gate 按 rank 分组，不依赖层号。
                 for offset in range(eff_pred_len):
                     p = abs_start + offset
                     if p >= num_pred_patches:
                         break
                     rank = offset // step_size
                     w    = gate[rank]                                # scalar (learnable)
-                    if p not in pos_logit_sum_layers:
-                        pos_logit_sum_layers[p] = [
-                            logits_chunk_layers[l][:, offset, :] * w for l in range(n_rq)
-                        ]
+                    logits_at_p = [
+                        logits_chunk_layers[l][:, offset, :] for l in range(n_rq)
+                    ]
+                    code_at_p = _decode_avg_logits_per_layer(logits_at_p)  # [B*C, 1, code_dim]
+                    if p not in pos_code_sum:
+                        pos_code_sum[p] = code_at_p * w
                         pos_weight_sum[p] = w
+                        pos_first_hard_code[p] = _decode_hard_logits_per_layer(logits_at_p).detach()
                     else:
-                        for l in range(n_rq):
-                            pos_logit_sum_layers[p][l] = (
-                                pos_logit_sum_layers[p][l]
-                                + logits_chunk_layers[l][:, offset, :] * w
-                            )
+                        pos_code_sum[p] = pos_code_sum[p] + code_at_p * w
                         pos_weight_sum[p] = pos_weight_sum[p] + w
 
-                # 提交本步的 step_size 个位置（对每层独立做加权均值 → softmax → 查码本 → 累加）
+                # 提交本步的 step_size 个位置。
+                # 最终输出仍使用带梯度的 fused code；喂回下一步 context 的版本使用
+                # 该位置第一次被预测到时的 hard code，保证自回归输入始终落在码本元素上。
                 commit_len = min(step_size, eff_pred_len)
                 new_codes = []
                 for offset in range(commit_len):
@@ -895,17 +990,17 @@ class PatchVQVAETransformer(nn.Module):
                     if p >= num_pred_patches:
                         break
                     denom = pos_weight_sum[p] + 1e-8
-                    avg_logits_list = [
-                        pos_logit_sum_layers[p][l] / denom for l in range(n_rq)
-                    ]  # list[L] of [B*C, K]
                     if return_token_metrics:
-                        for l, avg_l in enumerate(avg_logits_list):
-                            pred_idx_committed_layers[l].append(avg_l.argmax(dim=-1, keepdim=True))
-                    code = _decode_avg_logits_per_layer(avg_logits_list)  # [B*C, 1, code_dim]
-                    new_codes.append(code)
+                        # token 诊断仍使用当前提交 chunk 在该位置的原始 logits argmax。
+                        for l in range(n_rq):
+                            pred_idx_committed_layers[l].append(
+                                logits_chunk_layers[l][:, offset, :].argmax(dim=-1, keepdim=True)
+                            )
+                    code = pos_code_sum[p] / denom  # [B*C, 1, code_dim]
+                    new_codes.append(pos_first_hard_code[p])
                     committed_list.append(code)
 
-                # 用本步提交的 codes 延伸 context（供下一步使用）
+                # 用本步提交的 hard detached codes 延伸 context（供下一步使用）
                 if new_codes:
                     current_context = torch.cat(
                         [current_context, torch.cat(new_codes, dim=1)], dim=1
@@ -1204,6 +1299,10 @@ def get_model_config(args):
         'num_hiddens': args.num_hiddens,
         'num_residual_layers': args.num_residual_layers,
         'num_residual_hiddens': args.num_residual_hiddens,
+        # VQVAE backbone: mlp 保持旧结构；tcn 启用 Conv1d/TCN codec
+        'vqvae_backbone': getattr(args, 'vqvae_backbone', 'mlp'),
+        'vqvae_tcn_kernel_size': int(getattr(args, 'vqvae_tcn_kernel_size', 5)),
+        'vqvae_chunk_size': int(getattr(args, 'vqvae_chunk_size', 2)),
         # Transformer hidden_dim（可选，默认使用code_dim）
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
         # 每通道独立码本（默认False，与旧行为兼容）

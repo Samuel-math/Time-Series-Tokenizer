@@ -6,12 +6,14 @@ Patch-based VQVAE + Transformer 微调脚本
 import numpy as np
 import pandas as pd
 import os
+import random
 import sys
 import json
+import copy
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.optim import AdamW
+from torch.optim import AdamW, SGD, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 from torch.cuda import amp
 import argparse
@@ -27,6 +29,52 @@ from src.basics import set_device
 from datautils import get_dls
 
 
+class Lion(Optimizer):
+    """Minimal Lion optimizer (decoupled weight decay)."""
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        if lr <= 0.0:
+            raise ValueError(f'Invalid learning rate: {lr}')
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f'Invalid beta parameter at index 0: {betas[0]}')
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f'Invalid beta parameter at index 1: {betas[1]}')
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            weight_decay = group['weight_decay']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError('Lion does not support sparse gradients')
+
+                # Decoupled weight decay, aligned with AdamW style.
+                if weight_decay != 0:
+                    p.mul_(1 - lr * weight_decay)
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state['exp_avg'] = torch.zeros_like(p)
+
+                exp_avg = state['exp_avg']
+                update = exp_avg.mul(beta1).add(grad, alpha=1 - beta1)
+                p.add_(update.sign(), alpha=-lr)
+                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+        return loss
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Patch VQVAE Transformer 微调')
     
@@ -38,6 +86,14 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
     parser.add_argument('--scaler', type=str, default='standard', help='数据缩放方式')
     parser.add_argument('--features', type=str, default='M', help='特征类型')
+    parser.add_argument('--channel_start', type=int, default=None,
+                        help='只使用变量维度中的起始 channel（包含）；None 表示从 0 开始')
+    parser.add_argument('--channel_end', type=int, default=None,
+                        help='只使用变量维度中的结束 channel（不包含）；None 表示到最后')
+    parser.add_argument('--channel_indices', type=str, default=None,
+                        help='逗号分隔的任意 channel 索引列表；设置后优先于 channel_start/end')
+    parser.add_argument('--channel_group_id', type=int, default=None,
+                        help='任意 channel_indices 分组时用于 checkpoint 后缀的 group id')
     
     # 预训练模型参数
     parser.add_argument('--pretrained_model', type=str, required=True, help='预训练模型路径')
@@ -49,6 +105,7 @@ def parse_args():
     parser.add_argument('--revin', type=int, default=1, help='是否使用RevIN')
     parser.add_argument('--amp', type=int, default=1, help='是否启用混合精度')
     parser.add_argument('--run_id', type=int, default=None, help='运行ID（用于多次运行同一参数组合）')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子（默认 42）')
 
     # 训练 loss 类型（验证/测试始终用 MSE 报告，保持与 benchmark 可比）
     parser.add_argument('--train_loss', type=str, default='mse',
@@ -82,6 +139,29 @@ def parse_args():
     parser.add_argument('--model_id', type=int, default=1, help='模型ID')
     
     return parser.parse_args()
+
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def channel_suffix(args):
+    indices = getattr(args, 'channel_indices', None)
+    if indices:
+        gid = getattr(args, 'channel_group_id', None)
+        return f'_grp{gid if gid is not None else "custom"}'
+    start = getattr(args, 'channel_start', None)
+    end = getattr(args, 'channel_end', None)
+    if start is None and end is None:
+        return ''
+    return f'_ch{0 if start is None else start}-{end if end is not None else "end"}'
 
 
 def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
@@ -129,12 +209,25 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     # 创建模型（使用model_config，包含Gumbel-Softmax配置）
     model = PatchVQVAETransformer(model_config).to(device)
     
-    # 直接加载所有权重，使用strict=False允许架构差异
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        print(f"警告: 以下权重未加载: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"警告: 以下权重未加载: {missing_keys}")
-    if unexpected_keys:
-        print(f"警告: 以下权重未使用: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"警告: 以下权重未使用: {unexpected_keys}")
+    # 先严格加载；若失败，打印缺失/多余键后再回退 strict=False 以保持兼容。
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print("✓ 预训练权重加载成功（strict=True）")
+    except RuntimeError as e:
+        print(f"警告: strict=True 加载失败，回退 strict=False: {e}")
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(
+                f"警告: missing keys ({len(missing_keys)}): {missing_keys[:10]}..."
+                if len(missing_keys) > 10 else
+                f"警告: missing keys ({len(missing_keys)}): {missing_keys}"
+            )
+        if unexpected_keys:
+            print(
+                f"警告: unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:10]}..."
+                if len(unexpected_keys) > 10 else
+                f"警告: unexpected keys ({len(unexpected_keys)}): {unexpected_keys}"
+            )
     
     print(f'预训练模型配置: {config}')
     print(f'预训练验证损失: {checkpoint.get("val_loss", "N/A")}')
@@ -226,7 +319,8 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
     的精度损失导致 best epoch 选择不稳。参数 use_amp 仅为了兼容调用方签名。
     """
     model.eval()
-    total_loss = 0
+    total_mse = 0
+    total_mae = 0
     total_token_acc = 0.0
     layer_acc_sum = None
     metric_batches = 0
@@ -253,8 +347,11 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
             if revin:
                 pred = revin(pred, 'denorm')
 
-            mse_loss = F.mse_loss(pred.float(), batch_y, reduction='mean')
-            total_loss += mse_loss.item()
+            pred_f = pred.float()
+            mse_loss = F.mse_loss(pred_f, batch_y, reduction='mean')
+            mae_loss = F.l1_loss(pred_f, batch_y, reduction='mean')
+            total_mse += mse_loss.item()
+            total_mae += mae_loss.item()
             if token_metrics.get('token_acc') is not None:
                 total_token_acc += token_metrics['token_acc']
                 if layer_acc_sum is None:
@@ -264,9 +361,13 @@ def validate_epoch(model, dataloader, revin, args, device, use_amp):
                 metric_batches += 1
             n_batches += 1
 
-    avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+    avg_mse = total_mse / n_batches if n_batches > 0 else 0.0
+    avg_mae = total_mae / n_batches if n_batches > 0 else 0.0
     return {
-        'loss': avg_loss,
+        'mse': avg_mse,
+        'mae': avg_mae,
+        'score': avg_mse + avg_mae,  # best epoch uses MSE + MAE
+        'loss': avg_mse,  # backward-compatible alias; validation loss is MSE.
         'token_acc': total_token_acc / metric_batches if metric_batches > 0 else None,
         'layer_acc': [v / metric_batches for v in layer_acc_sum] if metric_batches > 0 else [],
     }
@@ -337,6 +438,8 @@ def test_model(model, dataloader, revin, args, device, use_amp):
 def main():
     args = parse_args()
     print('Args:', args)
+    set_global_seed(int(args.seed))
+    print(f'Seed set to: {int(args.seed)}')
     
     # CausalTransformer 现已走 is_causal=True 的 fused SDP 路径，无需禁用 flash/mem-efficient attention
 
@@ -354,6 +457,8 @@ def main():
     args.dset_finetune = args.dset
     dls = get_dls(args)
     print(f'Number of channels: {dls.vars}')
+    if getattr(dls, 'channel_start', None) is not None:
+        print(f'Channel group: [{dls.channel_start}, {dls.channel_end}) / full channels = {dls.full_vars}')
     print(f'Train batches: {len(dls.train)}, Valid batches: {len(dls.valid)}, Test batches: {len(dls.test)}')
     
     # 加载预训练模型（传入args以配置Gumbel-Softmax）
@@ -366,6 +471,19 @@ def main():
     missing_keys = [key for key in required_config_keys if key not in config]
     if missing_keys:
         raise ValueError(f"配置不完整，缺少以下键: {missing_keys}")
+
+    ckpt_ch_start = config.get('channel_start', pretrain_args.get('channel_start'))
+    ckpt_ch_end = config.get('channel_end', pretrain_args.get('channel_end'))
+    ckpt_ch_indices = config.get('channel_indices', pretrain_args.get('channel_indices'))
+    arg_ch_start = getattr(args, 'channel_start', None)
+    arg_ch_end = getattr(args, 'channel_end', None)
+    arg_ch_indices = getattr(args, 'channel_indices', None)
+    if (ckpt_ch_start, ckpt_ch_end, ckpt_ch_indices) != (arg_ch_start, arg_ch_end, arg_ch_indices):
+        raise ValueError(
+            f"finetune channel range 与预训练 checkpoint 不一致: "
+            f"args=({arg_ch_start}, {arg_ch_end}, {arg_ch_indices}), "
+            f"ckpt=({ckpt_ch_start}, {ckpt_ch_end}, {ckpt_ch_indices})"
+        )
     
     print(f'✓ 模型配置验证通过: {config}')
     
@@ -426,8 +544,30 @@ def main():
         model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_run{run_id}_model{args.model_id}'
     else:
         model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
+    model_name = f'{model_name}{channel_suffix(args)}'
+    # 同名 finetune 文件存在时，先清理旧文件再写入新结果（保持文件名稳定）。
+    existing_ckpt = save_dir / f'{model_name}.pth'
+    if existing_ckpt.exists():
+        old_artifacts = [
+            existing_ckpt,
+            save_dir / f'{model_name}_history.csv',
+            save_dir / f'{model_name}_results.csv',
+            save_dir / f'{model_name}_config.json',
+        ]
+        removed = []
+        for path in old_artifacts:
+            if path.exists():
+                path.unlink()
+                removed.append(path.name)
+        if removed:
+            print(f'检测到同名历史finetune结果，已先删除: {", ".join(removed)}')
     
     # 优化器和调度器
+    # 三选一（你手动切换）：默认 AdamW；另外两个先注释。
+    OPTIMIZER_NAME = 'adamw'
+    # OPTIMIZER_NAME = 'sgd'
+    # OPTIMIZER_NAME = 'lion'
+
     # 解冻 decoder 时分组：decoder 用更小 lr + 更大 weight_decay，
     # 保护 VQ-VAE 在 pretrain 中学到的几何结构，避免过拟合 ETTh1 这种小数据集。
     if unfreeze_dec:
@@ -437,27 +577,47 @@ def main():
                           if (not n.startswith('decoder.')) and p.requires_grad]
         dec_lr = args.lr * float(args.decoder_lr_ratio)
         dec_wd = args.weight_decay * float(args.decoder_wd_ratio)
-        optimizer = AdamW(
-            [
-                {'params': other_params,   'lr': args.lr, 'weight_decay': args.weight_decay},
-                {'params': decoder_params, 'lr': dec_lr,  'weight_decay': dec_wd},
-            ],
-        )
+        param_groups = [
+            {'params': other_params,   'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': decoder_params, 'lr': dec_lr,  'weight_decay': dec_wd},
+        ]
+        if OPTIMIZER_NAME == 'adamw':
+            optimizer = AdamW(param_groups)
+        elif OPTIMIZER_NAME == 'sgd':
+            optimizer = SGD(param_groups, momentum=0.9, nesterov=True)
+        elif OPTIMIZER_NAME == 'lion':
+            optimizer = Lion(param_groups, betas=(0.9, 0.99))
+        else:
+            raise ValueError(f'Unsupported optimizer: {OPTIMIZER_NAME}')
         n_dec = sum(p.numel() for p in decoder_params)
         n_oth = sum(p.numel() for p in other_params)
         print(f'  Optimizer groups: main={n_oth:,} params (lr={args.lr}, wd={args.weight_decay})'
               f' | decoder={n_dec:,} params (lr={dec_lr}, wd={dec_wd})')
+        print(f'  Optimizer type: {OPTIMIZER_NAME.upper()}')
     else:
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                          lr=args.lr, weight_decay=args.weight_decay)
+        trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+        if OPTIMIZER_NAME == 'adamw':
+            optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        elif OPTIMIZER_NAME == 'sgd':
+            optimizer = SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay,
+                            momentum=0.9, nesterov=True)
+        elif OPTIMIZER_NAME == 'lion':
+            optimizer = Lion(trainable_params, lr=args.lr, weight_decay=args.weight_decay,
+                             betas=(0.9, 0.99))
+        else:
+            raise ValueError(f'Unsupported optimizer: {OPTIMIZER_NAME}')
+        print(f'  Optimizer type: {OPTIMIZER_NAME.upper()}')
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=1e-6)
     
-    # 训练
-    best_val_loss = float('inf')
-    train_losses, valid_losses, valid_token_accs = [], [], []
+    # 训练：从第1个epoch开始评估并选择最佳模型（不再使用epoch0 baseline）。
+    best_val_mse = float('inf')
+    best_val_mae = float('inf')
+    best_val_score = float('inf')
+    best_epoch = None
+
+    train_losses, valid_mses, valid_maes, valid_scores, valid_token_accs = [], [], [], [], []
     no_improve_epochs = 0  # 连续无改善的epoch数
     early_stop_patience = 5  # 连续5个epoch无下降就停止
-    best_epoch = -1  # 最佳模型所在的epoch
     
     start_time = time.time()
     
@@ -482,31 +642,39 @@ def main():
         
         # 验证评估
         val_metrics = validate_epoch(model, dls.valid, revin, args, device, use_amp)
-        val_loss = val_metrics['loss']
+        val_mse = val_metrics['mse']
+        val_mae = val_metrics['mae']
+        val_score = val_metrics['score']
         
         train_losses.append(avg_train_loss)
-        valid_losses.append(val_loss)
+        valid_mses.append(val_mse)
+        valid_maes.append(val_mae)
+        valid_scores.append(val_score)
         valid_token_accs.append(val_metrics.get('token_acc'))
         
         total_time = time.time() - start_time
         
-        # 检查当前epoch是否改善了最佳验证损失
-        is_best = val_loss < best_val_loss
+        # 根据验证集 MSE + MAE 选择最佳模型。
+        is_best = (best_epoch is None) or (val_score < best_val_score)
         if is_best:
-            best_val_loss = val_loss
+            best_val_mse = val_mse
+            best_val_mae = val_mae
+            best_val_score = val_score
             best_epoch = epoch
             no_improve_epochs = 0  # 重置计数器
             
             # 保存最佳模型
             # 确保使用原始config（从预训练checkpoint加载的），确保架构一致性
-            import copy
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'config': copy.deepcopy(config),  # 深拷贝，确保config不被后续修改影响
                 'args': vars(args),
                 'epoch': epoch,
                 'train_loss': avg_train_loss,
-                'val_loss': val_loss,
+                'val_loss': val_mse,
+                'val_mse': val_mse,
+                'val_mae': val_mae,
+                'val_score': val_score,
                 'timestamp': datetime.now().isoformat(),
                 'total_training_time_seconds': total_time,
             }
@@ -520,7 +688,8 @@ def main():
         
         # 打印进度
         print(f"Epoch {epoch+1:3d}/{args.n_epochs} | "
-              f"Train Loss: {avg_train_loss:.6f} | Valid Loss: {val_loss:.6f} | "
+              f"Train Loss: {avg_train_loss:.6f} | Valid MSE: {val_mse:.6f} | "
+              f"Valid MAE: {val_mae:.6f} | Score: {val_score:.6f} | "
               f"Time: {total_time/60:.1f}min {status}")
         if val_metrics.get('token_acc') is not None:
             layer_text = ', '.join(
@@ -530,21 +699,25 @@ def main():
                   + (f" ({layer_text})" if layer_text else ""))
         
         if not is_best:
-            print(f"  -> 无改善 (当前最佳: epoch {best_epoch+1}, val_loss: {best_val_loss:.6f}, "
+            best_epoch_text = f"epoch {best_epoch+1}" if best_epoch is not None else "N/A"
+            print(f"  -> 无改善 (当前最佳: {best_epoch_text}, best_score: {best_val_score:.6f}, "
+                  f"best_mse: {best_val_mse:.6f}, best_mae: {best_val_mae:.6f}, "
                   f"连续 {no_improve_epochs} 个epoch无改善)")
         
         # 早停检查：连续10个epoch无改善
         if no_improve_epochs >= early_stop_patience:
             print(f"\n>>> 早停: 连续 {early_stop_patience} 个 epoch 无改善")
             # 保存当前模型（10个epoch无改善时的模型）
-            import copy
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'config': copy.deepcopy(config),  # 深拷贝，确保config不被后续修改影响
                 'args': vars(args),
                 'epoch': epoch,
                 'train_loss': avg_train_loss,
-                'val_loss': val_loss,
+                'val_loss': val_mse,
+                'val_mse': val_mse,
+                'val_mae': val_mae,
+                'val_score': val_score,
                 'timestamp': datetime.now().isoformat(),
                 'total_training_time_seconds': total_time,
                 'early_stopped': True,
@@ -563,7 +736,6 @@ def main():
     best_checkpoint = torch.load(save_dir / f'{model_name}.pth', map_location=device, weights_only=False)
     
     # 始终使用checkpoint中的config重新创建模型，确保架构完全一致
-    import copy
     checkpoint_config = copy.deepcopy(best_checkpoint.get('config', {}))
     if not checkpoint_config:
         raise ValueError(f"Checkpoint中缺少config！文件: {save_dir / f'{model_name}.pth'}")
@@ -628,14 +800,17 @@ def main():
     history_df = pd.DataFrame({
         'epoch': range(1, len(train_losses) + 1),
         'train_loss': train_losses,
-        'valid_loss': valid_losses,
+        'valid_mse': valid_mses,
+        'valid_mae': valid_maes,
+        'valid_score': valid_scores,
         'valid_token_acc': valid_token_accs,
     })
     history_df.to_csv(save_dir / f'{model_name}_history.csv', index=False)
     
     print('=' * 80)
     print(f'微调完成！')
-    print(f'最佳验证损失: {best_val_loss:.6f}')
+    print(f'最佳验证分数 (MSE+MAE): {best_val_score:.6f}')
+    print(f'对应验证 MSE: {best_val_mse:.6f}, MAE: {best_val_mae:.6f}')
     print(f'测试 MSE: {mse:.6f}, MAE: {mae:.6f}')
     print(f'模型保存至: {save_dir / model_name}.pth')
 
