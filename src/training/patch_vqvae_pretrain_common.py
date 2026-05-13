@@ -79,6 +79,8 @@ def build_arg_parser():
                    help='TCN backbone 的 Conv1d kernel size（需为奇数；仅 vqvae_backbone=tcn 时使用）')
     p.add_argument('--vqvae_chunk_size', type=int, default=2,
                    help='chunk_mlp backbone 的 patch 分块大小（需整除 patch_size）')
+    p.add_argument('--decoder_lowpass', type=int, default=0,
+                   help='1=在 VQVAE decoder 输出末尾应用固定 [1,4,6,4,1]/16 低通滤波（默认关闭）')
 
     # VQVAE checkpoint
     p.add_argument('--vqvae_checkpoint', type=str, default=None,
@@ -98,6 +100,12 @@ def build_arg_parser():
     p.add_argument('--rq_layer_weights', type=float, nargs='+', default=None,
                    help='各 RVQ 层 pred_loss 的权重，顺序对应第0层、第1层…'
                         '（默认 None = 均等权重）。示例: --rq_layer_weights 1.0 0.5')
+    p.add_argument('--soft_neighbor_k', type=int, default=0,
+                   help='NTP soft label 使用的 codebook 近邻数；0=关闭，等价普通 hard CE')
+    p.add_argument('--soft_neighbor_alpha', type=float, default=0.25,
+                   help='soft label 分给近邻 code 的总概率质量；仅 soft_neighbor_k>0 时生效')
+    p.add_argument('--soft_neighbor_tau', type=float, default=0.3,
+                   help='近邻 softmax 温度；仅 soft_neighbor_k>0 时生效')
 
     # NMPP 模式
     p.add_argument('--use_raw_input', type=int, default=0,
@@ -162,7 +170,136 @@ def _channel_suffix(args):
 # Loss helpers
 # ---------------------------------------------------------------------------
 
-def _progressive_loss(all_logits, all_target_indices, rq_layer_weights=None):
+def _soft_neighbor_cross_entropy(logits_l, tgt_l, model, layer_idx, neighbor_k, alpha, tau, neighbor_tables=None):
+    """Cross entropy with target probability spread to codebook nearest neighbors.
+
+    全向量化路径（共享码本 + per-channel 码本均一次性处理所有通道）。
+    """
+    B, P, C, K = logits_l.shape
+    if model is None or neighbor_k <= 0 or alpha <= 0:
+        return F.cross_entropy(logits_l.reshape(-1, K), tgt_l.reshape(-1))
+
+    neighbor_k = min(int(neighbor_k), K - 1)
+    if neighbor_k <= 0:
+        return F.cross_entropy(logits_l.reshape(-1, K), tgt_l.reshape(-1))
+
+    alpha = min(max(float(alpha), 0.0), 1.0)
+    tau = max(float(tau), 1e-6)
+    per_channel = bool(getattr(model, 'per_channel_codebook', False))
+
+    if not per_channel:
+        logits_flat = logits_l.reshape(-1, K)
+        tgt_flat = tgt_l.reshape(-1)
+        logp = F.log_softmax(logits_flat, dim=-1)
+        if neighbor_tables is not None:
+            neighbor_idx, neighbor_prob = neighbor_tables[(layer_idx, 0)]
+        else:
+            weight = _get_codebook_weight(model, layer_idx, 0)
+            dist = torch.cdist(weight.float(), weight.float(), p=2)
+            dist = dist.masked_fill(torch.eye(K, device=dist.device, dtype=torch.bool), float('inf'))
+            neighbor_dist, neighbor_idx = torch.topk(dist, k=neighbor_k, dim=-1, largest=False)
+            neighbor_prob = F.softmax(-neighbor_dist / tau, dim=-1)
+
+        target_neighbors = neighbor_idx[tgt_flat]
+        target_prob = neighbor_prob[tgt_flat].to(logp.dtype)
+        true_logp = logp.gather(1, tgt_flat.unsqueeze(1)).squeeze(1)
+        neighbor_logp = logp.gather(1, target_neighbors)
+        return -((1.0 - alpha) * true_logp + alpha * (target_prob * neighbor_logp).sum(dim=1)).mean()
+
+    # ---- per-channel：一次性处理所有通道，避免 Python 循环 ----
+    # 优先用预计算的 stacked 表
+    stacked = neighbor_tables.get((layer_idx, 'stacked')) if neighbor_tables is not None else None
+    if stacked is None:
+        if neighbor_tables is not None:
+            idx_list = [neighbor_tables[(layer_idx, c)][0] for c in range(C)]
+            prob_list = [neighbor_tables[(layer_idx, c)][1] for c in range(C)]
+        else:
+            idx_list, prob_list = [], []
+            for c in range(C):
+                weight = _get_codebook_weight(model, layer_idx, c)
+                dist = torch.cdist(weight.float(), weight.float(), p=2)
+                dist = dist.masked_fill(torch.eye(K, device=dist.device, dtype=torch.bool), float('inf'))
+                neighbor_dist, neighbor_idx = torch.topk(dist, k=neighbor_k, dim=-1, largest=False)
+                idx_list.append(neighbor_idx)
+                prob_list.append(F.softmax(-neighbor_dist / tau, dim=-1))
+        idx_stack = torch.stack(idx_list, dim=0)    # [C, K, k]
+        prob_stack = torch.stack(prob_list, dim=0)  # [C, K, k]
+    else:
+        idx_stack, prob_stack = stacked
+
+    # [C, B*P, K]
+    logits_perm = logits_l.permute(2, 0, 1, 3).reshape(C, -1, K).contiguous()
+    tgt_perm = tgt_l.permute(2, 0, 1).reshape(C, -1).contiguous()  # [C, B*P]
+    logp = F.log_softmax(logits_perm, dim=-1)
+
+    # gather neighbors per channel: [C, B*P, k]
+    tgt_idx_expand = tgt_perm.unsqueeze(-1).expand(-1, -1, neighbor_k)
+    target_neighbors = idx_stack.gather(1, tgt_idx_expand)
+    target_prob = prob_stack.gather(1, tgt_idx_expand).to(logp.dtype)
+
+    true_logp = logp.gather(2, tgt_perm.unsqueeze(-1)).squeeze(-1)        # [C, B*P]
+    neighbor_logp = logp.gather(2, target_neighbors)                       # [C, B*P, k]
+    loss = -((1.0 - alpha) * true_logp + alpha * (target_prob * neighbor_logp).sum(dim=-1))
+    return loss.mean()
+
+
+def _build_soft_neighbor_tables(model, n_layers, n_channels, codebook_size, neighbor_k, tau):
+    """Precompute codebook nearest-neighbor tables once per epoch.
+
+    per-channel 模式下会额外在 ``(l, 'stacked')`` 处保存沿通道堆叠后的张量，
+    供 :func:`_soft_neighbor_cross_entropy` 一次性处理所有通道。
+    """
+    neighbor_k = min(int(neighbor_k), codebook_size - 1)
+    if model is None or neighbor_k <= 0:
+        return None
+
+    tau = max(float(tau), 1e-6)
+    per_channel = bool(getattr(model, 'per_channel_codebook', False))
+    tables = {}
+    with torch.no_grad():
+        for l in range(n_layers):
+            idx_list, prob_list = [], []
+            for c in range(n_channels):
+                weight = _get_codebook_weight(model, l, c)
+                dist = torch.cdist(weight.float(), weight.float(), p=2)
+                dist = dist.masked_fill(
+                    torch.eye(codebook_size, device=dist.device, dtype=torch.bool),
+                    float('inf'),
+                )
+                neighbor_dist, neighbor_idx = torch.topk(dist, k=neighbor_k, dim=-1, largest=False)
+                neighbor_prob = F.softmax(-neighbor_dist / tau, dim=-1)
+                tables[(l, c)] = (neighbor_idx, neighbor_prob)
+                idx_list.append(neighbor_idx)
+                prob_list.append(neighbor_prob)
+            if per_channel and idx_list:
+                tables[(l, 'stacked')] = (
+                    torch.stack(idx_list, dim=0),
+                    torch.stack(prob_list, dim=0),
+                )
+    return tables
+
+
+def _build_semantic_rank_tables(model, n_layers, n_channels, codebook_size):
+    """Precompute rank[pred] among each true code's nearest codebook entries."""
+    tables = {}
+    with torch.no_grad():
+        for l in range(n_layers):
+            for c in range(n_channels):
+                weight = _get_codebook_weight(model, l, c)
+                dist = torch.cdist(weight.float(), weight.float(), p=2)
+                order = dist.argsort(dim=-1)
+                ranks = torch.empty_like(order)
+                rank_values = torch.arange(1, codebook_size + 1, device=dist.device).expand_as(order)
+                ranks.scatter_(dim=1, index=order, src=rank_values)
+                tables[(l, c)] = ranks
+    return tables
+
+
+def _progressive_loss(
+    all_logits, all_target_indices, rq_layer_weights=None,
+    model=None, soft_neighbor_k=0, soft_neighbor_alpha=0.25, soft_neighbor_tau=0.3,
+    neighbor_tables=None,
+):
     """
     all_logits:        List[stage] of List[rq_layer] of [B, step_size, C, codebook_size]
     all_target_indices: List[stage] of List[rq_layer] of [B, step_size, C]
@@ -182,15 +319,25 @@ def _progressive_loss(all_logits, all_target_indices, rq_layer_weights=None):
     total_weight = 0.0
     for logits_layers, tgt_layers in zip(all_logits, all_target_indices):
         for l, (logits_l, tgt_l) in enumerate(zip(logits_layers, tgt_layers)):
-            B, P, C, K = logits_l.shape
-            total_loss += weights[l] * F.cross_entropy(logits_l.reshape(-1, K), tgt_l.reshape(-1))
+            total_loss += weights[l] * _soft_neighbor_cross_entropy(
+                logits_l, tgt_l, model, l,
+                soft_neighbor_k, soft_neighbor_alpha, soft_neighbor_tau,
+                neighbor_tables=neighbor_tables,
+            )
             total_weight += weights[l]
 
     return total_loss / (total_weight * len(all_logits) / n_layers)
 
 
+def _get_codebook_weight(model, layer_idx, channel_idx=None):
+    """Return the codebook embedding weight for one RVQ layer."""
+    if getattr(model, 'per_channel_codebook', False):
+        return model.vqs[channel_idx].layers[layer_idx].embedding.weight
+    return model.vq.layers[layer_idx].embedding.weight
+
+
 def _progressive_accuracy(all_logits, all_target_indices):
-    """统计 NMPP token 预测准确率（按 RVQ 层分别统计，并给出整体均值）。"""
+    """Lightweight fast path: only top-1 accuracy (avg + per-layer)."""
     n_layers = len(all_logits[0])
     correct = [0] * n_layers
     total = [0] * n_layers
@@ -210,15 +357,138 @@ def _progressive_accuracy(all_logits, all_target_indices):
     return avg_acc, layer_acc
 
 
+def _progressive_token_diagnostics(
+    all_logits, all_target_indices, model=None,
+    include_semantic_rank=False, semantic_rank_tables=None,
+):
+    """统计 NMPP token 预测诊断：top-k、真实 code rank，以及可选的 codebook 近邻 rank。
+
+    所有计数器在 GPU 上累加，函数末尾一次性同步回 CPU，避免每个 batch 多次 GPU↔CPU sync。
+    """
+    n_layers = len(all_logits[0])
+    device = all_logits[0][0].device
+    topk_levels = (1, 3, 5, 10)
+    n_topk = len(topk_levels)
+
+    correct = torch.zeros(n_layers, device=device, dtype=torch.long)
+    total = torch.zeros(n_layers, device=device, dtype=torch.long)
+    layer_topk_hits = torch.zeros(n_layers, n_topk, device=device, dtype=torch.long)
+    layer_rank_sum = torch.zeros(n_layers, device=device, dtype=torch.float64)
+    layer_rank_values = [[] for _ in range(n_layers)]
+
+    layer_sem_sum = torch.zeros(n_layers, device=device, dtype=torch.float64)
+    layer_sem_count = torch.zeros(n_layers, device=device, dtype=torch.long)
+
+    per_channel = bool(getattr(model, 'per_channel_codebook', False)) if model is not None else False
+
+    with torch.no_grad():
+        for logits_layers, tgt_layers in zip(all_logits, all_target_indices):
+            for l, (logits_l, tgt_l) in enumerate(zip(logits_layers, tgt_layers)):
+                B, P, C, K = logits_l.shape
+                pred_l = logits_l.argmax(dim=-1)
+                correct[l] += (pred_l == tgt_l).sum()
+                total[l] += tgt_l.numel()
+
+                flat_logits = logits_l.reshape(-1, K)
+                flat_tgt = tgt_l.reshape(-1)
+                true_score = flat_logits.gather(1, flat_tgt.unsqueeze(1))
+                ranks = (flat_logits > true_score).sum(dim=1) + 1  # [N], int64
+                ranks_f = ranks.to(torch.float64)
+
+                layer_rank_sum[l] += ranks_f.sum()
+                layer_rank_values[l].append(ranks)
+                for ki, k in enumerate(topk_levels):
+                    layer_topk_hits[l, ki] += (ranks <= min(k, K)).sum()
+
+                if include_semantic_rank and semantic_rank_tables is not None:
+                    if per_channel:
+                        # 每个通道用各自的 table；尽量减少 .item() 调用
+                        for c in range(C):
+                            pred_c = pred_l[:, :, c].reshape(-1)
+                            tgt_c = tgt_l[:, :, c].reshape(-1)
+                            sem = semantic_rank_tables[(l, c)][tgt_c, pred_c]
+                            sem_f = sem.to(torch.float64)
+                            layer_sem_sum[l] += sem_f.sum()
+                            layer_sem_count[l] += sem.numel()
+                    else:
+                        # 共享码本：一次 gather 拿下所有通道
+                        table = semantic_rank_tables[(l, 0)]
+                        sem_all = table[flat_tgt, pred_l.reshape(-1)]
+                        layer_sem_sum[l] += sem_all.to(torch.float64).sum()
+                        layer_sem_count[l] += sem_all.numel()
+
+    # ---- 一次性同步到 CPU ----
+    correct_cpu = correct.cpu().tolist()
+    total_cpu = total.cpu().tolist()
+    layer_topk_hits_cpu = layer_topk_hits.cpu().tolist()
+    layer_rank_sum_cpu = layer_rank_sum.cpu().tolist()
+    layer_sem_sum_cpu = layer_sem_sum.cpu().tolist()
+    layer_sem_count_cpu = layer_sem_count.cpu().tolist()
+
+    total_tokens = sum(total_cpu)
+    rank_sum_v = sum(layer_rank_sum_cpu)
+    sem_sum_v = sum(layer_sem_sum_cpu)
+    sem_count_v = sum(layer_sem_count_cpu)
+    topk_hits_total = [sum(layer_topk_hits_cpu[l][ki] for l in range(n_layers)) for ki in range(n_topk)]
+
+    layer_acc = [
+        (correct_cpu[l] / total_cpu[l]) if total_cpu[l] > 0 else 0.0
+        for l in range(n_layers)
+    ]
+    avg_acc = (sum(correct_cpu) / total_tokens) if total_tokens > 0 else 0.0
+
+    # Median: 每层一次 cat + median，整体一次 cat + median；都在 GPU 上算
+    layer_median_rank = []
+    all_ranks = []
+    for vals in layer_rank_values:
+        if vals:
+            cat = torch.cat(vals)
+            all_ranks.append(cat)
+            layer_median_rank.append(cat.float().median().item())
+        else:
+            layer_median_rank.append(0.0)
+    median_rank = torch.cat(all_ranks).float().median().item() if all_ranks else 0.0
+
+    return {
+        'token_acc': avg_acc,
+        'layer_acc': layer_acc,
+        'topk_acc': {
+            topk_levels[ki]: (topk_hits_total[ki] / total_tokens if total_tokens > 0 else 0.0)
+            for ki in range(n_topk)
+        },
+        'mean_rank': rank_sum_v / total_tokens if total_tokens > 0 else 0.0,
+        'median_rank': median_rank,
+        'layer_topk_acc': [
+            {
+                topk_levels[ki]: (layer_topk_hits_cpu[l][ki] / total_cpu[l] if total_cpu[l] > 0 else 0.0)
+                for ki in range(n_topk)
+            }
+            for l in range(n_layers)
+        ],
+        'layer_mean_rank': [
+            layer_rank_sum_cpu[l] / total_cpu[l] if total_cpu[l] > 0 else 0.0
+            for l in range(n_layers)
+        ],
+        'layer_median_rank': layer_median_rank,
+        'semantic_neighbor_rank': (
+            sem_sum_v / sem_count_v if sem_count_v > 0 else None
+        ),
+        'layer_semantic_neighbor_rank': [
+            (
+                layer_sem_sum_cpu[l] / layer_sem_count_cpu[l]
+                if layer_sem_count_cpu[l] > 0 else None
+            )
+            for l in range(n_layers)
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Train / validate epochs
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, trainable_params):
     model.train()
-    totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0., token_acc=0.)
-    layer_acc_sum = None
-    n = 0
 
     use_raw = bool(args.use_raw_input)
     compute_recon = args.recon_weight > 0 and not use_raw
@@ -227,6 +497,29 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
     rq_weights = getattr(args, 'rq_layer_weights', None)
     pred_len    = getattr(args, 'pred_len', None)            # N；None → 等于 step_size
     step_size   = args.progressive_step_size
+    soft_neighbor_k = int(getattr(args, 'soft_neighbor_k', 0))
+    soft_neighbor_alpha = float(getattr(args, 'soft_neighbor_alpha', 0.25))
+    soft_neighbor_tau = float(getattr(args, 'soft_neighbor_tau', 0.3))
+    compute_diag = soft_neighbor_k > 0
+    n_channels = (getattr(model, '_n_channels', None) or 1) if getattr(model, 'per_channel_codebook', False) else 1
+    soft_neighbor_tables = _build_soft_neighbor_tables(
+        model, model.n_rq_layers, n_channels, model.codebook_size, soft_neighbor_k, soft_neighbor_tau,
+    ) if soft_neighbor_k > 0 and soft_neighbor_alpha > 0 else None
+
+    if compute_diag:
+        totals = dict(
+            loss=0., pred_loss=0., vq_loss=0., recon_loss=0.,
+            token_acc=0., top3_acc=0., top5_acc=0., top10_acc=0.,
+            mean_rank=0., median_rank=0.,
+        )
+        layer_acc_sum = None
+        layer_topk_sum = None
+        layer_mean_rank_sum = None
+        layer_median_rank_sum = None
+    else:
+        totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0., token_acc=0.)
+        layer_acc_sum = None
+    n = 0
 
     for batch_x, batch_y in dataloader:
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -247,8 +540,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
             use_raw_input=use_raw,
             pred_len=pred_len,
         )
-        pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
-        token_acc, layer_acc = _progressive_accuracy(all_logits, all_tgt)
+        pred_loss = _progressive_loss(
+            all_logits, all_tgt, rq_weights,
+            model=model,
+            soft_neighbor_k=soft_neighbor_k,
+            soft_neighbor_alpha=soft_neighbor_alpha,
+            soft_neighbor_tau=soft_neighbor_tau,
+            neighbor_tables=soft_neighbor_tables,
+        )
 
         loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
@@ -261,24 +560,52 @@ def train_epoch(model, dataloader, optimizer, scheduler, revin, args, device, tr
         totals['pred_loss']  += pred_loss.item()
         totals['vq_loss']    += vq_loss.item()
         totals['recon_loss'] += recon_loss.item()
-        totals['token_acc']  += token_acc
-        if layer_acc_sum is None:
-            layer_acc_sum = [0.0] * len(layer_acc)
-        for i, acc in enumerate(layer_acc):
-            layer_acc_sum[i] += acc
+
+        if compute_diag:
+            token_diag = _progressive_token_diagnostics(all_logits, all_tgt)
+            layer_acc = token_diag['layer_acc']
+            totals['token_acc']  += token_diag['token_acc']
+            totals['top3_acc']   += token_diag['topk_acc'][3]
+            totals['top5_acc']   += token_diag['topk_acc'][5]
+            totals['top10_acc']  += token_diag['topk_acc'][10]
+            totals['mean_rank']  += token_diag['mean_rank']
+            totals['median_rank'] += token_diag['median_rank']
+            if layer_acc_sum is None:
+                layer_acc_sum = [0.0] * len(layer_acc)
+                layer_topk_sum = [{3: 0.0, 5: 0.0, 10: 0.0} for _ in layer_acc]
+                layer_mean_rank_sum = [0.0] * len(layer_acc)
+                layer_median_rank_sum = [0.0] * len(layer_acc)
+            for i, acc in enumerate(layer_acc):
+                layer_acc_sum[i] += acc
+                layer_topk_sum[i][3] += token_diag['layer_topk_acc'][i][3]
+                layer_topk_sum[i][5] += token_diag['layer_topk_acc'][i][5]
+                layer_topk_sum[i][10] += token_diag['layer_topk_acc'][i][10]
+                layer_mean_rank_sum[i] += token_diag['layer_mean_rank'][i]
+                layer_median_rank_sum[i] += token_diag['layer_median_rank'][i]
+        else:
+            token_acc, layer_acc = _progressive_accuracy(all_logits, all_tgt)
+            totals['token_acc'] += token_acc
+            if layer_acc_sum is None:
+                layer_acc_sum = [0.0] * len(layer_acc)
+            for i, acc in enumerate(layer_acc):
+                layer_acc_sum[i] += acc
         n += 1
 
     scheduler.step()
     out = {k: v / n for k, v in totals.items()}
     out['layer_acc'] = [v / n for v in layer_acc_sum] if layer_acc_sum is not None else []
+    if compute_diag:
+        out['layer_topk_acc'] = [
+            {k: v / n for k, v in layer_sum.items()}
+            for layer_sum in layer_topk_sum
+        ] if layer_topk_sum is not None else []
+        out['layer_mean_rank'] = [v / n for v in layer_mean_rank_sum] if layer_mean_rank_sum is not None else []
+        out['layer_median_rank'] = [v / n for v in layer_median_rank_sum] if layer_median_rank_sum is not None else []
     return out
 
 
 def validate_epoch(model, dataloader, revin, args, device):
     model.eval()
-    totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0., token_acc=0.)
-    layer_acc_sum = None
-    n = 0
 
     use_raw = bool(args.use_raw_input)
     compute_recon = args.recon_weight > 0 and not use_raw
@@ -287,6 +614,35 @@ def validate_epoch(model, dataloader, revin, args, device):
     rq_weights  = getattr(args, 'rq_layer_weights', None)
     pred_len    = getattr(args, 'pred_len', None)
     step_size   = args.progressive_step_size
+    soft_neighbor_k = int(getattr(args, 'soft_neighbor_k', 0))
+    soft_neighbor_alpha = float(getattr(args, 'soft_neighbor_alpha', 0.25))
+    soft_neighbor_tau = float(getattr(args, 'soft_neighbor_tau', 0.3))
+    compute_diag = soft_neighbor_k > 0
+    n_channels = (getattr(model, '_n_channels', None) or 1) if getattr(model, 'per_channel_codebook', False) else 1
+    soft_neighbor_tables = _build_soft_neighbor_tables(
+        model, model.n_rq_layers, n_channels, model.codebook_size, soft_neighbor_k, soft_neighbor_tau,
+    ) if soft_neighbor_k > 0 and soft_neighbor_alpha > 0 else None
+    semantic_rank_tables = _build_semantic_rank_tables(
+        model, model.n_rq_layers, n_channels, model.codebook_size
+    ) if compute_diag else None
+
+    if compute_diag:
+        totals = dict(
+            loss=0., pred_loss=0., vq_loss=0., recon_loss=0.,
+            token_acc=0., top3_acc=0., top5_acc=0., top10_acc=0.,
+            mean_rank=0., median_rank=0., semantic_neighbor_rank=0.,
+        )
+        layer_acc_sum = None
+        layer_topk_sum = None
+        layer_mean_rank_sum = None
+        layer_median_rank_sum = None
+        layer_semantic_rank_sum = None
+        layer_semantic_batches = None
+        semantic_batches = 0
+    else:
+        totals = dict(loss=0., pred_loss=0., vq_loss=0., recon_loss=0., token_acc=0.)
+        layer_acc_sum = None
+    n = 0
 
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
@@ -304,23 +660,83 @@ def validate_epoch(model, dataloader, revin, args, device):
                 use_raw_input=use_raw,
                 pred_len=pred_len,
             )
-            pred_loss = _progressive_loss(all_logits, all_tgt, rq_weights)
-            token_acc, layer_acc = _progressive_accuracy(all_logits, all_tgt)
+            pred_loss = _progressive_loss(
+                all_logits, all_tgt, rq_weights,
+                model=model,
+                soft_neighbor_k=soft_neighbor_k,
+                soft_neighbor_alpha=soft_neighbor_alpha,
+                soft_neighbor_tau=soft_neighbor_tau,
+                neighbor_tables=soft_neighbor_tables,
+            )
             loss = pred_loss + vq_w * vq_loss + recon_w * recon_loss
 
             totals['loss']       += loss.item()
             totals['pred_loss']  += pred_loss.item()
             totals['vq_loss']    += vq_loss.item()
             totals['recon_loss'] += recon_loss.item()
-            totals['token_acc']  += token_acc
-            if layer_acc_sum is None:
-                layer_acc_sum = [0.0] * len(layer_acc)
-            for i, acc in enumerate(layer_acc):
-                layer_acc_sum[i] += acc
+
+            if compute_diag:
+                token_diag = _progressive_token_diagnostics(
+                    all_logits, all_tgt, model=model, include_semantic_rank=True,
+                    semantic_rank_tables=semantic_rank_tables,
+                )
+                layer_acc = token_diag['layer_acc']
+                totals['token_acc']  += token_diag['token_acc']
+                totals['top3_acc']   += token_diag['topk_acc'][3]
+                totals['top5_acc']   += token_diag['topk_acc'][5]
+                totals['top10_acc']  += token_diag['topk_acc'][10]
+                totals['mean_rank']  += token_diag['mean_rank']
+                totals['median_rank'] += token_diag['median_rank']
+                if token_diag['semantic_neighbor_rank'] is not None:
+                    totals['semantic_neighbor_rank'] += token_diag['semantic_neighbor_rank']
+                    semantic_batches += 1
+                if layer_acc_sum is None:
+                    layer_acc_sum = [0.0] * len(layer_acc)
+                    layer_topk_sum = [{3: 0.0, 5: 0.0, 10: 0.0} for _ in layer_acc]
+                    layer_mean_rank_sum = [0.0] * len(layer_acc)
+                    layer_median_rank_sum = [0.0] * len(layer_acc)
+                    layer_semantic_rank_sum = [0.0] * len(layer_acc)
+                    layer_semantic_batches = [0] * len(layer_acc)
+                for i, acc in enumerate(layer_acc):
+                    layer_acc_sum[i] += acc
+                    layer_topk_sum[i][3] += token_diag['layer_topk_acc'][i][3]
+                    layer_topk_sum[i][5] += token_diag['layer_topk_acc'][i][5]
+                    layer_topk_sum[i][10] += token_diag['layer_topk_acc'][i][10]
+                    layer_mean_rank_sum[i] += token_diag['layer_mean_rank'][i]
+                    layer_median_rank_sum[i] += token_diag['layer_median_rank'][i]
+                    sem_rank_i = token_diag['layer_semantic_neighbor_rank'][i]
+                    if sem_rank_i is not None:
+                        layer_semantic_rank_sum[i] += sem_rank_i
+                        layer_semantic_batches[i] += 1
+            else:
+                token_acc, layer_acc = _progressive_accuracy(all_logits, all_tgt)
+                totals['token_acc'] += token_acc
+                if layer_acc_sum is None:
+                    layer_acc_sum = [0.0] * len(layer_acc)
+                for i, acc in enumerate(layer_acc):
+                    layer_acc_sum[i] += acc
             n += 1
 
     out = {k: v / n for k, v in totals.items()}
     out['layer_acc'] = [v / n for v in layer_acc_sum] if layer_acc_sum is not None else []
+    if compute_diag:
+        if semantic_batches > 0:
+            out['semantic_neighbor_rank'] = totals['semantic_neighbor_rank'] / semantic_batches
+        else:
+            out['semantic_neighbor_rank'] = None
+        out['layer_topk_acc'] = [
+            {k: v / n for k, v in layer_sum.items()}
+            for layer_sum in layer_topk_sum
+        ] if layer_topk_sum is not None else []
+        out['layer_mean_rank'] = [v / n for v in layer_mean_rank_sum] if layer_mean_rank_sum is not None else []
+        out['layer_median_rank'] = [v / n for v in layer_median_rank_sum] if layer_median_rank_sum is not None else []
+        out['layer_semantic_neighbor_rank'] = [
+            (
+                layer_semantic_rank_sum[i] / layer_semantic_batches[i]
+                if layer_semantic_batches[i] > 0 else None
+            )
+            for i in range(len(layer_semantic_rank_sum))
+        ] if layer_semantic_rank_sum is not None else []
     return out
 
 
@@ -383,12 +799,22 @@ def run_pretrain():
         backbone_sfx = f'_tcnk{int(getattr(args, "vqvae_tcn_kernel_size", 5))}'
     else:
         backbone_sfx = f'_{backbone}c{int(getattr(args, "vqvae_chunk_size", 2))}'
+    if bool(getattr(args, 'decoder_lowpass', 0)):
+        backbone_sfx = f'{backbone_sfx}_dlp'
+    soft_k = int(getattr(args, 'soft_neighbor_k', 0))
+    if soft_k > 0:
+        soft_alpha = float(getattr(args, 'soft_neighbor_alpha', 0.25))
+        soft_tau = float(getattr(args, 'soft_neighbor_tau', 0.3))
+        # 用 Python 默认 float repr，保留尾随的 .0，与 bash pipeline 中的命名规则一致
+        soft_sfx = f'_snk{soft_k}a{soft_alpha}t{soft_tau}'.replace('.', 'p')
+    else:
+        soft_sfx = ''
     rid_sfx   = f'_run{args.run_id}' if args.run_id is not None else ''
     ch_sfx    = _channel_suffix(args)
     model_name = (
         f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}'
         f'_l{args.n_layers}_in{args.context_points}_step{step_size}'
-        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{backbone_sfx}{nmpp_sfx}{ch_sfx}'
+        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{backbone_sfx}{nmpp_sfx}{soft_sfx}{ch_sfx}'
     )
     # 同名 pretrain 文件存在时，先清理旧文件再写入新结果（保持文件名稳定）。
     existing_ckpt = save_dir / f'{model_name}.pth'
@@ -425,6 +851,7 @@ def run_pretrain():
                 'codebook_size', 'num_hiddens', 'num_residual_layers',
                 'num_residual_hiddens', 'commitment_cost',
                 'vqvae_backbone', 'vqvae_tcn_kernel_size', 'vqvae_chunk_size',
+                'decoder_lowpass',
                 'codebook_ema', 'ema_decay', 'ema_eps',
             ]
             overridden = []
@@ -480,16 +907,34 @@ def run_pretrain():
     min_delta = float(getattr(args, 'early_stop_min_delta', 1e-4))
     smooth_k  = max(1, int(getattr(args, 'early_stop_smooth_k', 1)))
 
+    soft_neighbor_k = int(getattr(args, 'soft_neighbor_k', 0))
+    compute_diag = soft_neighbor_k > 0
+
     best_val   = float('inf')
     no_improve = 0
     train_losses, valid_losses = [], []
     train_token_accs, valid_token_accs = [], []
+    if compute_diag:
+        train_top3_accs, valid_top3_accs = [], []
+        train_top5_accs, valid_top5_accs = [], []
+        train_top10_accs, valid_top10_accs = [], []
+        train_mean_ranks, valid_mean_ranks = [], []
+        train_median_ranks, valid_median_ranks = [], []
+        valid_semantic_ranks = []
 
     print(
         f'\n开始预训练，共 {args.n_epochs} epoch '
         f'(early stop: patience={patience}, warmup={warmup}, '
         f'min_delta={min_delta}, smooth_k={smooth_k})'
     )
+    if compute_diag:
+        print(
+            f"NTP loss: codebook-neighbor soft label "
+            f"(k={int(args.soft_neighbor_k)}, alpha={float(args.soft_neighbor_alpha):g}, "
+            f"tau={float(args.soft_neighbor_tau):g})"
+        )
+    else:
+        print("NTP loss: hard cross entropy (soft_neighbor_k=0)")
     print('=' * 80)
 
     for epoch in range(args.n_epochs):
@@ -501,6 +946,18 @@ def run_pretrain():
         valid_losses.append(va['loss'])
         train_token_accs.append(tr['token_acc'])
         valid_token_accs.append(va['token_acc'])
+        if compute_diag:
+            train_top3_accs.append(tr['top3_acc'])
+            valid_top3_accs.append(va['top3_acc'])
+            train_top5_accs.append(tr['top5_acc'])
+            valid_top5_accs.append(va['top5_acc'])
+            train_top10_accs.append(tr['top10_acc'])
+            valid_top10_accs.append(va['top10_acc'])
+            train_mean_ranks.append(tr['mean_rank'])
+            valid_mean_ranks.append(va['mean_rank'])
+            train_median_ranks.append(tr['median_rank'])
+            valid_median_ranks.append(va['median_rank'])
+            valid_semantic_ranks.append(va.get('semantic_neighbor_rank'))
 
         if smooth_k > 1 and len(valid_losses) >= smooth_k:
             va_signal = sum(valid_losses[-smooth_k:]) / smooth_k
@@ -519,6 +976,35 @@ def run_pretrain():
             f"  └─ NTP Acc: Train {tr['token_acc'] * 100:.2f}%"
             f" | Val {va['token_acc'] * 100:.2f}%"
         )
+        if compute_diag:
+            print(
+                f"      Top-k Val: top3 {va['top3_acc'] * 100:.2f}%"
+                f" | top5 {va['top5_acc'] * 100:.2f}%"
+                f" | top10 {va['top10_acc'] * 100:.2f}%"
+            )
+            sem_rank = va.get('semantic_neighbor_rank')
+            sem_text = f"{sem_rank:.2f}" if sem_rank is not None else "N/A"
+            print(
+                f"      Code Rank: Train mean/median {tr['mean_rank']:.2f}/{tr['median_rank']:.1f}"
+                f" | Val mean/median {va['mean_rank']:.2f}/{va['median_rank']:.1f}"
+                f" | SemanticNeighborRank {sem_text}"
+            )
+            va_layer_topk = va.get('layer_topk_acc', [])
+            va_layer_mean_rank = va.get('layer_mean_rank', [])
+            va_layer_median_rank = va.get('layer_median_rank', [])
+            va_layer_sem_rank = va.get('layer_semantic_neighbor_rank', [])
+            for i, topk_i in enumerate(va_layer_topk):
+                sem_i = va_layer_sem_rank[i] if i < len(va_layer_sem_rank) else None
+                sem_i_text = f"{sem_i:.2f}" if sem_i is not None else "N/A"
+                mean_i = va_layer_mean_rank[i] if i < len(va_layer_mean_rank) else 0.0
+                median_i = va_layer_median_rank[i] if i < len(va_layer_median_rank) else 0.0
+                print(
+                    f"      L{i} Top-k/Rank: top3 {topk_i[3] * 100:.2f}%"
+                    f" | top5 {topk_i[5] * 100:.2f}%"
+                    f" | top10 {topk_i[10] * 100:.2f}%"
+                    f" | rank {mean_i:.2f}/{median_i:.1f}"
+                    f" | sem {sem_i_text}"
+                )
         if tr_layers and va_layers:
             print(f"      Train Layers: {tr_layers}")
             print(f"      Val Layers  : {va_layers}")
@@ -566,13 +1052,28 @@ def run_pretrain():
                       f'| max_coverage_per_pos={max_cover} '
                       f'| overlap_len={N - M} patches/stage')
 
-    pd.DataFrame({
+    history = {
         'epoch':       range(1, len(train_losses) + 1),
         'train_loss':  train_losses,
         'valid_loss':  valid_losses,
         'train_token_acc': train_token_accs,
         'valid_token_acc': valid_token_accs,
-    }).to_csv(save_dir / f'{model_name}_history.csv', index=False)
+    }
+    if compute_diag:
+        history.update({
+            'train_top3_acc': train_top3_accs,
+            'valid_top3_acc': valid_top3_accs,
+            'train_top5_acc': train_top5_accs,
+            'valid_top5_acc': valid_top5_accs,
+            'train_top10_acc': train_top10_accs,
+            'valid_top10_acc': valid_top10_accs,
+            'train_mean_rank': train_mean_ranks,
+            'valid_mean_rank': valid_mean_ranks,
+            'train_median_rank': train_median_ranks,
+            'valid_median_rank': valid_median_ranks,
+            'valid_semantic_neighbor_rank': valid_semantic_ranks,
+        })
+    pd.DataFrame(history).to_csv(save_dir / f'{model_name}_history.csv', index=False)
 
     with open(save_dir / f'{model_name}_config.json', 'w') as f:
         json.dump(config, f, indent=4)

@@ -54,6 +54,7 @@ NUM_RESIDUAL_HIDDENS="${NUM_RESIDUAL_HIDDENS:-64}"
 VQVAE_BACKBONE="${VQVAE_BACKBONE:-mlp}"
 VQVAE_TCN_KERNEL_SIZE="${VQVAE_TCN_KERNEL_SIZE:-5}"
 VQVAE_CHUNK_SIZE="${VQVAE_CHUNK_SIZE:-2}"
+DECODER_LOWPASS="${DECODER_LOWPASS:-0}"
 N_RQ_LAYERS="${N_RQ_LAYERS:-2}"
 PER_CHANNEL_CODEBOOK="${PER_CHANNEL_CODEBOOK:-0}"
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
@@ -81,6 +82,9 @@ PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-100}"
 PRETRAIN_BATCH_SIZE="${PRETRAIN_BATCH_SIZE:-64}"
 PRETRAIN_LR="${PRETRAIN_LR:-3e-4}"
 RQ_LAYER_WEIGHTS="${RQ_LAYER_WEIGHTS:-1.0 1.0}"
+SOFT_NEIGHBOR_K="${SOFT_NEIGHBOR_K:-0}"
+SOFT_NEIGHBOR_ALPHA="${SOFT_NEIGHBOR_ALPHA:-0.25}"
+SOFT_NEIGHBOR_TAU="${SOFT_NEIGHBOR_TAU:-0.3}"
 USE_RAW_INPUT="${USE_RAW_INPUT:-0}"
 
 # Finetune
@@ -137,7 +141,20 @@ FINETUNE_SAVE_PATH="${FINETUNE_SAVE_PATH:-${DECODER_DIR}/saved_models/patch_vqva
 
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/${GROUP_RUN_NAME}}"
 mkdir -p "${LOG_DIR}"
-PROGRESS_LOG="${LOG_DIR}/_progress.log"
+
+# 早一点确定 SOFT_NEIGHBOR_SUFFIX，下面的 PROGRESS_LOG 等命名都会用到。
+# 注意：alpha/tau 用 Python float repr 标准化，确保与 Python 侧
+# (src/training/patch_vqvae_pretrain_common.py) 生成的 ckpt 文件名一致
+# （否则 1.0 / 0.50 等写法会两侧不匹配，导致找不到 pretrain ckpt）。
+SOFT_NEIGHBOR_SUFFIX=""
+if [ "${SOFT_NEIGHBOR_K}" -gt 0 ]; then
+    _SN_ALPHA=$("${PYTHON_BIN}" -c "print(float(${SOFT_NEIGHBOR_ALPHA}))")
+    _SN_TAU=$("${PYTHON_BIN}" -c "print(float(${SOFT_NEIGHBOR_TAU}))")
+    SOFT_NEIGHBOR_SUFFIX="_snk${SOFT_NEIGHBOR_K}a${_SN_ALPHA}t${_SN_TAU}"
+    SOFT_NEIGHBOR_SUFFIX="${SOFT_NEIGHBOR_SUFFIX//./p}"
+fi
+
+PROGRESS_LOG="${LOG_DIR}/_progress${SOFT_NEIGHBOR_SUFFIX}.log"
 
 prune_matching_dirs() {
     local parent="$1"
@@ -217,8 +234,12 @@ elif [ "${VQVAE_BACKBONE}" = "conv_linear" ]; then
 elif [ "${VQVAE_BACKBONE}" != "mlp" ]; then
     BACKBONE_SUFFIX="_${VQVAE_BACKBONE}c${VQVAE_CHUNK_SIZE}"
 fi
+if [ "${DECODER_LOWPASS}" = "1" ]; then
+    BACKBONE_SUFFIX="${BACKBONE_SUFFIX}_dlp"
+fi
 NMPP_SUFFIX=""
 [ "${USE_RAW_INPUT}" -eq 1 ] && NMPP_SUFFIX="_nmpp"
+# SOFT_NEIGHBOR_SUFFIX 已在前面早一点定义（PROGRESS_LOG 之前）
 
 run_and_capture() {
     local log_file="$1"
@@ -270,7 +291,7 @@ PY
     fi
     MODEL_ID=$((BASE_MODEL_ID + GROUP_ID))
     CB_CKPT="${CB_SAVE_PATH}/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${PERCH_SUFFIX}${RVQ_SUFFIX}${BACKBONE_SUFFIX}_model${MODEL_ID}${CH_SUFFIX}.pth"
-    PRETRAIN_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${BACKBONE_SUFFIX}${NMPP_SUFFIX}${CH_SUFFIX}"
+    PRETRAIN_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${BACKBONE_SUFFIX}${NMPP_SUFFIX}${SOFT_NEIGHBOR_SUFFIX}${CH_SUFFIX}"
     PRETRAIN_CKPT="${PRETRAIN_SAVE_PATH}/${DSET}/${PRETRAIN_NAME}.pth"
 }
 
@@ -331,7 +352,7 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         --num_hiddens '${NUM_HIDDENS}' --num_residual_layers '${NUM_RESIDUAL_LAYERS}' \
         --num_residual_hiddens '${NUM_RESIDUAL_HIDDENS}' \
         --vqvae_backbone '${VQVAE_BACKBONE}' --vqvae_tcn_kernel_size '${VQVAE_TCN_KERNEL_SIZE}' \
-        --vqvae_chunk_size '${VQVAE_CHUNK_SIZE}' \
+        --vqvae_chunk_size '${VQVAE_CHUNK_SIZE}' --decoder_lowpass '${DECODER_LOWPASS}' \
         --codebook_ema 1 --ema_decay 0.95 \
         --n_epochs '${CB_EPOCHS}' --lr '${CB_LR}' --weight_decay '${WEIGHT_DECAY}' \
         --revin '${REVIN}' --per_channel_codebook '${PER_CHANNEL_CODEBOOK}' \
@@ -357,7 +378,7 @@ done
 echo "===== Phase 2/3: Pretrain all transformers =====" | tee -a "${PROGRESS_LOG}"
 for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
     set_group_vars "${GROUP_ID}"
-    PRE_LOG="${LOG_DIR}/pre_${GROUP_TAG}.log"
+    PRE_LOG="${LOG_DIR}/pre_${GROUP_TAG}${SOFT_NEIGHBOR_SUFFIX}.log"
     if [ ! -f "${CB_CKPT}" ]; then
         echo "[$(date +%H:%M:%S)] PRE SKIP ${GROUP_TAG} (missing codebook)" | tee -a "${PROGRESS_LOG}"
         continue
@@ -380,11 +401,13 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         --num_hiddens '${NUM_HIDDENS}' --num_residual_layers '${NUM_RESIDUAL_LAYERS}' \
         --num_residual_hiddens '${NUM_RESIDUAL_HIDDENS}' \
         --vqvae_backbone '${VQVAE_BACKBONE}' --vqvae_tcn_kernel_size '${VQVAE_TCN_KERNEL_SIZE}' \
-        --vqvae_chunk_size '${VQVAE_CHUNK_SIZE}' \
+        --vqvae_chunk_size '${VQVAE_CHUNK_SIZE}' --decoder_lowpass '${DECODER_LOWPASS}' \
         --vqvae_checkpoint '${CB_CKPT}' --freeze_vqvae 1 --load_vq_weights 1 \
         --per_channel_codebook '${PER_CHANNEL_CODEBOOK}' --n_rq_layers '${N_RQ_LAYERS}' \
         --use_raw_input '${USE_RAW_INPUT}' \
         --rq_layer_weights ${RQ_LAYER_WEIGHTS} \
+        --soft_neighbor_k '${SOFT_NEIGHBOR_K}' --soft_neighbor_alpha '${SOFT_NEIGHBOR_ALPHA}' \
+        --soft_neighbor_tau '${SOFT_NEIGHBOR_TAU}' \
         --n_epochs '${PRETRAIN_EPOCHS}' --lr '${PRETRAIN_LR}' --weight_decay '${WEIGHT_DECAY}' \
         --revin '${REVIN}' --vq_weight 0.0 --recon_weight 0.0 \
         ${CHANNEL_ARGS} \
@@ -402,7 +425,7 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
 done
 
 echo "===== Phase 3/3: Finetune all groups by horizon =====" | tee -a "${PROGRESS_LOG}"
-SUMMARY_TSV="${LOG_DIR}/summary.tsv"
+SUMMARY_TSV="${LOG_DIR}/summary${SOFT_NEIGHBOR_SUFFIX}.tsv"
 echo -e "target_points\tgroup_id\tgroup_tag\tstart\tend\tweight\tmse\tmae" > "${SUMMARY_TSV}"
 for TP_IDX in "${!TARGET_POINTS_LIST[@]}"; do
     TARGET_POINTS="${TARGET_POINTS_LIST[$TP_IDX]}"
@@ -414,8 +437,8 @@ for TP_IDX in "${!TARGET_POINTS_LIST[@]}"; do
     echo "===== Finetune horizon ${TARGET_POINTS} (ar_step=${CURRENT_FORECAST_STEP_SIZE}, pred_len=${CURRENT_FORECAST_PRED_LEN}, lr=${CURRENT_FINETUNE_LR}, tau=${CURRENT_GUMBEL_TEMPERATURE}, huber_delta=${CURRENT_HUBER_DELTA}) =====" | tee -a "${PROGRESS_LOG}"
     for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         set_group_vars "${GROUP_ID}"
-        FT_LOG="${LOG_DIR}/ft_${GROUP_TAG}_tp${TARGET_POINTS}.log"
-        FT_NAME="patch_vqvae_finetune_cw${FINETUNE_CONTEXT_POINTS}_tw${TARGET_POINTS}_model${MODEL_ID}${CH_SUFFIX}"
+        FT_LOG="${LOG_DIR}/ft_${GROUP_TAG}_tp${TARGET_POINTS}${SOFT_NEIGHBOR_SUFFIX}.log"
+        FT_NAME="patch_vqvae_finetune_cw${FINETUNE_CONTEXT_POINTS}_tw${TARGET_POINTS}_model${MODEL_ID}${SOFT_NEIGHBOR_SUFFIX}${CH_SUFFIX}"
         FT_CKPT="${FINETUNE_SAVE_PATH}/${DSET}/${FT_NAME}.pth"
         if [ ! -f "${PRETRAIN_CKPT}" ]; then
             echo "[$(date +%H:%M:%S)] FT SKIP ${GROUP_TAG} tp=${TARGET_POINTS} (missing pretrain)" | tee -a "${PROGRESS_LOG}"
@@ -488,7 +511,7 @@ PY
     echo "===== Weighted Summary: ${SUMMARY_LINE} =====" | tee -a "${PROGRESS_LOG}"
 done
 
-OVERALL_SUMMARY_TSV="${LOG_DIR}/summary_overall.tsv"
+OVERALL_SUMMARY_TSV="${LOG_DIR}/summary_overall${SOFT_NEIGHBOR_SUFFIX}.tsv"
 OVERALL_SUMMARY=$(SUMMARY_TSV="${SUMMARY_TSV}" OVERALL_SUMMARY_TSV="${OVERALL_SUMMARY_TSV}" "${PYTHON_BIN}" - <<'PY'
 import os
 from collections import defaultdict

@@ -124,6 +124,11 @@ def parse_args():
                         help='soft peak pooling 的 softmax 温度 τ_f（越小越接近 hard peak）')
     parser.add_argument('--order_eps', type=float, default=1e-6,
                         help='能量归一化 eps，避免低能量层频率分数不稳定')
+    parser.add_argument('--layer1_smooth_weight', type=float, default=0.0,
+                        help='RVQ 第 1 层解码分量的低通平滑正则权重（0=关闭）。'
+                             '约束 Decoder(z_q^1) 接近其 moving-average 版本，鼓励第 1 层承担低频主干')
+    parser.add_argument('--layer1_smooth_kernel', type=int, default=3,
+                        help='第 1 层平滑正则的 moving-average kernel size（需为奇数，默认 3）')
 
     # 噪声-VQ重构正交损失（Patch 空间版）
     parser.add_argument('--orth_weight', type=float, default=0.0,
@@ -319,6 +324,19 @@ def compute_noise_orth_loss(model, s: torch.Tensor, eps: float = 1e-6) -> torch.
     return sim.abs().mean()
 
 
+def moving_average_lowpass(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Channel-wise moving-average low-pass over time for [B, T, C] tensors."""
+    if kernel_size <= 1:
+        return x
+    if kernel_size % 2 == 0:
+        raise ValueError(f"layer1_smooth_kernel must be odd, got {kernel_size}")
+    pad = kernel_size // 2
+    x_ch_first = x.permute(0, 2, 1)  # [B, C, T]
+    x_pad = F.pad(x_ch_first, (pad, pad), mode='replicate')
+    x_lp = F.avg_pool1d(x_pad, kernel_size=kernel_size, stride=1)
+    return x_lp.permute(0, 2, 1)
+
+
 def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, epoch: int = 0):
     """训练一个epoch"""
     model.train()
@@ -329,7 +347,10 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, epoch
     total_sparse_norm = 0
     total_order_loss = 0
     total_orth_loss = 0
+    total_layer1_smooth_loss = 0
     lambda_ord  = float(getattr(args, 'lambda_ord',  0.0))
+    layer1_smooth_weight = float(getattr(args, 'layer1_smooth_weight', 0.0))
+    layer1_smooth_kernel = int(getattr(args, 'layer1_smooth_kernel', 3))
     orth_weight = float(getattr(args, 'orth_weight', 0.0))
     orth_start  = int(getattr(args, 'orth_start_epoch', 20))
     orth_warmup = int(getattr(args, 'orth_warmup_epochs', 10))
@@ -431,6 +452,14 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, epoch
                 per_layer_gap_sum[li] += float(gap.detach())
             total_order_loss += float(order_loss.detach())
 
+        # 第 1 层码本低通平滑正则：鼓励 x_components[0] 学低频主干。
+        if layer1_smooth_weight > 0 and x_components is not None:
+            x1 = x_components[0]
+            x1_lp = moving_average_lowpass(x1, layer1_smooth_kernel)
+            layer1_smooth_loss = F.mse_loss(x1, x1_lp.detach())
+            loss = loss + layer1_smooth_weight * layer1_smooth_loss
+            total_layer1_smooth_loss += float(layer1_smooth_loss.detach())
+
         # 噪声-码本正交损失（Encoder 空间，warmup 控制有效权重）
         if effective_orth_weight > 0 and s is not None:
             orth_loss = compute_noise_orth_loss(model, s)
@@ -494,6 +523,7 @@ def train_epoch(model, dataloader, optimizer, revin, args, device, scaler, epoch
         'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
         'order_loss': total_order_loss / n_batches if n_batches > 0 else 0.0,
         'orth_loss': total_orth_loss / n_batches if n_batches > 0 else 0.0,
+        'layer1_smooth_loss': total_layer1_smooth_loss / n_batches if n_batches > 0 else 0.0,
         'per_layer_g': per_layer_g,
         'per_layer_gap': per_layer_gap,
         'codebook_stats': codebook_stats,
@@ -509,7 +539,10 @@ def validate_epoch(model, dataloader, revin, args, device):
     total_perplexity = 0
     total_sparse_norm = 0
     total_order_loss = 0
+    total_layer1_smooth_loss = 0
     lambda_ord = float(getattr(args, 'lambda_ord', 0.0))
+    layer1_smooth_weight = float(getattr(args, 'layer1_smooth_weight', 0.0))
+    layer1_smooth_kernel = int(getattr(args, 'layer1_smooth_kernel', 3))
     use_per_layer = int(getattr(args, 'n_rq_layers', 1)) >= 2
     use_order = (
         lambda_ord > 0 and use_per_layer
@@ -589,6 +622,13 @@ def validate_epoch(model, dataloader, revin, args, device):
                     per_layer_gap_sum[li] += float(gap)
                 total_order_loss += float(order_loss)
 
+            if layer1_smooth_weight > 0 and x_components is not None:
+                x1 = x_components[0]
+                x1_lp = moving_average_lowpass(x1, layer1_smooth_kernel)
+                layer1_smooth_loss = F.mse_loss(x1, x1_lp)
+                loss = loss + layer1_smooth_weight * layer1_smooth_loss
+                total_layer1_smooth_loss += float(layer1_smooth_loss)
+
             if per_channel:
                 ch_usages = [
                     len(torch.unique(indices[:, :, c, 0])) / args.codebook_size
@@ -629,6 +669,7 @@ def validate_epoch(model, dataloader, revin, args, device):
         'perplexity': total_perplexity / n_batches if n_batches > 0 else 0.0,
         'sparse_norm': total_sparse_norm / n_batches if n_batches > 0 else 0.0,
         'order_loss': total_order_loss / n_batches if n_batches > 0 else 0.0,
+        'layer1_smooth_loss': total_layer1_smooth_loss / n_batches if n_batches > 0 else 0.0,
         'per_layer_g': per_layer_g,
         'per_layer_gap': per_layer_gap,
         'codebook_stats': codebook_stats,
@@ -851,6 +892,12 @@ def main():
         if getattr(args, 'sparse_weight', 0.0) > 0:
             print(f"  └─ SparseNorm (L1): Train {train_metrics['sparse_norm']:.5f} | "
                   f"Valid {val_metrics['sparse_norm']:.5f}")
+
+        if float(getattr(args, 'layer1_smooth_weight', 0.0)) > 0:
+            print(f"  └─ Layer1Smooth(k={int(getattr(args, 'layer1_smooth_kernel', 3))}, "
+                  f"w={float(getattr(args, 'layer1_smooth_weight', 0.0)):.5f}): "
+                  f"Train {train_metrics.get('layer1_smooth_loss', 0.0):.5f} | "
+                  f"Valid {val_metrics.get('layer1_smooth_loss', 0.0):.5f}")
 
         # 噪声-VQ重构正交损失日志（只在有效权重 > 0 时才打印）
         if float(getattr(args, 'orth_weight', 0.0)) > 0:

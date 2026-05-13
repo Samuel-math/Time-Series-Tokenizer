@@ -34,6 +34,17 @@ class ResidualMLPBlock(nn.Module):
         return x + self._block(x)
 
 
+def _apply_decoder_lowpass(x, enabled=False):
+    """Apply a fixed 7-tap binomial low-pass filter on decoder patch output."""
+    if not enabled or x.shape[-1] < 7:
+        return x
+    channels = x.shape[1]
+    weight = x.new_tensor([1 / 64, 6 / 64, 15 / 64, 20 / 64, 15 / 64, 6 / 64, 1 / 64])
+    weight = weight.view(1, 1, 7).repeat(channels, 1, 1)
+    x_pad = F.pad(x, (3, 3), mode='replicate')
+    return F.conv1d(x_pad, weight, groups=channels)
+
+
 class Encoder(nn.Module):
     def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens,
                  embedding_dim, compression_factor, patch_size=None):
@@ -152,6 +163,7 @@ class Decoder(nn.Module):
         x = self._residual_mlp(x)
         x = self._output_proj(x)
         x = x.view(x.shape[0], self.out_channels, self.patch_size)
+        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -240,6 +252,7 @@ class LinearDecoder(nn.Module):
         x = inputs.flatten(start_dim=1)
         x = self.proj(x)
         x = x.view(x.shape[0], self.out_channels, self.patch_size)
+        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -348,6 +361,7 @@ class ConvLinearDecoder(nn.Module):
         x = self.input_proj(inputs)
         x = F.interpolate(x, size=self.patch_size, mode='linear', align_corners=False)
         x = self.output_proj(x)
+        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -500,6 +514,7 @@ class TCNDecoder(nn.Module):
         x = F.interpolate(x, size=self.patch_size, mode='linear', align_corners=False)
         x = self.residual_tcn(x)
         x = self.output_proj(x)
+        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -640,6 +655,7 @@ class ChunkMLPDecoder(nn.Module):
         x = self.chunk_proj(x).view(bsz, self.num_chunks, -1)
         x = self.local_out(x).view(bsz, self.num_chunks, self.out_channels, self.chunk_size)
         x = x.permute(0, 2, 1, 3).reshape(bsz, self.out_channels, self.patch_size)
+        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -733,7 +749,9 @@ def build_decoder(config, in_channels=None, out_channels=1):
         patch_size=config.get('patch_size'),
     )
     try:
-        return VQVAE_DECODER_BUILDERS[backbone](config, common)
+        decoder = VQVAE_DECODER_BUILDERS[backbone](config, common)
+        decoder.decoder_lowpass = bool(config.get('decoder_lowpass', False))
+        return decoder
     except KeyError as exc:
         supported = ', '.join(sorted(VQVAE_DECODER_BUILDERS))
         raise ValueError(f"Unsupported vqvae_backbone={backbone!r}; supported: {supported}") from exc
