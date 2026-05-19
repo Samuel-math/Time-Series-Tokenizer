@@ -64,6 +64,28 @@ def build_arg_parser():
     p.add_argument('--d_ff', type=int, default=256)
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--transformer_hidden_dim', type=int, default=None)
+    p.add_argument('--temporal_backbone', type=str, default='causal_transformer',
+                   choices=['causal_transformer', 'relative_transformer', 'itransformer_lite',
+                            'timefilter_lite', 'timefilter_attn',
+                            'channel_summary_adapter'],
+                   help='NTP temporal backbone: causal_transformer=旧CI Transformer, '
+                        'relative_transformer=相对位置偏置的因果Transformer, '
+                        'itransformer_lite=时间因果建模+通道attention, '
+                        'timefilter_lite=时间因果建模+patch-specific通道图过滤, '
+                        'timefilter_attn=多头channel attention版timefilter_lite, '
+                        'channel_summary_adapter=滞后跨通道均值条件分支')
+    p.add_argument('--channel_mixer_heads', type=int, default=None,
+                   help='itransformer_lite 的 channel attention heads；None=沿用 n_heads')
+    p.add_argument('--timefilter_topk', type=int, default=8,
+                   help='timefilter_lite 每个 patch/channel 保留的通道邻居数')
+    p.add_argument('--timefilter_temperature', type=float, default=1.0,
+                   help='timefilter_lite 通道 affinity softmax 温度')
+    p.add_argument('--timefilter_attn_heads', type=int, default=None,
+                   help='timefilter_attn 的 channel attention heads；None=沿用 n_heads')
+    p.add_argument('--channel_summary_window', type=int, default=4,
+                   help='channel_summary_adapter 使用的历史 patch 窗口 W')
+    p.add_argument('--channel_summary_gate_init', type=float, default=-4.0,
+                   help='channel_summary_adapter gate 初始化值；-4 约等于 0.018')
     p.add_argument('--commitment_cost', type=float, default=0.25)
     p.add_argument('--codebook_ema', type=int, default=1)
     p.add_argument('--disable_ema_update', type=int, default=1,
@@ -801,6 +823,21 @@ def run_pretrain():
         backbone_sfx = f'_{backbone}c{int(getattr(args, "vqvae_chunk_size", 2))}'
     if bool(getattr(args, 'decoder_lowpass', 0)):
         backbone_sfx = f'{backbone_sfx}_dlp'
+    temporal_backbone = str(getattr(args, 'temporal_backbone', 'causal_transformer')).lower()
+    if temporal_backbone in ('causal_transformer', 'transformer', 'patchtst'):
+        temporal_sfx = ''
+    elif temporal_backbone == 'relative_transformer':
+        temporal_sfx = '_relpos'
+    elif temporal_backbone == 'timefilter_lite':
+        temporal_sfx = f'_timefilterlitek{int(getattr(args, "timefilter_topk", 8))}'
+    elif temporal_backbone == 'timefilter_attn':
+        heads = getattr(args, 'timefilter_attn_heads', None)
+        heads = int(heads if heads is not None else getattr(args, 'n_heads', 4))
+        temporal_sfx = f'_timefilterattnh{heads}k{int(getattr(args, "timefilter_topk", 8))}'
+    elif temporal_backbone == 'channel_summary_adapter':
+        temporal_sfx = f'_chsummaryw{int(getattr(args, "channel_summary_window", 4))}'
+    else:
+        temporal_sfx = f'_{temporal_backbone}'
     soft_k = int(getattr(args, 'soft_neighbor_k', 0))
     if soft_k > 0:
         soft_alpha = float(getattr(args, 'soft_neighbor_alpha', 0.25))
@@ -814,7 +851,8 @@ def run_pretrain():
     model_name = (
         f'patch_vqvae_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}'
         f'_l{args.n_layers}_in{args.context_points}_step{step_size}'
-        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}{backbone_sfx}{nmpp_sfx}{soft_sfx}{ch_sfx}'
+        f'{rid_sfx}_model{args.model_id}{perch_sfx}{rvq_sfx}'
+        f'{backbone_sfx}{temporal_sfx}{nmpp_sfx}{soft_sfx}{ch_sfx}'
     )
     # 同名 pretrain 文件存在时，先清理旧文件再写入新结果（保持文件名稳定）。
     existing_ckpt = save_dir / f'{model_name}.pth'

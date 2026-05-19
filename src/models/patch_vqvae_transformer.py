@@ -444,6 +444,396 @@ class CausalTransformer(nn.Module):
         return x
 
 
+class RelativePositionBias(nn.Module):
+    """T5-style relative position bias for causal attention."""
+
+    def __init__(self, num_heads, num_buckets=32, max_distance=128):
+        super().__init__()
+        self.num_heads = int(num_heads)
+        self.num_buckets = int(num_buckets)
+        self.max_distance = int(max_distance)
+        self.relative_attention_bias = nn.Embedding(self.num_buckets, self.num_heads)
+
+    def _relative_position_bucket(self, relative_position):
+        n = (-relative_position).clamp(min=0)
+        max_exact = self.num_buckets // 2
+        is_small = n < max_exact
+        val_if_large = max_exact + (
+            torch.log(n.float() / max_exact + 1e-6)
+            / math.log(self.max_distance / max_exact)
+            * (self.num_buckets - max_exact)
+        ).to(torch.long)
+        val_if_large = val_if_large.clamp(max=self.num_buckets - 1)
+        return torch.where(is_small, n, val_if_large)
+
+    def forward(self, seq_len, device):
+        context_pos = torch.arange(seq_len, device=device)[:, None]
+        memory_pos = torch.arange(seq_len, device=device)[None, :]
+        relative_position = memory_pos - context_pos
+        rp_bucket = self._relative_position_bucket(relative_position)
+        values = self.relative_attention_bias(rp_bucket)  # [T, T, H]
+        return values.permute(2, 0, 1).contiguous()  # [H, T, T]
+
+
+class RelativePositionTransformerBackbone(nn.Module):
+    """Causal Transformer with learned relative position bias."""
+    use_channel_grid = False
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, hidden_dim=None):
+        super().__init__()
+        self.code_dim = code_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else code_dim
+        self.n_heads = int(n_heads)
+
+        if self.hidden_dim % self.n_heads != 0:
+            raise ValueError(
+                f"relative_transformer requires hidden_dim={self.hidden_dim} "
+                f"divisible by n_heads={self.n_heads}"
+            )
+
+        if self.hidden_dim != self.code_dim:
+            self.input_proj = nn.Linear(self.code_dim, self.hidden_dim)
+            self.output_proj = nn.Linear(self.hidden_dim, self.code_dim)
+        else:
+            self.input_proj = None
+            self.output_proj = None
+
+        self.drop = nn.Dropout(dropout)
+        self.rel_pos_bias = RelativePositionBias(self.n_heads, num_buckets=32, max_distance=128)
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'ln1': nn.LayerNorm(self.hidden_dim),
+                'attn': nn.MultiheadAttention(
+                    embed_dim=self.hidden_dim,
+                    num_heads=self.n_heads,
+                    dropout=dropout,
+                    batch_first=True,
+                ),
+                'ln2': nn.LayerNorm(self.hidden_dim),
+                'ffn': nn.Sequential(
+                    nn.Linear(self.hidden_dim, d_ff),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_ff, self.hidden_dim),
+                    nn.Dropout(dropout),
+                ),
+            })
+            for _ in range(int(n_layers))
+        ])
+
+    def forward(self, x_flat, batch_size=None, n_channels=None):
+        del batch_size, n_channels
+        x = x_flat
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+        x = self.drop(x)
+
+        bsz, seq_len, _ = x.shape
+        rel_bias = self.rel_pos_bias(seq_len, x.device)  # [H, T, T]
+        causal = torch.triu(
+            torch.full((seq_len, seq_len), float('-inf'), device=x.device),
+            diagonal=1,
+        )
+        attn_mask = rel_bias + causal.unsqueeze(0)
+        attn_mask = attn_mask.repeat(bsz, 1, 1).to(dtype=x.dtype)  # [B*H, T, T]
+
+        for layer in self.layers:
+            h = layer['ln1'](x)
+            h, _ = layer['attn'](h, h, h, attn_mask=attn_mask, need_weights=False)
+            x = x + h
+            x = x + layer['ffn'](layer['ln2'](x))
+
+        if self.output_proj is not None:
+            x = self.output_proj(x)
+        return x
+
+
+class ITransformerLiteBackbone(nn.Module):
+    """Causal temporal modeling plus per-position channel attention.
+
+    The input/output contract stays compatible with the old flattened path:
+    [B*C, P, D] -> [B*C, P, D]. Internally it restores [B, P, C, D]
+    so channel attention can run over variables at the same patch position.
+    """
+    use_channel_grid = True
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, channel_heads=None):
+        super().__init__()
+        self.temporal = CausalTransformer(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+        )
+        channel_heads = channel_heads if channel_heads is not None else n_heads
+        self.channel_norm = nn.LayerNorm(code_dim)
+        self.channel_attn = nn.MultiheadAttention(
+            embed_dim=code_dim, num_heads=channel_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(code_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(code_dim, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, code_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x_flat, batch_size, n_channels):
+        h = self.temporal(x_flat)  # [B*C, P, D]
+        bc, num_patches, code_dim = h.shape
+        if bc != batch_size * n_channels:
+            raise ValueError(
+                f"Expected B*C={batch_size * n_channels}, got {bc}; "
+                "check channel count passed to temporal backbone."
+            )
+
+        h_grid = h.reshape(batch_size, n_channels, num_patches, code_dim).permute(0, 2, 1, 3)
+        channel_tokens = h_grid.reshape(batch_size * num_patches, n_channels, code_dim)
+        attn_in = self.channel_norm(channel_tokens)
+        attn_out, _ = self.channel_attn(attn_in, attn_in, attn_in, need_weights=False)
+        channel_tokens = channel_tokens + attn_out
+        channel_tokens = channel_tokens + self.ffn(self.ffn_norm(channel_tokens))
+
+        h_grid = channel_tokens.reshape(batch_size, num_patches, n_channels, code_dim)
+        return h_grid.permute(0, 2, 1, 3).reshape(batch_size * n_channels, num_patches, code_dim)
+
+
+class TimeFilterLiteBackbone(nn.Module):
+    """Patch-specific channel graph filter after causal temporal modeling.
+
+    This is a lightweight TimeFilter-inspired block: at each patch position it
+    computes channel affinities in latent space, keeps a top-k neighborhood, and
+    aggregates filtered channel features by a residual graph update.
+    """
+    use_channel_grid = True
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, graph_topk=8, graph_temperature=1.0):
+        super().__init__()
+        self.temporal = CausalTransformer(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+        )
+        self.graph_topk = int(graph_topk)
+        self.graph_temperature = max(float(graph_temperature), 1e-6)
+        self.q_proj = nn.Linear(code_dim, code_dim)
+        self.k_proj = nn.Linear(code_dim, code_dim)
+        self.v_proj = nn.Linear(code_dim, code_dim)
+        self.out_proj = nn.Linear(code_dim, code_dim)
+        self.drop = nn.Dropout(dropout)
+        self.graph_norm = nn.LayerNorm(code_dim)
+        self.ffn_norm = nn.LayerNorm(code_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(code_dim, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, code_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x_flat, batch_size, n_channels):
+        h = self.temporal(x_flat)  # [B*C, P, D]
+        bc, num_patches, code_dim = h.shape
+        if bc != batch_size * n_channels:
+            raise ValueError(
+                f"Expected B*C={batch_size * n_channels}, got {bc}; "
+                "check channel count passed to temporal backbone."
+            )
+
+        h_grid = h.reshape(batch_size, n_channels, num_patches, code_dim).permute(0, 2, 1, 3)
+        x = self.graph_norm(h_grid)
+        q = F.normalize(self.q_proj(x), dim=-1)
+        k = F.normalize(self.k_proj(x), dim=-1)
+        v = self.v_proj(x)
+
+        affinity = torch.einsum('btcd,btsd->btcs', q, k) / self.graph_temperature
+        topk = min(max(self.graph_topk, 1), n_channels)
+        if topk < n_channels:
+            top_values, top_idx = torch.topk(affinity, k=topk, dim=-1)
+            masked = affinity.new_full(affinity.shape, float('-inf'))
+            affinity = masked.scatter(dim=-1, index=top_idx, src=top_values)
+
+        weights = F.softmax(affinity, dim=-1)
+        filtered = torch.einsum('btcs,btsd->btcd', weights, v)
+        h_grid = h_grid + self.drop(self.out_proj(filtered))
+        h_grid = h_grid + self.ffn(self.ffn_norm(h_grid))
+        return h_grid.permute(0, 2, 1, 3).reshape(batch_size * n_channels, num_patches, code_dim)
+
+
+class TimeFilterAttentionBackbone(nn.Module):
+    """TimeFilter-lite variant with multi-head channel attention.
+
+    Compared with ``TimeFilterLiteBackbone``'s single-head cosine top-k graph,
+    this uses standard scaled dot-product attention over channels at each patch
+    position while still keeping the old causal temporal path.
+    """
+    use_channel_grid = True
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, attn_heads=None,
+                 graph_topk=8, graph_temperature=1.0):
+        super().__init__()
+        self.temporal = CausalTransformer(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+        )
+        self.attn_heads = int(attn_heads if attn_heads is not None else n_heads)
+        if code_dim % self.attn_heads != 0:
+            raise ValueError(
+                f"timefilter_attn requires code_dim={code_dim} divisible by "
+                f"timefilter_attn_heads={self.attn_heads}"
+            )
+        self.head_dim = code_dim // self.attn_heads
+        self.graph_topk = int(graph_topk)
+        self.graph_temperature = max(float(graph_temperature), 1e-6)
+        self.attn_norm = nn.LayerNorm(code_dim)
+        self.q_proj = nn.Linear(code_dim, code_dim)
+        self.k_proj = nn.Linear(code_dim, code_dim)
+        self.v_proj = nn.Linear(code_dim, code_dim)
+        self.out_proj = nn.Linear(code_dim, code_dim)
+        self.drop = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(code_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(code_dim, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, code_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x_flat, batch_size, n_channels):
+        h = self.temporal(x_flat)  # [B*C, P, D]
+        bc, num_patches, code_dim = h.shape
+        if bc != batch_size * n_channels:
+            raise ValueError(
+                f"Expected B*C={batch_size * n_channels}, got {bc}; "
+                "check channel count passed to temporal backbone."
+            )
+
+        h_grid = h.reshape(batch_size, n_channels, num_patches, code_dim).permute(0, 2, 1, 3)
+        x = self.attn_norm(h_grid)
+        q = self.q_proj(x).reshape(batch_size, num_patches, n_channels, self.attn_heads, self.head_dim)
+        k = self.k_proj(x).reshape(batch_size, num_patches, n_channels, self.attn_heads, self.head_dim)
+        v = self.v_proj(x).reshape(batch_size, num_patches, n_channels, self.attn_heads, self.head_dim)
+        q = q.permute(0, 1, 3, 2, 4)  # [B, P, H, C, Dh]
+        k = k.permute(0, 1, 3, 2, 4)
+        v = v.permute(0, 1, 3, 2, 4)
+
+        scale = (self.head_dim ** -0.5) / self.graph_temperature
+        scores = torch.einsum('bphcd,bphsd->bphcs', q, k) * scale
+        topk = min(max(self.graph_topk, 1), n_channels)
+        if topk < n_channels:
+            top_values, top_idx = torch.topk(scores, k=topk, dim=-1)
+            masked = scores.new_full(scores.shape, float('-inf'))
+            scores = masked.scatter(dim=-1, index=top_idx, src=top_values)
+
+        weights = self.drop(F.softmax(scores, dim=-1))
+        filtered = torch.einsum('bphcs,bphsd->bphcd', weights, v)
+        filtered = filtered.permute(0, 1, 3, 2, 4).contiguous().reshape(
+            batch_size, num_patches, n_channels, code_dim,
+        )
+        h_grid = h_grid + self.drop(self.out_proj(filtered))
+        h_grid = h_grid + self.ffn(self.ffn_norm(h_grid))
+        return h_grid.permute(0, 2, 1, 3).reshape(batch_size * n_channels, num_patches, code_dim)
+
+
+class ChannelSummaryAdapterBackbone(nn.Module):
+    """Causal temporal modeling with a lightweight lagged channel summary adapter.
+
+    This keeps the channel-independent temporal path as the main signal and adds
+    only a small shared conditioning vector from recent cross-channel summaries.
+    """
+    use_channel_grid = True
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, summary_window=4, gate_init=-4.0):
+        super().__init__()
+        self.temporal = CausalTransformer(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+        )
+        self.summary_window = int(summary_window)
+        self.summary_norm = nn.LayerNorm(code_dim)
+        self.summary_mlp = nn.Sequential(
+            nn.Linear(code_dim, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, code_dim),
+            nn.Dropout(dropout),
+        )
+        self.summary_gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, x_flat, batch_size, n_channels):
+        h = self.temporal(x_flat)  # [B*C, P, D]
+        bc, num_patches, code_dim = h.shape
+        if bc != batch_size * n_channels:
+            raise ValueError(
+                f"Expected B*C={batch_size * n_channels}, got {bc}; "
+                "check channel count passed to temporal backbone."
+            )
+
+        h_grid = h.reshape(batch_size, n_channels, num_patches, code_dim).permute(0, 2, 1, 3)
+        channel_mean = h_grid.mean(dim=2)  # [B, P, D]
+        summaries = []
+        for p in range(num_patches):
+            start = max(0, p - self.summary_window)
+            summaries.append(channel_mean[:, start:p + 1, :].mean(dim=1))
+        summary = torch.stack(summaries, dim=1)  # [B, P, D]
+
+        adapter = self.summary_mlp(self.summary_norm(summary)).unsqueeze(2)
+        h_grid = h_grid + torch.sigmoid(self.summary_gate) * adapter
+        return h_grid.permute(0, 2, 1, 3).reshape(batch_size * n_channels, num_patches, code_dim)
+
+
+def build_temporal_backbone(config, code_dim):
+    """Build the temporal backbone used by NTP/finetune.
+
+    Returns a plain ``CausalTransformer`` for the default mode so existing
+    checkpoint keys under ``transformer.*`` remain compatible.
+    """
+    name = str(config.get('temporal_backbone', 'causal_transformer')).lower()
+    n_heads = int(config.get('n_heads', 4))
+    n_layers = int(config.get('n_layers', 4))
+    d_ff = int(config.get('d_ff', 256))
+    dropout = float(config.get('dropout', 0.1))
+    hidden_dim = config.get('transformer_hidden_dim', None)
+
+    if name in ('causal_transformer', 'transformer', 'patchtst'):
+        return CausalTransformer(code_dim, n_heads, n_layers, d_ff, dropout, hidden_dim=hidden_dim)
+    if name == 'relative_transformer':
+        return RelativePositionTransformerBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim
+        )
+    if name == 'itransformer_lite':
+        return ITransformerLiteBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            channel_heads=config.get('channel_mixer_heads', None),
+        )
+    if name == 'timefilter_lite':
+        return TimeFilterLiteBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            graph_topk=config.get('timefilter_topk', 8),
+            graph_temperature=config.get('timefilter_temperature', 1.0),
+        )
+    if name == 'timefilter_attn':
+        return TimeFilterAttentionBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            attn_heads=config.get('timefilter_attn_heads', None),
+            graph_topk=config.get('timefilter_topk', 8),
+            graph_temperature=config.get('timefilter_temperature', 1.0),
+        )
+    if name == 'channel_summary_adapter':
+        return ChannelSummaryAdapterBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            summary_window=config.get('channel_summary_window', 4),
+            gate_init=config.get('channel_summary_gate_init', -4.0),
+        )
+    supported = ('causal_transformer, relative_transformer, itransformer_lite, '
+                 'timefilter_lite, timefilter_attn, channel_summary_adapter')
+    raise ValueError(f"Unsupported temporal_backbone={name!r}; supported: {supported}")
+
+
 class PatchVQVAETransformer(nn.Module):
     """
     Patch-based VQVAE + Transformer
@@ -485,6 +875,7 @@ class PatchVQVAETransformer(nn.Module):
         
         # Transformer的hidden_dim（用于Transformer内部维度，默认使用code_dim）
         self.transformer_hidden_dim = config.get('transformer_hidden_dim', None)
+        self.temporal_backbone = str(config.get('temporal_backbone', 'causal_transformer')).lower()
         
         # VQ (码本维度 = code_dim)
         vq_init_method = config.get('vq_init_method', 'random')
@@ -515,11 +906,8 @@ class PatchVQVAETransformer(nn.Module):
         else:
             self.vq = _make_rvq()
 
-        # Transformer (输入维度 = code_dim，内部维度 = transformer_hidden_dim)
-        self.transformer = CausalTransformer(
-            self.code_dim, self.n_heads, self.n_layers,
-            self.d_ff, self.dropout, hidden_dim=self.transformer_hidden_dim
-        )
+        # Temporal backbone (默认保持旧 CausalTransformer，checkpoint key 不变)
+        self.transformer = build_temporal_backbone(config, self.code_dim)
 
         # 每层 RVQ 独立一个预测头；n_rq_layers=1 时等价于原来的 output_head
         self.output_heads = nn.ModuleList([
@@ -544,6 +932,12 @@ class PatchVQVAETransformer(nn.Module):
         self.decoder = build_decoder(config, in_channels=self.embedding_dim, out_channels=1)
         
         # Channel Attention 已移除
+
+    def _run_temporal_backbone(self, x_flat, batch_size, n_channels):
+        """Run temporal backbone with a stable [B*C, P, D] external contract."""
+        if getattr(self.transformer, 'use_channel_grid', False):
+            return self.transformer(x_flat, batch_size, n_channels)
+        return self.transformer(x_flat)
     
     def _get_vq(self, c: int):
         """返回通道 c 对应的 VQ 模块（per_channel_codebook=True 时每通道独立，否则共享）"""
@@ -751,7 +1145,7 @@ class PatchVQVAETransformer(nn.Module):
                 [seq_full[:, :context_size, :], placeholder], dim=1
             )  # [B*C, context_size + pred_len, D]
 
-            h_full   = self.transformer(full_sequence_stage)
+            h_full   = self._run_temporal_backbone(full_sequence_stage, B, C)
             h_target = h_full[:, context_size:context_size + pred_len, :]  # [B*C, N, hidden]
 
             target_indices_stage = full_indices[:, target_start:target_end, :, :]
@@ -900,7 +1294,7 @@ class PatchVQVAETransformer(nn.Module):
                                       device=context_flat.device, dtype=context_flat.dtype)
             full_sequence = torch.cat([context_flat, placeholder], dim=1)
 
-            h_full = self.transformer(full_sequence)
+            h_full = self._run_temporal_backbone(full_sequence, B, C)
             h_pred = h_full[:, num_input_patches:, :]
             all_pred_codes = _decode_h_pred_all_layers(h_pred)        # 累加所有 L 层
             if return_token_metrics:
@@ -954,7 +1348,9 @@ class PatchVQVAETransformer(nn.Module):
                     B * C, eff_pred_len, code_dim,
                     device=current_context.device, dtype=current_context.dtype,
                 )
-                h_full = self.transformer(torch.cat([current_context, placeholder], dim=1))
+                h_full = self._run_temporal_backbone(
+                    torch.cat([current_context, placeholder], dim=1), B, C,
+                )
                 h_chunk = h_full[:, n_ctx:n_ctx + eff_pred_len, :]   # [B*C, N, hidden]
                 # list[L] of [B*C, N, K]
                 logits_chunk_layers = [head(h_chunk) for head in self.output_heads]
@@ -1291,6 +1687,14 @@ def get_model_config(args):
         'n_heads': args.n_heads,
         'd_ff': args.d_ff,
         'dropout': args.dropout,
+        # Temporal backbone：默认 causal_transformer 保持旧行为；可选 channel-interaction variants
+        'temporal_backbone': getattr(args, 'temporal_backbone', 'causal_transformer'),
+        'channel_mixer_heads': getattr(args, 'channel_mixer_heads', None),
+        'timefilter_topk': int(getattr(args, 'timefilter_topk', 8)),
+        'timefilter_temperature': float(getattr(args, 'timefilter_temperature', 1.0)),
+        'timefilter_attn_heads': getattr(args, 'timefilter_attn_heads', None),
+        'channel_summary_window': int(getattr(args, 'channel_summary_window', 4)),
+        'channel_summary_gate_init': float(getattr(args, 'channel_summary_gate_init', -4.0)),
         'commitment_cost': args.commitment_cost,
         'codebook_ema': bool(args.codebook_ema),
         'ema_decay': args.ema_decay,

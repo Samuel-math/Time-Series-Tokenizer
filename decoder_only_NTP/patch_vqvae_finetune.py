@@ -127,6 +127,13 @@ def parse_args():
     parser.add_argument('--use_gumbel_softmax', type=int, default=1, help='是否使用Gumbel-Softmax（1启用，0使用普通Softmax）')
     parser.add_argument('--gumbel_temperature', type=float, default=1.0, help='Gumbel-Softmax温度（越小越接近argmax）')
     parser.add_argument('--gumbel_hard', type=int, default=0, help='是否使用Straight-Through Gumbel（前向硬采样，反向软梯度）')
+
+    # 仅用于展示/兼容命令行；实际 finetune 架构以 pretrained checkpoint config 为准
+    parser.add_argument('--temporal_backbone', type=str, default=None,
+                        choices=[None, 'causal_transformer', 'relative_transformer', 'itransformer_lite',
+                                 'timefilter_lite', 'timefilter_attn',
+                                 'channel_summary_adapter'],
+                        help='Temporal backbone 架构由 pretrained checkpoint 决定；该参数仅保留用于脚本兼容')
     
     # 自回归预测参数
     parser.add_argument('--ar_step_size', type=int, default=None, help='自回归步长（每步预测的patch数）。None表示非自回归（一次预测所有）')
@@ -164,6 +171,23 @@ def channel_suffix(args):
     return f'_ch{0 if start is None else start}-{end if end is not None else "end"}'
 
 
+def temporal_suffix_from_config(config):
+    backbone = str(config.get('temporal_backbone', 'causal_transformer')).lower()
+    if backbone in ('causal_transformer', 'transformer', 'patchtst'):
+        return ''
+    if backbone == 'relative_transformer':
+        return '_relpos'
+    if backbone == 'timefilter_lite':
+        return f'_timefilterlitek{int(config.get("timefilter_topk", 8))}'
+    if backbone == 'timefilter_attn':
+        heads = config.get('timefilter_attn_heads', None)
+        heads = int(heads if heads is not None else config.get('n_heads', 4))
+        return f'_timefilterattnh{heads}k{int(config.get("timefilter_topk", 8))}'
+    if backbone == 'channel_summary_adapter':
+        return f'_chsummaryw{int(config.get("channel_summary_window", 4))}'
+    return f'_{backbone}'
+
+
 def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     """加载预训练模型
     
@@ -196,6 +220,7 @@ def load_pretrained_model(checkpoint_path, device, n_channels=None, args=None):
     print(f'  num_residual_layers: {config.get("num_residual_layers", "NOT FOUND")}')
     print(f'  n_layers: {config.get("n_layers", "NOT FOUND")}')
     print(f'  n_heads: {config.get("n_heads", "NOT FOUND")}')
+    print(f'  temporal_backbone: {config.get("temporal_backbone", "causal_transformer")}')
     
     # 创建模型配置（添加Gumbel-Softmax配置，但不影响架构）
     import copy
@@ -544,7 +569,7 @@ def main():
         model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_run{run_id}_model{args.model_id}'
     else:
         model_name = f'patch_vqvae_finetune_cw{args.context_points}_tw{args.target_points}_model{args.model_id}'
-    model_name = f'{model_name}{channel_suffix(args)}'
+    model_name = f'{model_name}{temporal_suffix_from_config(config)}{channel_suffix(args)}'
     # 同名 finetune 文件存在时，先清理旧文件再写入新结果（保持文件名稳定）。
     existing_ckpt = save_dir / f'{model_name}.pth'
     if existing_ckpt.exists():
@@ -654,8 +679,8 @@ def main():
         
         total_time = time.time() - start_time
         
-        # 根据验证集 MSE + MAE 选择最佳模型。
-        is_best = (best_epoch is None) or (val_score < best_val_score)
+        # 仅按验证集 MSE 选择最佳模型（checkpoint/早停都以 MSE 为准）。
+        is_best = (best_epoch is None) or (val_mse < best_val_mse)
         if is_best:
             best_val_mse = val_mse
             best_val_mae = val_mae
@@ -700,8 +725,8 @@ def main():
         
         if not is_best:
             best_epoch_text = f"epoch {best_epoch+1}" if best_epoch is not None else "N/A"
-            print(f"  -> 无改善 (当前最佳: {best_epoch_text}, best_score: {best_val_score:.6f}, "
-                  f"best_mse: {best_val_mse:.6f}, best_mae: {best_val_mae:.6f}, "
+            print(f"  -> 无改善 (当前最佳: {best_epoch_text}, best_mse: {best_val_mse:.6f}, "
+                  f"best_score: {best_val_score:.6f}, best_mae: {best_val_mae:.6f}, "
                   f"连续 {no_improve_epochs} 个epoch无改善)")
         
         # 早停检查：连续10个epoch无改善
@@ -746,6 +771,7 @@ def main():
     print(f"  num_residual_layers: {checkpoint_config.get('num_residual_layers')}")
     print(f"  n_layers: {checkpoint_config.get('n_layers')}")
     print(f"  n_heads: {checkpoint_config.get('n_heads')}")
+    print(f"  temporal_backbone: {checkpoint_config.get('temporal_backbone', 'causal_transformer')}")
     
     # 确保config包含必要的字段
     checkpoint_config['n_channels'] = dls.vars  # 确保通道数正确
@@ -809,8 +835,8 @@ def main():
     
     print('=' * 80)
     print(f'微调完成！')
-    print(f'最佳验证分数 (MSE+MAE): {best_val_score:.6f}')
-    print(f'对应验证 MSE: {best_val_mse:.6f}, MAE: {best_val_mae:.6f}')
+    print(f'最佳验证 MSE: {best_val_mse:.6f}')
+    print(f'对应验证 MAE: {best_val_mae:.6f}, Score(MSE+MAE): {best_val_score:.6f}')
     print(f'测试 MSE: {mse:.6f}, MAE: {mae:.6f}')
     print(f'模型保存至: {save_dir / model_name}.pth')
 

@@ -35,13 +35,12 @@ class ResidualMLPBlock(nn.Module):
 
 
 def _apply_decoder_lowpass(x, enabled=False):
-    """Apply a fixed 7-tap binomial low-pass filter on decoder patch output."""
-    if not enabled or x.shape[-1] < 7:
+    """Apply a fixed [1, 2, 1] / 4 low-pass filter on decoder patch output."""
+    if not enabled or x.shape[-1] < 3:
         return x
     channels = x.shape[1]
-    weight = x.new_tensor([1 / 64, 6 / 64, 15 / 64, 20 / 64, 15 / 64, 6 / 64, 1 / 64])
-    weight = weight.view(1, 1, 7).repeat(channels, 1, 1)
-    x_pad = F.pad(x, (3, 3), mode='replicate')
+    weight = x.new_tensor([0.25, 0.5, 0.25]).view(1, 1, 3).repeat(channels, 1, 1)
+    x_pad = F.pad(x, (1, 1), mode='replicate')
     return F.conv1d(x_pad, weight, groups=channels)
 
 

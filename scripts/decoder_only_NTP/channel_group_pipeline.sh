@@ -78,6 +78,13 @@ N_LAYERS="${N_LAYERS:-3}"
 N_HEADS="${N_HEADS:-4}"
 D_FF="${D_FF:-256}"
 DROPOUT="${DROPOUT:-0.1}"
+TEMPORAL_BACKBONE="${TEMPORAL_BACKBONE:-causal_transformer}"
+CHANNEL_MIXER_HEADS="${CHANNEL_MIXER_HEADS:-}"
+TIMEFILTER_TOPK="${TIMEFILTER_TOPK:-8}"
+TIMEFILTER_TEMPERATURE="${TIMEFILTER_TEMPERATURE:-1.0}"
+TIMEFILTER_ATTN_HEADS="${TIMEFILTER_ATTN_HEADS:-}"
+CHANNEL_SUMMARY_WINDOW="${CHANNEL_SUMMARY_WINDOW:-4}"
+CHANNEL_SUMMARY_GATE_INIT="${CHANNEL_SUMMARY_GATE_INIT:--4.0}"
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-100}"
 PRETRAIN_BATCH_SIZE="${PRETRAIN_BATCH_SIZE:-64}"
 PRETRAIN_LR="${PRETRAIN_LR:-3e-4}"
@@ -237,6 +244,19 @@ fi
 if [ "${DECODER_LOWPASS}" = "1" ]; then
     BACKBONE_SUFFIX="${BACKBONE_SUFFIX}_dlp"
 fi
+TEMPORAL_SUFFIX=""
+if [ "${TEMPORAL_BACKBONE}" = "timefilter_lite" ]; then
+    TEMPORAL_SUFFIX="_timefilterlitek${TIMEFILTER_TOPK}"
+elif [ "${TEMPORAL_BACKBONE}" = "relative_transformer" ]; then
+    TEMPORAL_SUFFIX="_relpos"
+elif [ "${TEMPORAL_BACKBONE}" = "timefilter_attn" ]; then
+    _TF_ATTN_HEADS="${TIMEFILTER_ATTN_HEADS:-${N_HEADS}}"
+    TEMPORAL_SUFFIX="_timefilterattnh${_TF_ATTN_HEADS}k${TIMEFILTER_TOPK}"
+elif [ "${TEMPORAL_BACKBONE}" = "channel_summary_adapter" ]; then
+    TEMPORAL_SUFFIX="_chsummaryw${CHANNEL_SUMMARY_WINDOW}"
+elif [ "${TEMPORAL_BACKBONE}" != "causal_transformer" ] && [ "${TEMPORAL_BACKBONE}" != "transformer" ] && [ "${TEMPORAL_BACKBONE}" != "patchtst" ]; then
+    TEMPORAL_SUFFIX="_${TEMPORAL_BACKBONE}"
+fi
 NMPP_SUFFIX=""
 [ "${USE_RAW_INPUT}" -eq 1 ] && NMPP_SUFFIX="_nmpp"
 # SOFT_NEIGHBOR_SUFFIX 已在前面早一点定义（PROGRESS_LOG 之前）
@@ -291,7 +311,7 @@ PY
     fi
     MODEL_ID=$((BASE_MODEL_ID + GROUP_ID))
     CB_CKPT="${CB_SAVE_PATH}/${DSET}/codebook_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}${PERCH_SUFFIX}${RVQ_SUFFIX}${BACKBONE_SUFFIX}_model${MODEL_ID}${CH_SUFFIX}.pth"
-    PRETRAIN_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${BACKBONE_SUFFIX}${NMPP_SUFFIX}${SOFT_NEIGHBOR_SUFFIX}${CH_SUFFIX}"
+    PRETRAIN_NAME="patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}_model${MODEL_ID}${PERCH_SUFFIX}${RVQ_SUFFIX}${BACKBONE_SUFFIX}${TEMPORAL_SUFFIX}${NMPP_SUFFIX}${SOFT_NEIGHBOR_SUFFIX}${CH_SUFFIX}"
     PRETRAIN_CKPT="${PRETRAIN_SAVE_PATH}/${DSET}/${PRETRAIN_NAME}.pth"
 }
 
@@ -398,6 +418,12 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         --patch_size '${PATCH_SIZE}' --embedding_dim '${EMBEDDING_DIM}' \
         --compression_factor '${COMPRESSION_FACTOR}' --codebook_size '${CODEBOOK_SIZE}' \
         --n_layers '${N_LAYERS}' --n_heads '${N_HEADS}' --d_ff '${D_FF}' --dropout '${DROPOUT}' \
+        --temporal_backbone '${TEMPORAL_BACKBONE}' \
+        ${CHANNEL_MIXER_HEADS:+--channel_mixer_heads '${CHANNEL_MIXER_HEADS}'} \
+        --timefilter_topk '${TIMEFILTER_TOPK}' --timefilter_temperature '${TIMEFILTER_TEMPERATURE}' \
+        ${TIMEFILTER_ATTN_HEADS:+--timefilter_attn_heads '${TIMEFILTER_ATTN_HEADS}'} \
+        --channel_summary_window '${CHANNEL_SUMMARY_WINDOW}' \
+        --channel_summary_gate_init '${CHANNEL_SUMMARY_GATE_INIT}' \
         --num_hiddens '${NUM_HIDDENS}' --num_residual_layers '${NUM_RESIDUAL_LAYERS}' \
         --num_residual_hiddens '${NUM_RESIDUAL_HIDDENS}' \
         --vqvae_backbone '${VQVAE_BACKBONE}' --vqvae_tcn_kernel_size '${VQVAE_TCN_KERNEL_SIZE}' \
@@ -438,7 +464,7 @@ for TP_IDX in "${!TARGET_POINTS_LIST[@]}"; do
     for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         set_group_vars "${GROUP_ID}"
         FT_LOG="${LOG_DIR}/ft_${GROUP_TAG}_tp${TARGET_POINTS}${SOFT_NEIGHBOR_SUFFIX}.log"
-        FT_NAME="patch_vqvae_finetune_cw${FINETUNE_CONTEXT_POINTS}_tw${TARGET_POINTS}_model${MODEL_ID}${SOFT_NEIGHBOR_SUFFIX}${CH_SUFFIX}"
+        FT_NAME="patch_vqvae_finetune_cw${FINETUNE_CONTEXT_POINTS}_tw${TARGET_POINTS}_model${MODEL_ID}${TEMPORAL_SUFFIX}${SOFT_NEIGHBOR_SUFFIX}${CH_SUFFIX}"
         FT_CKPT="${FINETUNE_SAVE_PATH}/${DSET}/${FT_NAME}.pth"
         if [ ! -f "${PRETRAIN_CKPT}" ]; then
             echo "[$(date +%H:%M:%S)] FT SKIP ${GROUP_TAG} tp=${TARGET_POINTS} (missing pretrain)" | tee -a "${PROGRESS_LOG}"
