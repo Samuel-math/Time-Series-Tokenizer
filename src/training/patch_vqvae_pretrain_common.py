@@ -102,7 +102,12 @@ def build_arg_parser():
     p.add_argument('--vqvae_chunk_size', type=int, default=2,
                    help='chunk_mlp backbone 的 patch 分块大小（需整除 patch_size）')
     p.add_argument('--decoder_lowpass', type=int, default=0,
-                   help='1=在 VQVAE decoder 输出末尾应用固定 [1,4,6,4,1]/16 低通滤波（默认关闭）')
+                   help='1=在 VQVAE decoder 输出末尾应用低通滤波（核类型由 --decoder_lowpass_kernel 决定；默认关闭）')
+    p.add_argument('--decoder_lowpass_kernel', type=str, default='binomial3',
+                   choices=['binomial3', 'mean3', 'mean5', 'mean7', 'mean9',
+                            'binomial5', 'binomial7', 'triangular5'],
+                   help='--decoder_lowpass=1 时使用的低通核：binomial3=[1,2,1]/4 (默认，向后兼容)，'
+                        'mean*=均匀均值核 (越大越平滑)，binomial5/7=更宽的二项式核，triangular5=[1,2,3,2,1]/9')
 
     # VQVAE checkpoint
     p.add_argument('--vqvae_checkpoint', type=str, default=None,
@@ -823,6 +828,11 @@ def run_pretrain():
         backbone_sfx = f'_{backbone}c{int(getattr(args, "vqvae_chunk_size", 2))}'
     if bool(getattr(args, 'decoder_lowpass', 0)):
         backbone_sfx = f'{backbone_sfx}_dlp'
+        lp_kernel = str(getattr(args, 'decoder_lowpass_kernel', 'binomial3'))
+        # default kernel keeps backward-compatible filenames; other kernels
+        # add a short suffix so different settings save to distinct ckpts.
+        if lp_kernel != 'binomial3':
+            backbone_sfx = f'{backbone_sfx}_{lp_kernel}'
     temporal_backbone = str(getattr(args, 'temporal_backbone', 'causal_transformer')).lower()
     if temporal_backbone in ('causal_transformer', 'transformer', 'patchtst'):
         temporal_sfx = ''
@@ -889,7 +899,7 @@ def run_pretrain():
                 'codebook_size', 'num_hiddens', 'num_residual_layers',
                 'num_residual_hiddens', 'commitment_cost',
                 'vqvae_backbone', 'vqvae_tcn_kernel_size', 'vqvae_chunk_size',
-                'decoder_lowpass',
+                'decoder_lowpass', 'decoder_lowpass_kernel',
                 'codebook_ema', 'ema_decay', 'ema_eps',
             ]
             overridden = []

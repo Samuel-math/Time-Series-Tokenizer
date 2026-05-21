@@ -34,13 +34,46 @@ class ResidualMLPBlock(nn.Module):
         return x + self._block(x)
 
 
-def _apply_decoder_lowpass(x, enabled=False):
-    """Apply a fixed [1, 2, 1] / 4 low-pass filter on decoder patch output."""
-    if not enabled or x.shape[-1] < 3:
+DECODER_LOWPASS_KERNELS = {
+    # Default: backward-compatible with previous fixed [1, 2, 1] / 4 filter.
+    'binomial3': [1 / 4, 2 / 4, 1 / 4],
+    # Uniform mean kernels (flatter → smoother).
+    'mean3': [1 / 3, 1 / 3, 1 / 3],
+    'mean5': [1 / 5] * 5,
+    'mean7': [1 / 7] * 7,
+    'mean9': [1 / 9] * 9,
+    # Wider binomial kernels (smooth but keep central weight emphasis).
+    'binomial5': [1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16],
+    'binomial7': [1 / 64, 6 / 64, 15 / 64, 20 / 64, 15 / 64, 6 / 64, 1 / 64],
+    # Triangular / linear-ramp kernel.
+    'triangular5': [1 / 9, 2 / 9, 3 / 9, 2 / 9, 1 / 9],
+}
+
+
+def _apply_decoder_lowpass(x, enabled=False, kernel='binomial3'):
+    """Apply a fixed low-pass filter on decoder patch output.
+
+    Args:
+        x: tensor shaped ``[B, C, T]``.
+        enabled: when False, returns ``x`` unchanged.
+        kernel: one of ``DECODER_LOWPASS_KERNELS``; default ``binomial3`` is
+            the previous ``[1, 2, 1] / 4`` filter (kept for backward compat).
+    """
+    if not enabled:
+        return x
+    if kernel not in DECODER_LOWPASS_KERNELS:
+        raise ValueError(
+            f"Unsupported decoder_lowpass_kernel={kernel!r}; supported: "
+            f"{sorted(DECODER_LOWPASS_KERNELS)}"
+        )
+    coeffs = DECODER_LOWPASS_KERNELS[kernel]
+    ksize = len(coeffs)
+    if x.shape[-1] < ksize:
         return x
     channels = x.shape[1]
-    weight = x.new_tensor([0.25, 0.5, 0.25]).view(1, 1, 3).repeat(channels, 1, 1)
-    x_pad = F.pad(x, (1, 1), mode='replicate')
+    weight = x.new_tensor(coeffs).view(1, 1, ksize).repeat(channels, 1, 1)
+    pad = ksize // 2
+    x_pad = F.pad(x, (pad, pad), mode='replicate')
     return F.conv1d(x_pad, weight, groups=channels)
 
 
@@ -162,7 +195,11 @@ class Decoder(nn.Module):
         x = self._residual_mlp(x)
         x = self._output_proj(x)
         x = x.view(x.shape[0], self.out_channels, self.patch_size)
-        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
+        x = _apply_decoder_lowpass(
+            x,
+            enabled=getattr(self, 'decoder_lowpass', False),
+            kernel=getattr(self, 'decoder_lowpass_kernel', 'binomial3'),
+        )
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -251,7 +288,11 @@ class LinearDecoder(nn.Module):
         x = inputs.flatten(start_dim=1)
         x = self.proj(x)
         x = x.view(x.shape[0], self.out_channels, self.patch_size)
-        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
+        x = _apply_decoder_lowpass(
+            x,
+            enabled=getattr(self, 'decoder_lowpass', False),
+            kernel=getattr(self, 'decoder_lowpass_kernel', 'binomial3'),
+        )
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -360,7 +401,11 @@ class ConvLinearDecoder(nn.Module):
         x = self.input_proj(inputs)
         x = F.interpolate(x, size=self.patch_size, mode='linear', align_corners=False)
         x = self.output_proj(x)
-        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
+        x = _apply_decoder_lowpass(
+            x,
+            enabled=getattr(self, 'decoder_lowpass', False),
+            kernel=getattr(self, 'decoder_lowpass_kernel', 'binomial3'),
+        )
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -513,7 +558,11 @@ class TCNDecoder(nn.Module):
         x = F.interpolate(x, size=self.patch_size, mode='linear', align_corners=False)
         x = self.residual_tcn(x)
         x = self.output_proj(x)
-        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
+        x = _apply_decoder_lowpass(
+            x,
+            enabled=getattr(self, 'decoder_lowpass', False),
+            kernel=getattr(self, 'decoder_lowpass_kernel', 'binomial3'),
+        )
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -654,7 +703,11 @@ class ChunkMLPDecoder(nn.Module):
         x = self.chunk_proj(x).view(bsz, self.num_chunks, -1)
         x = self.local_out(x).view(bsz, self.num_chunks, self.out_channels, self.chunk_size)
         x = x.permute(0, 2, 1, 3).reshape(bsz, self.out_channels, self.patch_size)
-        x = _apply_decoder_lowpass(x, getattr(self, 'decoder_lowpass', False))
+        x = _apply_decoder_lowpass(
+            x,
+            enabled=getattr(self, 'decoder_lowpass', False),
+            kernel=getattr(self, 'decoder_lowpass_kernel', 'binomial3'),
+        )
         if self.out_channels == 1:
             return x.squeeze(1)
         return x
@@ -750,6 +803,9 @@ def build_decoder(config, in_channels=None, out_channels=1):
     try:
         decoder = VQVAE_DECODER_BUILDERS[backbone](config, common)
         decoder.decoder_lowpass = bool(config.get('decoder_lowpass', False))
+        decoder.decoder_lowpass_kernel = str(
+            config.get('decoder_lowpass_kernel', 'binomial3')
+        )
         return decoder
     except KeyError as exc:
         supported = ', '.join(sorted(VQVAE_DECODER_BUILDERS))
@@ -823,6 +879,8 @@ class vqvae(BaseModel):
             'vqvae_backbone': vqvae_config.get('vqvae_backbone', 'mlp'),
             'vqvae_tcn_kernel_size': vqvae_config.get('vqvae_tcn_kernel_size', 5),
             'vqvae_chunk_size': vqvae_config.get('vqvae_chunk_size', 2),
+            'decoder_lowpass': vqvae_config.get('decoder_lowpass', False),
+            'decoder_lowpass_kernel': vqvae_config.get('decoder_lowpass_kernel', 'binomial3'),
         }
         self.encoder = build_encoder(codec_config, in_channels=1)
         self.decoder = build_decoder(codec_config, in_channels=embedding_dim, out_channels=1)

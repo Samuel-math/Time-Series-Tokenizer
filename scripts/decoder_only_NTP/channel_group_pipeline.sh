@@ -55,6 +55,7 @@ VQVAE_BACKBONE="${VQVAE_BACKBONE:-mlp}"
 VQVAE_TCN_KERNEL_SIZE="${VQVAE_TCN_KERNEL_SIZE:-5}"
 VQVAE_CHUNK_SIZE="${VQVAE_CHUNK_SIZE:-2}"
 DECODER_LOWPASS="${DECODER_LOWPASS:-0}"
+DECODER_LOWPASS_KERNEL="${DECODER_LOWPASS_KERNEL:-binomial3}"
 N_RQ_LAYERS="${N_RQ_LAYERS:-2}"
 PER_CHANNEL_CODEBOOK="${PER_CHANNEL_CODEBOOK:-0}"
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
@@ -243,6 +244,12 @@ elif [ "${VQVAE_BACKBONE}" != "mlp" ]; then
 fi
 if [ "${DECODER_LOWPASS}" = "1" ]; then
     BACKBONE_SUFFIX="${BACKBONE_SUFFIX}_dlp"
+    # Default kernel (binomial3) keeps the existing filename for backward
+    # compatibility; non-default kernels add a short suffix so different
+    # smoothing kernels save to distinct ckpts and don't shadow each other.
+    if [ "${DECODER_LOWPASS_KERNEL}" != "binomial3" ]; then
+        BACKBONE_SUFFIX="${BACKBONE_SUFFIX}_${DECODER_LOWPASS_KERNEL}"
+    fi
 fi
 TEMPORAL_SUFFIX=""
 if [ "${TEMPORAL_BACKBONE}" = "timefilter_lite" ]; then
@@ -428,6 +435,7 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         --num_residual_hiddens '${NUM_RESIDUAL_HIDDENS}' \
         --vqvae_backbone '${VQVAE_BACKBONE}' --vqvae_tcn_kernel_size '${VQVAE_TCN_KERNEL_SIZE}' \
         --vqvae_chunk_size '${VQVAE_CHUNK_SIZE}' --decoder_lowpass '${DECODER_LOWPASS}' \
+        --decoder_lowpass_kernel '${DECODER_LOWPASS_KERNEL}' \
         --vqvae_checkpoint '${CB_CKPT}' --freeze_vqvae 1 --load_vq_weights 1 \
         --per_channel_codebook '${PER_CHANNEL_CODEBOOK}' --n_rq_layers '${N_RQ_LAYERS}' \
         --use_raw_input '${USE_RAW_INPUT}' \

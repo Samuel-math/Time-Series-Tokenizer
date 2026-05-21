@@ -1708,6 +1708,7 @@ def get_model_config(args):
         'vqvae_tcn_kernel_size': int(getattr(args, 'vqvae_tcn_kernel_size', 5)),
         'vqvae_chunk_size': int(getattr(args, 'vqvae_chunk_size', 2)),
         'decoder_lowpass': bool(getattr(args, 'decoder_lowpass', 0)),
+        'decoder_lowpass_kernel': str(getattr(args, 'decoder_lowpass_kernel', 'binomial3')),
         # Transformer hidden_dim（可选，默认使用code_dim）
         'transformer_hidden_dim': getattr(args, 'transformer_hidden_dim', None),
         # 每通道独立码本（默认False，与旧行为兼容）
