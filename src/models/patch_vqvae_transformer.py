@@ -444,6 +444,50 @@ class CausalTransformer(nn.Module):
         return x
 
 
+class EncoderTransformer(nn.Module):
+    """Non-causal Transformer encoder backbone for placeholder-based prediction.
+
+    This keeps the same external contract as ``CausalTransformer`` but removes
+    the causal mask, allowing all tokens in the supplied sequence to interact.
+    In pretrain/finetune, future positions are zero placeholders, so no target
+    values are exposed while placeholder states can communicate bidirectionally.
+    """
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1, max_len=512, hidden_dim=None):
+        super().__init__()
+        self.code_dim = code_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else code_dim
+
+        if self.hidden_dim != self.code_dim:
+            self.input_proj = nn.Linear(self.code_dim, self.hidden_dim)
+            self.output_proj = nn.Linear(self.hidden_dim, self.code_dim)
+        else:
+            self.input_proj = None
+            self.output_proj = None
+
+        self.pos_embedding = nn.Embedding(max_len, self.hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+        positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
+        x = self.drop(x + self.pos_embedding(positions))
+        x = self.transformer(x)
+        if self.output_proj is not None:
+            x = self.output_proj(x)
+        return x
+
+
 class RelativePositionBias(nn.Module):
     """T5-style relative position bias for causal attention."""
 
@@ -661,6 +705,118 @@ class TimeFilterLiteBackbone(nn.Module):
         return h_grid.permute(0, 2, 1, 3).reshape(batch_size * n_channels, num_patches, code_dim)
 
 
+class EncoderTimeFilterLiteBackbone(TimeFilterLiteBackbone):
+    """Non-causal Transformer encoder followed by TimeFilter-lite channel filtering."""
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, graph_topk=8, graph_temperature=1.0):
+        super().__init__(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+            graph_topk=graph_topk, graph_temperature=graph_temperature,
+        )
+        self.temporal = EncoderTransformer(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+        )
+
+
+
+def _build_auto_channel_cluster_mask(x_grid, cluster_size):
+    """Build a batch-adaptive channel mask from hidden-state prototypes.
+
+    ``x_grid`` is [B, P, C, D].  We compute one normalized prototype per
+    channel by averaging over batch and patch positions, then keep each
+    channel's most similar prototype neighbors.  The mask is symmetrized so
+    the resulting graph behaves like an automatically inferred cluster prior.
+    """
+    _, _, n_channels, _ = x_grid.shape
+    if n_channels <= 0:
+        return torch.empty(0, 0, dtype=torch.bool, device=x_grid.device)
+
+    k = min(max(int(cluster_size), 1), n_channels)
+    with torch.no_grad():
+        proto = x_grid.detach().mean(dim=(0, 1))  # [C, D]
+        proto = F.normalize(proto, dim=-1)
+        sim = proto @ proto.t()
+        top_idx = torch.topk(sim, k=k, dim=-1).indices
+        mask = torch.zeros(n_channels, n_channels, dtype=torch.bool, device=x_grid.device)
+        row_idx = torch.arange(n_channels, device=x_grid.device).unsqueeze(1).expand_as(top_idx)
+        mask[row_idx, top_idx] = True
+        mask = mask | mask.t()
+        mask.fill_diagonal_(True)
+    return mask
+
+
+class ClusterTimeFilterLiteBackbone(TimeFilterLiteBackbone):
+    """TimeFilter-lite with an automatically inferred channel-cluster constraint.
+
+    It first applies the same causal temporal path as ``TimeFilterLiteBackbone``.
+    The patch-wise channel graph is then restricted by a mask inferred online
+    from current hidden-state channel prototypes.
+    """
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, graph_topk=8, graph_temperature=1.0,
+                 n_channels=None):
+        del n_channels
+        super().__init__(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+            graph_topk=graph_topk, graph_temperature=graph_temperature,
+        )
+        self.register_buffer('channel_cluster_mask', torch.empty(0, 0, dtype=torch.bool), persistent=True)
+
+    def forward(self, x_flat, batch_size, n_channels):
+        h = self.temporal(x_flat)  # [B*C, P, D]
+        bc, num_patches, code_dim = h.shape
+        if bc != batch_size * n_channels:
+            raise ValueError(
+                f"Expected B*C={batch_size * n_channels}, got {bc}; "
+                "check channel count passed to temporal backbone."
+            )
+
+        h_grid = h.reshape(batch_size, n_channels, num_patches, code_dim).permute(0, 2, 1, 3)
+        x = self.graph_norm(h_grid)
+        q = F.normalize(self.q_proj(x), dim=-1)
+        k = F.normalize(self.k_proj(x), dim=-1)
+        v = self.v_proj(x)
+
+        affinity = torch.einsum('btcd,btsd->btcs', q, k) / self.graph_temperature
+        mask = _build_auto_channel_cluster_mask(x, self.graph_topk)
+        affinity = affinity.masked_fill(~mask.view(1, 1, n_channels, n_channels), float('-inf'))
+
+        topk = min(max(self.graph_topk, 1), n_channels)
+        if topk < n_channels:
+            top_values, top_idx = torch.topk(affinity, k=topk, dim=-1)
+            masked = affinity.new_full(affinity.shape, float('-inf'))
+            affinity = masked.scatter(dim=-1, index=top_idx, src=top_values)
+
+        weights = F.softmax(affinity, dim=-1)
+        filtered = torch.einsum('btcs,btsd->btcd', weights, v)
+        h_grid = h_grid + self.drop(self.out_proj(filtered))
+        h_grid = h_grid + self.ffn(self.ffn_norm(h_grid))
+        return h_grid.permute(0, 2, 1, 3).reshape(batch_size * n_channels, num_patches, code_dim)
+
+
+class EncoderClusterTimeFilterLiteBackbone(ClusterTimeFilterLiteBackbone):
+    """Non-causal Transformer encoder with auto-cluster-constrained TimeFilter filtering."""
+
+    def __init__(self, code_dim, n_heads, n_layers, d_ff, dropout=0.1,
+                 max_len=512, hidden_dim=None, graph_topk=8, graph_temperature=1.0,
+                 n_channels=None):
+        super().__init__(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+            graph_topk=graph_topk, graph_temperature=graph_temperature,
+            n_channels=n_channels,
+        )
+        self.temporal = EncoderTransformer(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout,
+            max_len=max_len, hidden_dim=hidden_dim,
+        )
+
+
 class TimeFilterAttentionBackbone(nn.Module):
     """TimeFilter-lite variant with multi-head channel attention.
 
@@ -801,6 +957,21 @@ def build_temporal_backbone(config, code_dim):
 
     if name in ('causal_transformer', 'transformer', 'patchtst'):
         return CausalTransformer(code_dim, n_heads, n_layers, d_ff, dropout, hidden_dim=hidden_dim)
+    if name in ('encoder_transformer', 'transformer_encoder', 'noncausal_transformer'):
+        return EncoderTransformer(code_dim, n_heads, n_layers, d_ff, dropout, hidden_dim=hidden_dim)
+    if name in ('encoder_timefilter_lite', 'encoder_timefilter'):
+        return EncoderTimeFilterLiteBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            graph_topk=config.get('timefilter_topk', 8),
+            graph_temperature=config.get('timefilter_temperature', 1.0),
+        )
+    if name in ('encoder_cluster_timefilter_lite', 'encoder_cluster_timefilter'):
+        return EncoderClusterTimeFilterLiteBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            graph_topk=config.get('timefilter_topk', 8),
+            graph_temperature=config.get('timefilter_temperature', 1.0),
+            n_channels=config.get('n_channels', None),
+        )
     if name == 'relative_transformer':
         return RelativePositionTransformerBackbone(
             code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim
@@ -816,6 +987,13 @@ def build_temporal_backbone(config, code_dim):
             graph_topk=config.get('timefilter_topk', 8),
             graph_temperature=config.get('timefilter_temperature', 1.0),
         )
+    if name == 'cluster_timefilter_lite':
+        return ClusterTimeFilterLiteBackbone(
+            code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
+            graph_topk=config.get('timefilter_topk', 8),
+            graph_temperature=config.get('timefilter_temperature', 1.0),
+            n_channels=config.get('n_channels', None),
+        )
     if name == 'timefilter_attn':
         return TimeFilterAttentionBackbone(
             code_dim, n_heads, n_layers, d_ff, dropout=dropout, hidden_dim=hidden_dim,
@@ -829,8 +1007,10 @@ def build_temporal_backbone(config, code_dim):
             summary_window=config.get('channel_summary_window', 4),
             gate_init=config.get('channel_summary_gate_init', -4.0),
         )
-    supported = ('causal_transformer, relative_transformer, itransformer_lite, '
-                 'timefilter_lite, timefilter_attn, channel_summary_adapter')
+    supported = ('causal_transformer, encoder_transformer, encoder_timefilter_lite, '
+                 'encoder_cluster_timefilter_lite, relative_transformer, itransformer_lite, '
+                 'timefilter_lite, cluster_timefilter_lite, timefilter_attn, '
+                 'channel_summary_adapter')
     raise ValueError(f"Unsupported temporal_backbone={name!r}; supported: {supported}")
 
 

@@ -11,16 +11,16 @@
 # ETTh2 has 7 variables. With MAX_CHANNELS_PER_MODEL=7 this is equivalent to
 # one group; set MAX_CHANNELS_PER_MODEL=3 or 4 to test grouped training.
 # =====================================================================
-
+export CUDA_VISIBLE_DEVICES=1
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Dataset / grouping
-export DSET=ettm2
-export TOTAL_CHANNELS=7
-export MAX_CHANNELS_PER_MODEL=7
+export DSET=traffic
+export TOTAL_CHANNELS=862
+export MAX_CHANNELS_PER_MODEL=862
 export BASE_MODEL_ID="${BASE_MODEL_ID:-1}"
 export FORCE_RETRAIN_ALL=0
 export FORCE_RETRAIN_PRETRAIN=0
@@ -44,10 +44,10 @@ export VQVAE_TCN_KERNEL_SIZE="${VQVAE_TCN_KERNEL_SIZE:-5}"
 export VQVAE_CHUNK_SIZE="${VQVAE_CHUNK_SIZE:-2}"
 export PER_CHANNEL_CODEBOOK=0
 export N_RQ_LAYERS=2
-export RQ_LAYER_WEIGHTS="1.0 1.0"
+export RQ_LAYER_WEIGHTS="1.0 0.5"
 
 # Codebook training params
-export CB_CONTEXT_POINTS=512
+export CB_CONTEXT_POINTS=336
 export CB_BATCH_SIZE=64
 export CB_EPOCHS=50
 export CB_LR=3e-4
@@ -59,30 +59,36 @@ export ORTH_START_EPOCH="${ORTH_START_EPOCH:-0}"
 export ORTH_WARMUP_EPOCHS="${ORTH_WARMUP_EPOCHS:-2}"
 
 # Match etth2.sh NTP pretrain params
-export PRETRAIN_CONTEXT_POINTS=336
+export PRETRAIN_CONTEXT_POINTS=128
 export PROGRESSIVE_STEP_SIZE=6
 export PRETRAIN_PRED_LEN=6
 export N_LAYERS=3
 export N_HEADS=4
-export D_FF=336
+export D_FF=512
 export DROPOUT=0.1
 export PRETRAIN_EPOCHS=100
-export PRETRAIN_BATCH_SIZE=64
-export PRETRAIN_LR=3e-4
+export PRETRAIN_BATCH_SIZE=16
+export PRETRAIN_LR=1e-3
+export SOFT_NEIGHBOR_K=20
+export SOFT_NEIGHBOR_ALPHA=0.3
+export SOFT_NEIGHBOR_TAU=0.5
+export TEMPORAL_BACKBONE=timefilter_lite
+export TIMEFILTER_TOPK=8
+export TIMEFILTER_TEMPERATURE=1.0
 
 # Match etth2.sh finetune params
 export FINETUNE_CONTEXT_POINTS=96
-export FINETUNE_EPOCHS=50
-export FINETUNE_BATCH_SIZE=128
-export FINETUNE_LR=2e-5
-export TARGET_POINTS_LIST="${TARGET_POINTS_LIST:-192}"
+export FINETUNE_EPOCHS=30
+export FINETUNE_BATCH_SIZE=10
+export FINETUNE_LR=6e-4
+export TARGET_POINTS_LIST="${TARGET_POINTS_LIST:-720}"
 export USE_GUMBEL_SOFTMAX=1
-export GUMBEL_TEMPERATURE=0.9
+export GUMBEL_TEMPERATURE=0.8
 export GUMBEL_HARD=0
 export TRAIN_LOSS=huber
-export HUBER_DELTA=0.9
-export FORECAST_STEP_SIZE_LIST="${FORECAST_STEP_SIZE_LIST:-20}"
-export FORECAST_PRED_LEN_LIST="${FORECAST_PRED_LEN_LIST:-24}"
+export HUBER_DELTA=3.0
+export FORECAST_STEP_SIZE_LIST="${FORECAST_STEP_SIZE_LIST:-24}"
+export FORECAST_PRED_LEN_LIST="${FORECAST_PRED_LEN_LIST:-28}"
 export UNFREEZE_DECODER=0
 export DECODER_LR_RATIO=1
 export DECODER_WD_RATIO=1
@@ -95,7 +101,7 @@ export WEIGHT_DECAY=1e-4
 export STREAM_LOGS="${STREAM_LOGS:-1}"
 
 echo "================================================="
-echo "ETTm2 channel-group run"
+echo "Traffic channel-group run"
 echo "================================================="
 echo "Repo root              : ${REPO_ROOT}"
 echo "Max channels per model : ${MAX_CHANNELS_PER_MODEL}"

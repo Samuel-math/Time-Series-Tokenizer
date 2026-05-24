@@ -1,0 +1,109 @@
+Input Perturbation Robustness Test 加噪原理说明
+
+1. 测试目标
+
+当前 robustness_test/input_perturbation_robustness.py 做的是 input perturbation robustness test：
+只对历史输入窗口 batch_x 加噪，不扰动未来真实标签 batch_y。
+模型用带噪输入做预测，然后和 clean target 计算 MSE / MAE。
+
+整体流程：
+
+原始输入 batch_x
+  -> 可选在 RevIN 前加噪 before_revin
+  -> 可选 RevIN norm
+  -> 可选在 RevIN 后加噪 after_revin
+  -> 模型预测 pred
+  -> 可选 RevIN denorm
+  -> pred 和原始 batch_y 计算 MSE / MAE
+
+
+2. 加噪公式
+
+对每个 batch，生成高斯噪声：
+
+epsilon ~ N(0, 1)
+
+然后根据 noise_scale 选择不同噪声尺度。
+
+2.1 noise_scale=unit
+
+x_noisy = x + sigma * epsilon
+
+含义：
+直接加标准高斯白噪声，sigma 控制噪声强度。
+如果 noise_position=after_revin，那么噪声加在 RevIN 归一化后的空间里。
+
+2.2 noise_scale=train_std
+
+x_noisy = x + sigma * std_train * epsilon
+
+其中 std_train 是从训练集输入窗口上统计得到的 channel-wise 标准差，shape 为 [1, 1, C]。
+含义：
+不同变量按照自身训练集尺度加噪，避免所有通道使用完全相同绝对幅度。
+
+
+3. 加噪位置 noise_position
+
+3.1 after_revin，默认设置
+
+流程：
+
+batch_x -> RevIN norm -> 加噪 -> model
+
+含义：
+噪声加在归一化后的输入空间。
+如果 noise_scale=unit，则等价于在标准化空间加入 sigma * N(0,1)。
+
+3.2 before_revin
+
+流程：
+
+batch_x -> 加噪 -> RevIN norm -> model
+
+含义：
+噪声先加在原始数据尺度上，然后再经过 RevIN 归一化。
+
+
+4. 随机性与可复现性
+
+每个 batch 的噪声由 seed 和 batch_idx 共同决定：
+
+manual_seed = seed * 1000003 + batch_idx
+
+因此在相同 sigma、seed、batch_idx 下，生成的噪声是固定的，实验结果可复现。
+
+
+5. 指标计算
+
+对每个 sigma 和每个 seed，完整跑一遍 test set，得到：
+
+MSE = mean((pred - target)^2)
+MAE = mean(abs(pred - target))
+
+其中 target 始终是未加噪的 clean batch_y。
+
+如果设置多个 seed，会对不同 seed 的结果做聚合，输出均值和标准差。
+
+
+6. 输出文件
+
+脚本会保存：
+
+seed_metrics.csv
+  每个 horizon / sigma / seed 的 MSE、MAE。
+
+aggregate_metrics.csv
+  每个 horizon / sigma 上跨 seed 聚合后的 MSE mean/std、MAE mean/std，以及 relative_mse_increase_pct。
+
+aggregate_metrics_wide.tsv
+  宽表格式，便于直接复制到表格中，例如：
+
+horizon	0		0.05		0.1		0.15		0.2		0.3	
+	MSE	MAE	MSE	MAE	MSE	MAE	MSE	MAE	MSE	MAE	MSE	MAE
+96	...
+
+
+7. 简要总结
+
+当前鲁棒性测试衡量的是：模型预测结果对历史输入高斯扰动的敏感程度。
+它不改变未来真实标签，因此指标上升主要反映模型在输入噪声下的预测退化。

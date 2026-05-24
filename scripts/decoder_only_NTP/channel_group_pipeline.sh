@@ -55,7 +55,6 @@ VQVAE_BACKBONE="${VQVAE_BACKBONE:-mlp}"
 VQVAE_TCN_KERNEL_SIZE="${VQVAE_TCN_KERNEL_SIZE:-5}"
 VQVAE_CHUNK_SIZE="${VQVAE_CHUNK_SIZE:-2}"
 DECODER_LOWPASS="${DECODER_LOWPASS:-0}"
-DECODER_LOWPASS_KERNEL="${DECODER_LOWPASS_KERNEL:-binomial3}"
 N_RQ_LAYERS="${N_RQ_LAYERS:-2}"
 PER_CHANNEL_CODEBOOK="${PER_CHANNEL_CODEBOOK:-0}"
 CODE_DIM=$((EMBEDDING_DIM * PATCH_SIZE / COMPRESSION_FACTOR))
@@ -244,18 +243,18 @@ elif [ "${VQVAE_BACKBONE}" != "mlp" ]; then
 fi
 if [ "${DECODER_LOWPASS}" = "1" ]; then
     BACKBONE_SUFFIX="${BACKBONE_SUFFIX}_dlp"
-    # Default kernel (binomial3) keeps the existing filename for backward
-    # compatibility; non-default kernels add a short suffix so different
-    # smoothing kernels save to distinct ckpts and don't shadow each other.
-    if [ "${DECODER_LOWPASS_KERNEL}" != "binomial3" ]; then
-        BACKBONE_SUFFIX="${BACKBONE_SUFFIX}_${DECODER_LOWPASS_KERNEL}"
-    fi
 fi
 TEMPORAL_SUFFIX=""
 if [ "${TEMPORAL_BACKBONE}" = "timefilter_lite" ]; then
     TEMPORAL_SUFFIX="_timefilterlitek${TIMEFILTER_TOPK}"
-elif [ "${TEMPORAL_BACKBONE}" = "relative_transformer" ]; then
-    TEMPORAL_SUFFIX="_relpos"
+elif [ "${TEMPORAL_BACKBONE}" = "encoder_transformer" ] || [ "${TEMPORAL_BACKBONE}" = "transformer_encoder" ] || [ "${TEMPORAL_BACKBONE}" = "noncausal_transformer" ]; then
+    TEMPORAL_SUFFIX="_encoder"
+elif [ "${TEMPORAL_BACKBONE}" = "encoder_timefilter_lite" ] || [ "${TEMPORAL_BACKBONE}" = "encoder_timefilter" ]; then
+    TEMPORAL_SUFFIX="_encodertfk${TIMEFILTER_TOPK}"
+elif [ "${TEMPORAL_BACKBONE}" = "encoder_cluster_timefilter_lite" ] || [ "${TEMPORAL_BACKBONE}" = "encoder_cluster_timefilter" ]; then
+    TEMPORAL_SUFFIX="_encoderclustertfk${TIMEFILTER_TOPK}"
+elif [ "${TEMPORAL_BACKBONE}" = "cluster_timefilter_lite" ]; then
+    TEMPORAL_SUFFIX="_clustertfk${TIMEFILTER_TOPK}"
 elif [ "${TEMPORAL_BACKBONE}" = "timefilter_attn" ]; then
     _TF_ATTN_HEADS="${TIMEFILTER_ATTN_HEADS:-${N_HEADS}}"
     TEMPORAL_SUFFIX="_timefilterattnh${_TF_ATTN_HEADS}k${TIMEFILTER_TOPK}"
@@ -284,6 +283,37 @@ run_and_capture() {
 
 cleanup_parse_log() {
     [ "${STREAM_LOGS}" = "1" ] && rm -f "${PARSE_LOG}"
+}
+
+resolve_pretrain_ckpt_after_run() {
+    # Single source of truth fallback: Python prints the actual saved path as "模型: ...".
+    # If shell-side naming ever lags behind Python naming, adopt the real path instead
+    # of reporting a false PRE FAILED with rc=0.
+    if [ -f "${PRETRAIN_CKPT}" ]; then
+        return 0
+    fi
+
+    local actual=""
+    if [ -n "${PARSE_LOG:-}" ] && [ -f "${PARSE_LOG}" ]; then
+        actual=$(grep -E "模型:[[:space:]]*.*\.pth" "${PARSE_LOG}" | tail -1 | sed -E 's/^.*模型:[[:space:]]*//')
+        if [ -n "${actual}" ] && [ -f "${actual}" ]; then
+            echo "[$(date +%H:%M:%S)] PRE checkpoint path resolved from log: ${actual}" | tee -a "${PROGRESS_LOG}"
+            PRETRAIN_CKPT="${actual}"
+            PRETRAIN_NAME="$(basename "${actual}" .pth)"
+            return 0
+        fi
+    fi
+
+    local found=""
+    found=$(ls -t "${PRETRAIN_SAVE_PATH}/${DSET}/patch_vqvae_ps${PATCH_SIZE}_cb${CODEBOOK_SIZE}_cd${CODE_DIM}_l${N_LAYERS}_in${PRETRAIN_CONTEXT_POINTS}_step${PROGRESSIVE_STEP_SIZE}"*"_model${MODEL_ID}"*"${CH_SUFFIX}.pth" 2>/dev/null | head -1)
+    if [ -n "${found}" ] && [ -f "${found}" ]; then
+        echo "[$(date +%H:%M:%S)] PRE checkpoint path resolved by glob: ${found}" | tee -a "${PROGRESS_LOG}"
+        PRETRAIN_CKPT="${found}"
+        PRETRAIN_NAME="$(basename "${found}" .pth)"
+        return 0
+    fi
+
+    return 1
 }
 
 set_group_vars() {
@@ -435,7 +465,6 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         --num_residual_hiddens '${NUM_RESIDUAL_HIDDENS}' \
         --vqvae_backbone '${VQVAE_BACKBONE}' --vqvae_tcn_kernel_size '${VQVAE_TCN_KERNEL_SIZE}' \
         --vqvae_chunk_size '${VQVAE_CHUNK_SIZE}' --decoder_lowpass '${DECODER_LOWPASS}' \
-        --decoder_lowpass_kernel '${DECODER_LOWPASS_KERNEL}' \
         --vqvae_checkpoint '${CB_CKPT}' --freeze_vqvae 1 --load_vq_weights 1 \
         --per_channel_codebook '${PER_CHANNEL_CODEBOOK}' --n_rq_layers '${N_RQ_LAYERS}' \
         --use_raw_input '${USE_RAW_INPUT}' \
@@ -447,8 +476,12 @@ for ((GROUP_ID=0; GROUP_ID<NUM_GROUPS; GROUP_ID++)); do
         ${CHANNEL_ARGS} \
         --save_path '${PRETRAIN_SAVE_PATH}' \
         --model_id '${MODEL_ID}'"
+    if [ ${RC} -eq 0 ] && [ ! -f "${PRETRAIN_CKPT}" ]; then
+        resolve_pretrain_ckpt_after_run
+    fi
     if [ ${RC} -ne 0 ] || [ ! -f "${PRETRAIN_CKPT}" ]; then
         echo "[$(date +%H:%M:%S)] PRE FAILED ${GROUP_TAG} rc=${RC}" | tee -a "${PROGRESS_LOG}"
+        echo "    Expected checkpoint: ${PRETRAIN_CKPT}" | tee -a "${PROGRESS_LOG}"
         tail -20 "${PARSE_LOG}" | sed 's/^/    /' | tee -a "${PROGRESS_LOG}"
         cleanup_parse_log
         exit 1

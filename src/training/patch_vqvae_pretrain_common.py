@@ -65,13 +65,18 @@ def build_arg_parser():
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--transformer_hidden_dim', type=int, default=None)
     p.add_argument('--temporal_backbone', type=str, default='causal_transformer',
-                   choices=['causal_transformer', 'relative_transformer', 'itransformer_lite',
-                            'timefilter_lite', 'timefilter_attn',
+                   choices=['causal_transformer', 'encoder_transformer', 'encoder_timefilter_lite',
+                            'encoder_cluster_timefilter_lite', 'relative_transformer', 'itransformer_lite',
+                            'timefilter_lite', 'cluster_timefilter_lite', 'timefilter_attn',
                             'channel_summary_adapter'],
                    help='NTP temporal backbone: causal_transformer=旧CI Transformer, '
+                        'encoder_transformer=非因果Transformer Encoder, '
+                        'encoder_timefilter_lite=非因果Encoder+timefilter_lite, '
+                        'encoder_cluster_timefilter_lite=非因果Encoder+cluster_timefilter_lite, '
                         'relative_transformer=相对位置偏置的因果Transformer, '
                         'itransformer_lite=时间因果建模+通道attention, '
                         'timefilter_lite=时间因果建模+patch-specific通道图过滤, '
+                        'cluster_timefilter_lite=在channel cluster内做timefilter_lite, '
                         'timefilter_attn=多头channel attention版timefilter_lite, '
                         'channel_summary_adapter=滞后跨通道均值条件分支')
     p.add_argument('--channel_mixer_heads', type=int, default=None,
@@ -836,10 +841,18 @@ def run_pretrain():
     temporal_backbone = str(getattr(args, 'temporal_backbone', 'causal_transformer')).lower()
     if temporal_backbone in ('causal_transformer', 'transformer', 'patchtst'):
         temporal_sfx = ''
+    elif temporal_backbone in ('encoder_transformer', 'transformer_encoder', 'noncausal_transformer'):
+        temporal_sfx = '_encoder'
+    elif temporal_backbone in ('encoder_timefilter_lite', 'encoder_timefilter'):
+        temporal_sfx = f'_encodertfk{int(getattr(args, "timefilter_topk", 8))}'
+    elif temporal_backbone in ('encoder_cluster_timefilter_lite', 'encoder_cluster_timefilter'):
+        temporal_sfx = f'_encoderclustertfk{int(getattr(args, "timefilter_topk", 8))}'
     elif temporal_backbone == 'relative_transformer':
         temporal_sfx = '_relpos'
     elif temporal_backbone == 'timefilter_lite':
         temporal_sfx = f'_timefilterlitek{int(getattr(args, "timefilter_topk", 8))}'
+    elif temporal_backbone == 'cluster_timefilter_lite':
+        temporal_sfx = f'_clustertfk{int(getattr(args, "timefilter_topk", 8))}'
     elif temporal_backbone == 'timefilter_attn':
         heads = getattr(args, 'timefilter_attn_heads', None)
         heads = int(heads if heads is not None else getattr(args, 'n_heads', 4))

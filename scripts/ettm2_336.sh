@@ -13,6 +13,7 @@
 # =====================================================================
 
 set -uo pipefail
+export CUDA_VISIBLE_DEVICES=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -45,6 +46,7 @@ export VQVAE_CHUNK_SIZE="${VQVAE_CHUNK_SIZE:-2}"
 export PER_CHANNEL_CODEBOOK=0
 export N_RQ_LAYERS=2
 export RQ_LAYER_WEIGHTS="1.0 1.0"
+export DECODER_LOWPASS=1
 
 # Codebook training params
 export CB_CONTEXT_POINTS=512
@@ -64,25 +66,28 @@ export PROGRESSIVE_STEP_SIZE=6
 export PRETRAIN_PRED_LEN=6
 export N_LAYERS=3
 export N_HEADS=4
-export D_FF=336
-export DROPOUT=0.1
+export D_FF=128
+export DROPOUT=0.15
 export PRETRAIN_EPOCHS=100
 export PRETRAIN_BATCH_SIZE=64
 export PRETRAIN_LR=3e-4
+export TEMPORAL_BACKBONE=timefilter_lite
+export TIMEFILTER_TOPK=4
+# export TIMEFILTER_TEMPERATURE=1.0
 
 # Match etth2.sh finetune params
 export FINETUNE_CONTEXT_POINTS=96
 export FINETUNE_EPOCHS=50
 export FINETUNE_BATCH_SIZE=128
 export FINETUNE_LR=2e-5
-export TARGET_POINTS_LIST="${TARGET_POINTS_LIST:-96}"
+export TARGET_POINTS_LIST="${TARGET_POINTS_LIST:-336}"
 export USE_GUMBEL_SOFTMAX=1
-export GUMBEL_TEMPERATURE=1.1
+export GUMBEL_TEMPERATURE=0.9
 export GUMBEL_HARD=0
 export TRAIN_LOSS=huber
-export HUBER_DELTA=0.9
-export FORECAST_STEP_SIZE_LIST="${FORECAST_STEP_SIZE_LIST:-12}"
-export FORECAST_PRED_LEN_LIST="${FORECAST_PRED_LEN_LIST:-12}"
+export HUBER_DELTA=0.27
+export FORECAST_STEP_SIZE_LIST="${FORECAST_STEP_SIZE_LIST:-10}"
+export FORECAST_PRED_LEN_LIST="${FORECAST_PRED_LEN_LIST:-10}"
 export UNFREEZE_DECODER=0
 export DECODER_LR_RATIO=1
 export DECODER_WD_RATIO=1

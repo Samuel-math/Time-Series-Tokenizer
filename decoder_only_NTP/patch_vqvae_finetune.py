@@ -130,8 +130,9 @@ def parse_args():
 
     # 仅用于展示/兼容命令行；实际 finetune 架构以 pretrained checkpoint config 为准
     parser.add_argument('--temporal_backbone', type=str, default=None,
-                        choices=[None, 'causal_transformer', 'relative_transformer', 'itransformer_lite',
-                                 'timefilter_lite', 'timefilter_attn',
+                        choices=[None, 'causal_transformer', 'encoder_transformer', 'encoder_timefilter_lite',
+                                 'encoder_cluster_timefilter_lite', 'relative_transformer', 'itransformer_lite',
+                                 'timefilter_lite', 'cluster_timefilter_lite', 'timefilter_attn',
                                  'channel_summary_adapter'],
                         help='Temporal backbone 架构由 pretrained checkpoint 决定；该参数仅保留用于脚本兼容')
     
@@ -175,10 +176,18 @@ def temporal_suffix_from_config(config):
     backbone = str(config.get('temporal_backbone', 'causal_transformer')).lower()
     if backbone in ('causal_transformer', 'transformer', 'patchtst'):
         return ''
+    if backbone in ('encoder_transformer', 'transformer_encoder', 'noncausal_transformer'):
+        return '_encoder'
+    if backbone in ('encoder_timefilter_lite', 'encoder_timefilter'):
+        return f'_encodertfk{int(config.get("timefilter_topk", 8))}'
+    if backbone in ('encoder_cluster_timefilter_lite', 'encoder_cluster_timefilter'):
+        return f'_encoderclustertfk{int(config.get("timefilter_topk", 8))}'
     if backbone == 'relative_transformer':
         return '_relpos'
     if backbone == 'timefilter_lite':
         return f'_timefilterlitek{int(config.get("timefilter_topk", 8))}'
+    if backbone == 'cluster_timefilter_lite':
+        return f'_clustertfk{int(config.get("timefilter_topk", 8))}'
     if backbone == 'timefilter_attn':
         heads = config.get('timefilter_attn_heads', None)
         heads = int(heads if heads is not None else config.get('n_heads', 4))
