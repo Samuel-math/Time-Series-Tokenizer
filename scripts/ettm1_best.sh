@@ -117,4 +117,4 @@ if [ "${USE_CORR_CHANNEL_GROUPS}" = "1" ]; then
         --output "${CHANNEL_GROUPS_FILE}"
 fi
 
-bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+bash src/training/channel_group_pipeline.sh

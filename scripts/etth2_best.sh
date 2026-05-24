@@ -141,4 +141,4 @@ for i in "${!_TP_ARR[@]}"; do
 done
 echo "================================================="
 
-bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+bash src/training/channel_group_pipeline.sh
