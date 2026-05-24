@@ -63,6 +63,12 @@ def parse_args():
                         help='TCN backbone 的 Conv1d kernel size（需为奇数；仅 vqvae_backbone=tcn 时使用）')
     parser.add_argument('--vqvae_chunk_size', type=int, default=2,
                         help='chunk_mlp backbone 的 patch 分块大小（需整除 patch_size）')
+    parser.add_argument('--decoder_lowpass', type=int, default=0,
+                        help='1=在 VQVAE decoder 输出末尾应用低通滤波；0=关闭，保持旧行为')
+    parser.add_argument('--decoder_lowpass_kernel', type=str, default='binomial3',
+                        choices=['binomial3', 'mean3', 'mean5', 'mean7', 'mean9',
+                                 'binomial5', 'binomial7', 'triangular5'],
+                        help='decoder_lowpass=1 时使用的低通核')
     parser.add_argument('--commitment_cost', type=float, default=0.25, help='VQ commitment cost')
     parser.add_argument('--codebook_ema', type=int, default=0, help='是否使用EMA更新码本')
     parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA衰减率')
@@ -741,6 +747,11 @@ def main():
         backbone_suffix = f'_tcnk{int(getattr(args, "vqvae_tcn_kernel_size", 5))}'
     else:
         backbone_suffix = f'_{backbone}c{int(getattr(args, "vqvae_chunk_size", 2))}'
+    if bool(getattr(args, 'decoder_lowpass', 0)):
+        backbone_suffix = f'{backbone_suffix}_dlp'
+        lp_kernel = str(getattr(args, 'decoder_lowpass_kernel', 'binomial3'))
+        if lp_kernel != 'binomial3':
+            backbone_suffix = f'{backbone_suffix}_{lp_kernel}'
     ch_suffix = channel_suffix(args)
     model_name = f'codebook_ps{args.patch_size}_cb{args.codebook_size}_cd{code_dim}{per_ch_suffix}{rvq_suffix}{backbone_suffix}_model{args.model_id}{ch_suffix}'
     
