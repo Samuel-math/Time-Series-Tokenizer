@@ -110,8 +110,8 @@ SWEEP_TAG="${SWEEP_TAG:-etth2_pred720_r2_sweep_$(date +%Y%m%d_%H%M%S)}"
 RUN_HISTORY_PREFIX="${RUN_HISTORY_PREFIX:-${SWEEP_TAG}}"
 SHARED_GROUP_RUN_NAME="${SHARED_GROUP_RUN_NAME:-${SWEEP_TAG}_shared_pretrain}"
 
-export CB_SAVE_PATH="${CB_SAVE_PATH:-${REPO_ROOT}/vqvae-only/saved_models/vqvae_only/${SHARED_GROUP_RUN_NAME}}"
-export PRETRAIN_SAVE_PATH="${PRETRAIN_SAVE_PATH:-${REPO_ROOT}/decoder_only_NTP/saved_models/patch_vqvae/${SHARED_GROUP_RUN_NAME}}"
+export CB_SAVE_PATH="${CB_SAVE_PATH:-${REPO_ROOT}/saved_models/vqvae_only/${SHARED_GROUP_RUN_NAME}}"
+export PRETRAIN_SAVE_PATH="${PRETRAIN_SAVE_PATH:-${REPO_ROOT}/saved_models/patch_vqvae/${SHARED_GROUP_RUN_NAME}}"
 
 MASTER_LOG_DIR="${MASTER_LOG_DIR:-${REPO_ROOT}/logs/${SWEEP_TAG}}"
 mkdir -p "${MASTER_LOG_DIR}"
@@ -170,7 +170,7 @@ PY
 
         COMBO_TAG="m${M}_r${RATIO//./p}_n${PRED_LEN}"
         COMBO_GROUP_RUN_NAME="${SWEEP_TAG}_${COMBO_TAG}"
-        export FINETUNE_SAVE_PATH="${REPO_ROOT}/decoder_only_NTP/saved_models/patch_vqvae_finetune/${COMBO_GROUP_RUN_NAME}"
+        export FINETUNE_SAVE_PATH="${REPO_ROOT}/saved_models/patch_vqvae_finetune/${COMBO_GROUP_RUN_NAME}"
         export LOG_DIR="${MASTER_LOG_DIR}/${COMBO_TAG}"
         mkdir -p "${LOG_DIR}"
 
@@ -184,7 +184,7 @@ PY
         echo "  log dir        : ${LOG_DIR}"
         echo "-------------------------------------------------"
 
-        bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+        bash src/training/channel_group_pipeline.sh
         RC=$?
         if [ "${RC}" -ne 0 ]; then
             echo "ERROR: combo failed (${COMBO_TAG}), rc=${RC}" | tee -a "${MASTER_LOG_DIR}/failed.log"

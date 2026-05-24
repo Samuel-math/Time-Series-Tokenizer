@@ -141,7 +141,7 @@ for N_RQ_LAYERS in ${RQ_LAYER_LIST}; do
     echo "Run history prefix: ${RUN_HISTORY_PREFIX}"
     echo "-------------------------------------------------"
 
-    bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+    bash src/training/channel_group_pipeline.sh
     rc=$?
     if [ "${rc}" -ne 0 ]; then
         echo "ERROR: run failed for N_RQ_LAYERS=${N_RQ_LAYERS} (rc=${rc})"

@@ -12,10 +12,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ---- Fill with either one checkpoint or horizon-specific checkpoints ----
 CKPT="${CKPT:-}"
-CKPT_96="${CKPT_96:-/root/autodl-tmp/Time-Series-Tokenizer/decoder_only_NTP/saved_models/patch_vqvae_finetune/ettm1_pred96_freq_m7_base1_20260522_144435/ettm1/patch_vqvae_finetune_cw96_tw96_model1_grp0.pth}"
-CKPT_192="${CKPT_192:-/root/autodl-tmp/Time-Series-Tokenizer/decoder_only_NTP/saved_models/patch_vqvae_finetune/ettm1_pred96_freq_m7_base1_20260522_144435/ettm1/patch_vqvae_finetune_cw96_tw192_model1_grp0.pth}"
-CKPT_336="${CKPT_336:-/root/autodl-tmp/Time-Series-Tokenizer/decoder_only_NTP/saved_models/patch_vqvae_finetune/ettm1_pred96_freq_m7_base1_20260522_144435/ettm1/patch_vqvae_finetune_cw96_tw336_model1_grp0.pth}"
-CKPT_720="${CKPT_720:-/root/autodl-tmp/Time-Series-Tokenizer/decoder_only_NTP/saved_models/patch_vqvae_finetune/ettm1_pred96_freq_m7_base1_20260522_144435/ettm1/patch_vqvae_finetune_cw96_tw720_model1_grp0.pth}"
+CKPT_96="${CKPT_96:-}"
+CKPT_192="${CKPT_192:-}"
+CKPT_336="${CKPT_336:-}"
+CKPT_720="${CKPT_720:-}"
 TARGETS="${TARGETS:-}"
 if [ -z "${TARGETS}" ]; then
     if [ -n "${CKPT}" ]; then

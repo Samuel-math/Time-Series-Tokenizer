@@ -1,6 +1,6 @@
 """
 Patch VQVAE + Transformer 渐进式预训练公共逻辑
-（decoder_only_NTP / decoder_only_forcasting 共用）
+（src/training unified entrypoints）
 
 入口脚本只需:
     sys.path.insert(0, repo_root)
@@ -124,7 +124,7 @@ def build_arg_parser():
 
     # Per-channel 码本
     p.add_argument('--per_channel_codebook', type=int, default=0,
-                   help='每通道独立码本（1=启用，需与 vqvae-only 训练一致）')
+                   help='每通道独立码本（1=启用，需与 codebook_pretrain 训练一致）')
 
     # RVQ 层数
     p.add_argument('--n_rq_layers', type=int, default=1,
@@ -168,7 +168,7 @@ def build_arg_parser():
                    help='用最近 K 个 epoch 的 val_loss 均值做早停判据（K=1 表示不平滑，默认 1）')
 
     # 保存
-    p.add_argument('--save_path', type=str, default='saved_models/patch_vqvae/')
+    p.add_argument('--save_path', type=str, default=str(DEFAULT_SAVE_PATH))
     p.add_argument('--model_id', type=int, default=1)
     p.add_argument('--run_id', type=int, default=None)
 

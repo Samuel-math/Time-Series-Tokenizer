@@ -206,7 +206,7 @@ run_96_192_336_profile() {
     export HUBER_DELTA="${deltas%% *}"
 
     print_config "96/192/336 profile"
-    bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+    bash src/training/channel_group_pipeline.sh
 }
 
 run_720_profile() {
@@ -239,7 +239,7 @@ run_720_profile() {
     export HUBER_DELTA=1.5
 
     print_config "720 profile"
-    bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+    bash src/training/channel_group_pipeline.sh
 }
 
 cd "${REPO_ROOT}"

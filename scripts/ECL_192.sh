@@ -2,8 +2,8 @@
 # =====================================================================
 # ETTh2 channel-group wrapper.
 #
-# Mirrors scripts/decoder_only_NTP/etth2.sh, but runs through
-# scripts/decoder_only_NTP/channel_group_pipeline.sh.
+# Mirrors legacy decoder-only scripts, but runs through
+# src/training/channel_group_pipeline.sh.
 #
 # Usage from repo root:
 #   bash scripts/new_etth2.sh
@@ -130,4 +130,4 @@ if [ "${USE_CORR_CHANNEL_GROUPS}" = "1" ]; then
         --output "${CHANNEL_GROUPS_FILE}"
 fi
 
-bash scripts/decoder_only_NTP/channel_group_pipeline.sh
+bash src/training/channel_group_pipeline.sh
