@@ -43,7 +43,7 @@ datasets/weather.csv
 Supported dataset names:
 
 ```text
-ettm1 ettm2 etth1 etth2 electricity traffic weather illness exchange
+ettm1 ettm2 etth1 etth2 electricity traffic weather
 ```
 
 `ecl` is accepted as an alias of `electricity` in the provided scripts.
@@ -86,7 +86,7 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/single_run.sh \
 
 ## Stage 1: Train Noise-Aware Codebook Tokenizer
 
-This stage trains the VQ-VAE / RVQ tokenizer. It learns to map continuous patches into discrete codebook entries.
+This stage trains Noise-Aware Codebook Tokenizer. It learns to map continuous patches into discrete codebook entries.
 
 ```bash
 bash scripts/train_codebook_only.sh \
