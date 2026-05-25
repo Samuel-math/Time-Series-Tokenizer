@@ -1,14 +1,22 @@
 # Time DeCode
 
-本仓库是论文 **Time DeCode: Denoising Codebook-based Pre-training Framework for Time Series Analysis** 中提出方法的代码实现。
+This repository provides the code implementation for **Time DeCode: Denoising Codebook-based Pre-training Framework for Time Series Analysis**.
 
-核心训练流程分为三步：
+Time DeCode is a denoising codebook-based pre-training framework for time series analysis. It is designed around three sources of noise in real-world time series pre-training:
 
-1. **Codebook training**：训练 VQ-VAE / RVQ 码本，把连续时间序列 patch 离散化为 code tokens。
-2. **Pre-training**：基于码本 token 做 denoising / next-token style 的预训练。
-3. **Fine-tuning**：加载预训练 checkpoint，在指定数据集、输入长度和预测长度上微调并评估 MSE / MAE。
+- **Data-level noise**: noisy raw observations caused by measurement errors, stochastic fluctuations, and environmental disturbances.
+- **Objective-level noise**: continuous-value reconstruction or prediction objectives may force the model to fit local random deviations.
+- **Inference-level noise**: autoregressive rollout with a single prediction trajectory can accumulate errors under noisy temporal contexts.
 
-## 环境安装
+To mitigate these issues, Time DeCode introduces three main components:
+
+1. **Noise-Aware Discrete Tokenizer**: converts continuous time-series patches into discrete semantic codes. It uses sparse noise extraction to separate irregular local fluctuations from structural temporal patterns, and learns multi-layer codebooks for multi-frequency representations.
+2. **Next Multi-Code Prediction (NMCP)**: reformulates pre-training from continuous-value prediction to future code-index prediction. The temporal model predicts multiple future code tokens from historical code sequences.
+3. **Code-Space Prediction Calibration**: performs forecasting in the learned code space. Overlapping future code predictions are aggregated before decoding, improving inference stability and reducing error accumulation.
+
+The current code supports long-term time series forecasting with MSE / MAE evaluation.
+
+## Installation
 
 ```bash
 python -m venv .venv
@@ -16,11 +24,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-如果 `torch` 安装失败，请根据你的 CUDA 版本先从 PyTorch 官方源单独安装 `torch`，再安装其它依赖。
+If installing `torch` from `requirements.txt` fails, install the PyTorch wheel matching your CUDA version first, then install the remaining dependencies.
 
-## 数据准备
+## Data Preparation
 
-数据文件默认放在仓库根目录的 `datasets/` 下，例如：
+Put datasets under `datasets/` in the repository root. Typical file names are:
 
 ```text
 datasets/ETTm1.csv
@@ -32,40 +40,40 @@ datasets/traffic.csv
 datasets/weather.csv
 ```
 
-支持的数据集名称：
+Supported dataset names:
 
 ```text
 ettm1 ettm2 etth1 etth2 electricity traffic weather illness exchange
 ```
 
-脚本中也支持用 `ecl` 代替 `electricity`。
+`ecl` is accepted as an alias of `electricity` in the provided scripts.
 
-## 一键运行完整流程
+## Quick Start: Full Pipeline
 
-如果只想跑一个数据集、一个输入长度、一个预测长度，直接用：
+Run codebook training, pre-training, and fine-tuning for one dataset, one input length, and one prediction length:
 
 ```bash
 bash scripts/single_run.sh --dset etth2 --input_len 96 --output_len 336
 ```
 
-指定 GPU：
+Specify GPU outside the script:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/single_run.sh --dset etth2 --input_len 96 --output_len 336
 ```
 
-常用参数：
+Common options:
 
 ```bash
---forecast_step_size N      # finetune 自回归步长，单位 patch
---forecast_pred_len N       # 每次 forward 预测的 patch 数
---max_channels_per_model N  # 高维数据集通道分组大小
---force                     # 强制重跑完整流程
---no_resume                 # 不复用最近一次 run
---no_channel_groups         # 不使用频域通道分组
+--forecast_step_size N      # autoregressive step size in patches
+--forecast_pred_len N       # number of future patches predicted per forward step
+--max_channels_per_model N  # channel-group size for high-dimensional datasets
+--force                     # rerun all stages
+--no_resume                 # do not reuse the latest run
+--no_channel_groups         # disable frequency-based channel grouping
 ```
 
-例子：
+Example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/single_run.sh \
@@ -76,9 +84,9 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/single_run.sh \
   --forecast_pred_len 14
 ```
 
-## 分阶段运行
+## Stage 1: Train Noise-Aware Codebook Tokenizer
 
-### 1. 单独训练 Codebook
+This stage trains the VQ-VAE / RVQ tokenizer. It learns to map continuous patches into discrete codebook entries.
 
 ```bash
 bash scripts/train_codebook_only.sh \
@@ -86,7 +94,7 @@ bash scripts/train_codebook_only.sh \
   --context_points 512
 ```
 
-指定常用结构参数：
+With common tokenizer settings:
 
 ```bash
 PATCH_SIZE=8 \
@@ -99,7 +107,7 @@ bash scripts/train_codebook_only.sh \
   --context_points 512
 ```
 
-高维数据集可以指定通道范围：
+For high-dimensional datasets, train on a channel slice:
 
 ```bash
 bash scripts/train_codebook_only.sh \
@@ -109,15 +117,32 @@ bash scripts/train_codebook_only.sh \
   --channel_end 128
 ```
 
-默认输出位置：
+Useful environment variables:
+
+```bash
+PATCH_SIZE                # patch length
+COMPRESSION_FACTOR        # latent compression ratio
+EMBEDDING_DIM             # latent embedding dimension
+CODEBOOK_SIZE             # number of entries per codebook
+N_RQ_LAYERS               # number of residual quantization layers
+SPARSE_WEIGHT             # sparse noise extraction weight
+LAMBDA_ORD                # frequency-ordering regularization weight
+ORTH_WEIGHT               # noise-codebook orthogonality weight
+CB_EPOCHS                 # codebook training epochs
+CB_LR                     # codebook learning rate
+```
+
+Default output:
 
 ```text
 vqvae-only/saved_models/vqvae_only/<run_name>/<dset>/
 ```
 
-后续 pretrain 需要使用这里生成的 `.pth` 文件。
+Use the generated `.pth` checkpoint as `--vqvae_checkpoint` in the pre-training stage.
 
-### 2. 单独 Pre-train
+## Stage 2: Pre-train with Next Multi-Code Prediction
+
+This stage loads the trained tokenizer and pre-trains a temporal backbone in code space.
 
 ```bash
 bash scripts/pretrain_only.sh \
@@ -128,7 +153,7 @@ bash scripts/pretrain_only.sh \
   --vqvae_checkpoint /absolute/path/to/codebook.pth
 ```
 
-使用 `timefilter_lite`：
+Use `timefilter_lite` as temporal backbone:
 
 ```bash
 TEMPORAL_BACKBONE=timefilter_lite \
@@ -141,7 +166,7 @@ bash scripts/pretrain_only.sh \
   --vqvae_checkpoint /absolute/path/to/codebook.pth
 ```
 
-RVQ 权重示例：
+Use multi-layer RVQ prediction weights:
 
 ```bash
 N_RQ_LAYERS=2 \
@@ -154,15 +179,24 @@ bash scripts/pretrain_only.sh \
   --vqvae_checkpoint /absolute/path/to/codebook.pth
 ```
 
-默认输出位置：
+Key arguments:
+
+```bash
+--progressive_step_size M  # context grows by M patches at each progressive stage
+--pred_len N              # predict N future patches at each stage; N > M enables overlap
+```
+
+Default output:
 
 ```text
 decoder_only_NTP/saved_models/patch_vqvae/<run_name>/<dset>/
 ```
 
-后续 finetune 需要使用这里生成的 `.pth` 文件。
+Use the generated `.pth` checkpoint as `--pretrained_model` in the fine-tuning stage.
 
-### 3. 单独 Fine-tune
+## Stage 3: Fine-tune and Forecast with Code-Space Calibration
+
+This stage loads the pre-trained model, predicts future code representations, decodes them into continuous values, and reports MSE / MAE.
 
 ```bash
 bash scripts/finetune_only.sh \
@@ -172,7 +206,7 @@ bash scripts/finetune_only.sh \
   --pretrained_model /absolute/path/to/pretrain.pth
 ```
 
-显式指定自回归参数：
+Explicitly set autoregressive prediction parameters:
 
 ```bash
 bash scripts/finetune_only.sh \
@@ -184,7 +218,7 @@ bash scripts/finetune_only.sh \
   --pretrained_model /absolute/path/to/pretrain.pth
 ```
 
-使用 Huber loss：
+Use Huber loss for fine-tuning:
 
 ```bash
 TRAIN_LOSS=huber \
@@ -197,21 +231,21 @@ bash scripts/finetune_only.sh \
   --pretrained_model /absolute/path/to/pretrain.pth
 ```
 
-默认输出位置：
+Default output:
 
 ```text
 decoder_only_NTP/saved_models/patch_vqvae_finetune/<run_name>/<dset>/
 ```
 
-## 三阶段完整示例
+## Complete Three-Stage Example
 
 ```bash
-# 1. Train codebook
+# 1. Train the noise-aware tokenizer / codebook
 bash scripts/train_codebook_only.sh \
   --dset etth2 \
   --context_points 512
 
-# 2. Pre-train，替换为上一步生成的 codebook checkpoint
+# 2. Pre-train with Next Multi-Code Prediction
 bash scripts/pretrain_only.sh \
   --dset etth2 \
   --context_points 296 \
@@ -219,7 +253,7 @@ bash scripts/pretrain_only.sh \
   --pred_len 6 \
   --vqvae_checkpoint /absolute/path/to/codebook.pth
 
-# 3. Fine-tune，替换为上一步生成的 pretrain checkpoint
+# 3. Fine-tune for downstream forecasting
 bash scripts/finetune_only.sh \
   --dset etth2 \
   --input_len 96 \
@@ -229,9 +263,9 @@ bash scripts/finetune_only.sh \
   --pretrained_model /absolute/path/to/pretrain.pth
 ```
 
-如果使用 `--channel_start/--channel_end` 或 `--channel_indices`，三阶段必须保持一致。
+If `--channel_start/--channel_end` or `--channel_indices` is used, keep the same channel configuration across all three stages.
 
-## 运行已有 best 配置
+## Run Existing Best Configurations
 
 ```bash
 bash scripts/etth1_best.sh
@@ -243,23 +277,23 @@ bash scripts/traffic_best.sh
 bash scripts/weather_best.sh
 ```
 
-部分脚本支持只跑指定预测长度：
+Some scripts support selecting prediction horizons:
 
 ```bash
 HORIZONS="96 192" bash scripts/weather_best.sh
 HORIZONS="96,192,336,720" bash scripts/traffic_best.sh
 ```
 
-## 查看结果
+## Evaluation Results
 
-完整 pipeline 的日志和汇总结果通常保存在：
+For the full pipeline, logs and summaries are usually saved under:
 
 ```text
 logs/<run_name>/summary.tsv
 logs/<run_name>/summary_overall.tsv
 ```
 
-模型 checkpoint 默认保存在：
+Checkpoints are saved under:
 
 ```text
 vqvae-only/saved_models/vqvae_only/<run_name>/
@@ -267,9 +301,9 @@ decoder_only_NTP/saved_models/patch_vqvae/<run_name>/
 decoder_only_NTP/saved_models/patch_vqvae_finetune/<run_name>/
 ```
 
-## 注意事项
+## Notes
 
-1. 三阶段的 VQ-VAE 结构参数要保持一致，尤其是 `PATCH_SIZE`、`COMPRESSION_FACTOR`、`EMBEDDING_DIM`、`CODEBOOK_SIZE`、`N_RQ_LAYERS`。
-2. `finetune` 的模型结构由 `--pretrained_model` checkpoint 中的 config 决定。
-3. 脚本内部不固定 GPU；需要指定 GPU 时在命令前加 `CUDA_VISIBLE_DEVICES=...`。
-4. `--force` 或 `FORCE_RETRAIN_*` 可能覆盖/删除同名旧模型，使用前请确认。
+1. Keep tokenizer-related hyperparameters consistent across codebook training, pre-training, and fine-tuning, especially `PATCH_SIZE`, `COMPRESSION_FACTOR`, `EMBEDDING_DIM`, `CODEBOOK_SIZE`, and `N_RQ_LAYERS`.
+2. The fine-tuning model architecture is reconstructed from the `--pretrained_model` checkpoint config.
+3. Scripts do not set GPU ids internally. Use `CUDA_VISIBLE_DEVICES=...` outside the command when needed.
+4. `--force` or `FORCE_RETRAIN_*` may overwrite or remove existing artifacts with the same run name.
