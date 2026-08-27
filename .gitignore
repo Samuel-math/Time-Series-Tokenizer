@@ -1,1 +1,22 @@
-./Time-Series-Tokenizer
+# datasets
+datasets/
+
+# model checkpoints
+decoder_only_NTP/saved_models/
+vqvae-only/saved_models/
+
+# logs
+logs/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+**/.ipynb_checkpoints/
+
+# generated files
+*.json
+*.csv
+*.tsv
